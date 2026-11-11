@@ -1,0 +1,455 @@
+:root{
+  color-scheme: light dark;
+
+  /* ---------- color: light (paper) ---------- */
+  --bg:#F4F1EA;          /* page */
+  --surface:#FFFFFF;     /* cards, sheet, bar */
+  --surface-2:#E9E4D8;   /* pressed, inset cells, skipped row */
+  --ink:#1A1C1E;         /* main text, big numbers */
+  --ink-2:#53585E;       /* labels, helper text */
+  --line:#CFC8B8;        /* hairline dividers only (decorative) */
+  --edge:#857E70;        /* borders that mark a control: inputs, outline buttons */
+  --accent:#0B6470;      /* slate teal: primary button, target, active row */
+  --on-accent:#FFFFFF;
+  --accent-bg:#DCEDEF;   /* target cell fill, selected chip */
+  --focus:#0B6470;
+
+  /* state colors: text/icon color + fill */
+  --done:#1D6B38;    --done-bg:#E2F0E6;
+  --skip:#5A5F66;    --skip-bg:#ECE9E2;
+  --target:var(--accent); --target-bg:var(--accent-bg);
+  --fail:#A3231A;    --fail-bg:#FBE5E2;    /* failed save */
+  --backup:#8A5300;  --backup-bg:#FBEFD8;  /* needs backup */
+
+  --chalk:var(--ink);   /* tally strokes */
+  --scrim:rgba(17,19,21,.45);
+  --shadow-sheet:0 -8px 24px rgba(26,28,30,.16);
+  --shadow-toast:0 6px 18px rgba(26,28,30,.22);
+
+  /* ---------- type ---------- */
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --font-num:ui-rounded,-apple-system,BlinkMacSystemFont,"SF Pro Rounded","Segoe UI",Roboto,sans-serif;
+  --fs-label:13px;   /* caps labels only, tracked */
+  --fs-small:15px;   /* helper text, pills */
+  --fs-body:17px;    /* body, buttons, list rows */
+  --fs-input:17px;   /* never below 16px: iOS zoom guard */
+  --fs-btn:18px;     /* primary button text (LOOK 3.4) */
+  --fs-h2:22px;      /* card titles, sheet title */
+  --fs-h1:30px;      /* screen title */
+  --fs-num:30px;     /* weight and reps in a set row */
+  --fs-hero:44px;    /* Today header week/day numeral */
+  --lh-tight:1.15;   /* numbers, titles */
+  --lh-body:1.4;
+  --fw-reg:400; --fw-semi:600; --fw-bold:700; --fw-heavy:800;
+  --track-label:.08em;
+
+  /* ---------- space: 4px base, 8px rhythm ---------- */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px;
+  --gutter:16px;
+  --content-max:480px;
+
+  /* ---------- sizes ---------- */
+  --tap-min:44px;    /* hard floor, any tappable thing */
+  --tap:56px;        /* default control height */
+  --tap-big:64px;    /* primary action, answer chips */
+  --row-h:60px;      /* collapsed set row */
+  --row-h-help:72px; /* set row with its helper line (LOOK 3.1) */
+  --bar-h:56px;      /* bottom bar, before safe area */
+  --tally-h:22px;    --tally-h-lg:32px;  --tally-w-lg:4px;   /* the large tally on the Day done screen (LOOK 3.9) */
+  --tally-slash:34px; --tally-group-gap:10px;   /* the fifth-stroke slash and the gap between groups of five (LOOK 3.9) */
+  --hist-col:96px;   /* the Day done number column (LOOK 4.10) */
+
+  /* ---------- shape ---------- */
+  --r-sm:8px;  --r-md:12px;  --r-lg:18px;  --r-pill:999px;
+  --bw:1px;    --bw-strong:2px;  --bw-state:5px;  /* left state bar on a set row */
+
+  /* ---------- motion ---------- */
+  --t-fast:120ms; --t-med:200ms; --t-sheet:260ms;
+  --ease:cubic-bezier(.2,.7,.2,1);
+}
+
+/* ---------- dark (cast iron): system dark unless user forced light ---------- */
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#111315; --surface:#1A1D20; --surface-2:#24282C;
+    --ink:#ECEEF0; --ink-2:#A4ABB3; --line:#3A4047; --edge:#6E767F;
+    --accent:#5CC6D1; --on-accent:#06292D; --accent-bg:#12343A; --focus:#5CC6D1;
+    --done:#6FD18F;   --done-bg:#14301E;
+    --skip:#A4ABB3;   --skip-bg:#262A2F;
+    --fail:#FF8A80;   --fail-bg:#3B1A18;
+    --backup:#F0B45A; --backup-bg:#3A2A0F;
+    --scrim:rgba(0,0,0,.6);
+    --shadow-sheet:0 -8px 24px rgba(0,0,0,.5);
+    --shadow-toast:0 6px 18px rgba(0,0,0,.55);
+  }
+}
+/* same overrides when the user picks Dark in Settings */
+:root[data-theme="dark"]{
+  --bg:#111315; --surface:#1A1D20; --surface-2:#24282C;
+  --ink:#ECEEF0; --ink-2:#A4ABB3; --line:#3A4047; --edge:#6E767F;
+  --accent:#5CC6D1; --on-accent:#06292D; --accent-bg:#12343A; --focus:#5CC6D1;
+  --done:#6FD18F;   --done-bg:#14301E;
+  --skip:#A4ABB3;   --skip-bg:#262A2F;
+  --fail:#FF8A80;   --fail-bg:#3B1A18;
+  --backup:#F0B45A; --backup-bg:#3A2A0F;
+  --scrim:rgba(0,0,0,.6);
+  --shadow-sheet:0 -8px 24px rgba(0,0,0,.5);
+  --shadow-toast:0 6px 18px rgba(0,0,0,.55);
+}
+
+@media (prefers-reduced-motion: reduce){
+  :root{ --t-fast:0ms; --t-med:0ms; --t-sheet:0ms; }
+}
+
+/* ---------- builder tokens (Slice 0), same rules as above ---------- */
+:root{
+  --col-setno:36px;
+  --pill-h:28px;
+  --step-dot:32px;
+  --glyph-sm:18px;
+  --glyph:24px;
+  --glyph-md:22px;
+  --tab-bar-mark-w:24px;
+  --tab-bar-mark-h:3px;
+  --tab-gap:2px;
+  --dot:10px;
+  --ghost-h:40px;
+  --ghost-w:4px;
+  --ghost-gap:6px;
+  --stroke-w:3px;
+  --stroke-r:2px;
+  --lean:-6deg;
+  --lean-2:-3deg;
+  --focus-gap:2px;
+  --toast-rise:8px;
+  --toast-ms:3000ms;
+  --t-toast-action:6000ms;  /* a toast that wraps, or has an action (LOOK 3.7); never zeroed by reduced motion */
+  /* Slice 1 sizes (LOOK 3.1, 3.3, 4.6) */
+  --handle-w:40px; --handle-h:5px;
+  --badge-d:24px;
+  --score-chip:48px;
+  --tick-d:32px;
+  --card-check:20px;   /* the done card check before the name (LOOK 3.2 r4.4) */
+  --progress-h:4px;
+  /* polish pass (LOOK 2 and 4.9): the one on/off switch, inside a 56px row */
+  --switch-w:52px; --switch-h:32px; --switch-knob:26px;
+}
+/* ==== end of token block: no raw hex, px or ms below this line except 0 and 1px ==== */
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0; background:var(--bg); color:var(--ink); font:var(--fw-reg) var(--fs-body)/var(--lh-body) var(--font);
+  overscroll-behavior-y:contain; -webkit-tap-highlight-color:transparent;}
+button,input,select,textarea{font:inherit; color:inherit}
+button,[role="button"],input,a{touch-action:manipulation}
+.num{font-family:var(--font-num); font-variant-numeric:tabular-nums; font-weight:var(--fw-bold); line-height:var(--lh-tight)}
+.label{font-size:var(--fs-label); font-weight:var(--fw-semi); text-transform:uppercase; letter-spacing:var(--track-label); color:var(--ink-2)}
+:focus-visible{outline:var(--bw-strong) solid var(--focus); outline-offset:var(--focus-gap)}
+#app{max-width:var(--content-max); margin:0 auto; min-height:100dvh;
+  padding:calc(env(safe-area-inset-top) + var(--s3)) calc(env(safe-area-inset-right) + var(--gutter))
+          calc(env(safe-area-inset-bottom) + var(--bar-h) + var(--s5)) calc(env(safe-area-inset-left) + var(--gutter));}
+
+/* ---------- layout ---------- */
+[hidden]{display:none !important}
+.screen{display:flex; flex-direction:column; gap:var(--s4)}
+.screen.no-bar{padding-bottom:0}
+h1{font-size:var(--fs-h1); line-height:var(--lh-tight); font-weight:var(--fw-heavy); margin:0}
+h2{font-size:var(--fs-h2); line-height:var(--lh-tight); font-weight:var(--fw-bold); margin:0}
+p{margin:0}
+.lead{color:var(--ink-2)}
+.small{font-size:var(--fs-small); color:var(--ink-2)}
+.raw{font-size:var(--fs-label); color:var(--ink-2); word-break:normal; overflow-wrap:anywhere}
+.topbar{display:flex; align-items:center; min-height:var(--tap-min)}
+
+/* ---------- buttons (LOOK 3.4) ---------- */
+.btn{display:flex; align-items:center; justify-content:center; gap:var(--s2); width:100%;
+  border-radius:var(--r-md); border:0; cursor:pointer; text-decoration:none;
+  transition:transform var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease)}
+.btn:active{transform:scale(.98)}
+.btn:disabled{opacity:.4; pointer-events:none}
+.btn-primary{min-height:var(--tap-big); background:var(--accent); color:var(--on-accent); font-size:var(--fs-btn); font-weight:var(--fw-bold)}
+.btn-primary:active{filter:brightness(.92)}
+.btn-secondary{min-height:var(--tap); background:var(--surface); color:var(--ink); font-weight:var(--fw-semi); border:var(--bw) solid var(--edge)}
+.btn-secondary:active{background:var(--surface-2)}
+.btn-secondary svg{width:var(--glyph-md); height:var(--glyph-md); flex:none}
+.btn-quiet{min-height:var(--tap-min); width:auto; background:none; color:var(--accent); font-size:var(--fs-small); font-weight:var(--fw-semi); border-radius:var(--r-sm); padding:0 var(--s2); white-space:nowrap; gap:var(--s1)}
+.btn-quiet svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none}
+.btn-icon{min-width:var(--tap-min); min-height:var(--tap-min); width:auto; background:none; color:var(--ink-2); border-radius:var(--r-pill); padding:0 var(--s2)}
+.btn-icon svg{width:var(--glyph-md); height:var(--glyph-md)}
+.lift-top .btn-remove{margin-left:var(--s3)}
+.pos-row{display:flex; align-items:center; gap:var(--s2)}
+.pos-row .grow{flex:1; min-width:0}
+.switch-row{min-height:var(--tap); width:100%; text-align:left; gap:var(--s2); appearance:none; -webkit-appearance:none; background:none; border:0}
+.switch{position:relative; flex:none; width:var(--switch-w); height:var(--switch-h); border-radius:var(--r-pill); background:var(--surface-2); border:var(--bw) solid var(--edge)}
+.switch-knob{position:absolute; top:50%; left:calc((var(--switch-h) - var(--switch-knob)) / 2 - var(--bw)); width:var(--switch-knob); height:var(--switch-knob); border-radius:var(--r-pill); background:var(--surface); transform:translateY(-50%); transition:transform var(--t-fast)}
+.switch-row[aria-checked="true"] .switch{background:var(--accent); border-color:var(--accent)}
+.switch-row[aria-checked="true"] .switch-knob{background:var(--on-accent); transform:translate(calc(var(--switch-w) - var(--switch-h)), -50%)}
+.switch-word{min-width:var(--tap-min); color:var(--ink-2)}
+.switch-line{color:var(--ink-2); margin:0 var(--s4) var(--s2)}
+.check-box-row{min-height:var(--tap-min); width:100%; text-align:left; gap:var(--s2); align-items:flex-start; appearance:none; -webkit-appearance:none; background:var(--surface); border:var(--bw) solid var(--edge); border-radius:var(--r-md); padding:0 var(--s3)}
+.check-box-row .box{flex:none; display:inline-flex; align-items:center; justify-content:center; width:var(--glyph); height:var(--glyph); border:var(--bw) solid var(--edge); border-radius:var(--stroke-r)}
+.check-box-row .box svg{width:var(--glyph-sm); height:var(--glyph-sm)}
+.strip3{display:grid; grid-template-columns:1fr var(--tap-min); gap:var(--s2); align-items:center}
+.menu-row[disabled]{opacity:.4; pointer-events:none}
+.menu-why{color:var(--ink-2); margin:0 var(--s3) var(--s2)}
+
+/* ---------- pills (LOOK 3.5) ---------- */
+.pill{display:inline-flex; align-items:center; gap:var(--s1); height:var(--pill-h); padding:0 var(--s3);
+  border-radius:var(--r-pill); font-size:var(--fs-small); font-weight:var(--fw-semi); white-space:nowrap}
+.pill svg{width:var(--glyph-sm); height:var(--glyph-sm)}
+.row[data-dayempty] svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none; color:var(--ink)}
+.row[data-dayempty] svg{margin-top:calc((var(--fs-small) * var(--lh-body) - var(--glyph-sm)) / 2)}
+/* LOOK 4.6 Step 4 review lines (LB1): 15px --ink text, the glyph first with an --s2 gap, on the first text line. */
+.row[data-dayempty]{font-size:var(--fs-small); gap:var(--s2); align-items:flex-start; padding-block:calc((var(--tap) - var(--fs-small) * var(--lh-body)) / 2)}
+.pill-yes{background:var(--done-bg); color:var(--done)}
+.pill-unsure{background:var(--backup-bg); color:var(--backup)}
+.pill-no{background:var(--surface-2); color:var(--ink); font-weight:var(--fw-bold)}
+.pill-info{background:var(--surface-2); color:var(--ink-2)}
+.pill-skip{background:var(--skip-bg); color:var(--skip)}
+.day-head > .pill{align-self:flex-start}
+
+/* ---------- cards and rows ---------- */
+.group{display:flex; flex-direction:column; gap:var(--s2)}
+.card{background:var(--surface); border:var(--bw) solid var(--line); border-radius:var(--r-lg); overflow:hidden}
+.row{display:flex; align-items:center; gap:var(--s3); min-height:var(--tap); padding:var(--s2) var(--s4);
+  border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.row .grow{flex:1; min-width:0}
+/* LOOK 4.9 R16 (G15): the hairline sits under each helper line, not between a switch and its line, and none after the
+   last pair; the switch sits on the label's first line by computed padding. After .row, so it wins over .row's border,
+   padding and centering (same weight, later rule). */
+.switch-row{border-bottom:0; align-items:flex-start; padding-block:calc((var(--tap) - var(--switch-h)) / 2)}
+.switch-row .grow{margin-top:calc((var(--switch-h) - var(--fs-body) * var(--lh-body)) / 2)}
+.switch-line{padding-bottom:var(--s3); border-bottom:1px solid var(--line)}
+.switch-line:last-child{border-bottom:0}
+.row .val{font-family:var(--font-num); font-variant-numeric:tabular-nums; font-weight:var(--fw-bold); text-align:right}
+.row-link{color:var(--ink); text-decoration:none; cursor:pointer}
+.row-link svg{width:var(--glyph-md); height:var(--glyph-md); color:var(--ink-2)}
+.check-row{flex-wrap:wrap}
+.check-row .what-to-do{flex-basis:100%; font-size:var(--fs-small); color:var(--ink-2)}
+.check-row.is-no .what-to-do{color:var(--ink)}
+.check-row.is-unsure .what-to-do{color:var(--ink-2)}
+.check-row .what-to-do.row-extra{color:var(--ink-2)}
+.summary{font-family:var(--font-num); font-variant-numeric:tabular-nums; font-weight:var(--fw-bold); text-align:center}
+
+/* ---------- install (LOOK 4.1) ---------- */
+.steps{counter-reset:none}
+.step-no{display:inline-flex; align-items:center; justify-content:center; flex:none;
+  width:var(--step-dot); height:var(--step-dot); border-radius:var(--r-pill);
+  background:var(--accent-bg); color:var(--accent)}
+.step-glyph svg{width:var(--glyph); height:var(--glyph); color:var(--accent)}
+
+/* ---------- banner (LOOK 3.6) ---------- */
+.banner{display:flex; align-items:center; gap:var(--s3); min-height:var(--tap); padding:var(--s3) var(--s4);
+  background:var(--accent-bg); border-left:var(--bw-state) solid var(--accent); border-radius:var(--r-md)}
+.banner .grow{flex:1; min-width:0}
+.banner p{font-size:var(--fs-small)}
+.banner .second{color:var(--ink-2)}
+/* The Blocked skin (LOOK 3.6, DESIGN 15 Part 19): a screen where the app cannot go on. It never
+   reads the fail color: red means "not saved" only. */
+.blocked{background:var(--surface-2); border-left:var(--bw-state) solid var(--ink); border-radius:var(--r-md); padding:var(--s4);
+  display:flex; flex-direction:column; gap:var(--s2); overflow-wrap:anywhere}
+.blocked-head{display:flex; align-items:center; gap:var(--s2)}
+.blocked-head svg{width:var(--glyph); height:var(--glyph); flex:none}
+.blocked h2{font-size:var(--fs-h2); font-weight:700; color:var(--ink)}
+.blocked p{color:var(--ink)}
+.blocked .raw{font-size:var(--fs-label); color:var(--ink-2)}
+/* Storage skin (LOOK 3.6 r2): amber, Settings and Phone check only, never Today. Never red. */
+.banner-storage{background:var(--backup-bg); border-left-color:var(--backup)}
+
+/* ---------- toast (LOOK 3.7) ---------- */
+.toast{position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom) + var(--bar-h) + var(--s3));
+  transform:translate(-50%, var(--toast-rise)); opacity:0; width:max-content; max-width:calc(100% - 2 * var(--gutter));
+  background:var(--ink); color:var(--surface); font-size:var(--fs-small); font-weight:var(--fw-semi);
+  padding:var(--s3) var(--s4); border-radius:var(--r-pill); box-shadow:var(--shadow-toast);
+  transition:opacity var(--t-med) var(--ease), transform var(--t-med) var(--ease); pointer-events:none}
+.toast.is-on{opacity:1; transform:translate(-50%, 0)}
+/* LOOK 3.7 stack order (LB3): the toast sits above every sheet and scrim (.sheet-wrap is 20). */
+.toast{z-index:30}
+/* LOOK 3.7 r4.4: while a sheet is open the toast anchors to the top, and rises from above. */
+body:has(.sheet-wrap) .toast{top:calc(env(safe-area-inset-top) + var(--s3)); bottom:auto; transform:translate(-50%, calc(-1 * var(--toast-rise)))}
+body:has(.sheet-wrap) .toast.is-on{transform:translate(-50%, 0)}
+/* Long toast (LOOK 3.7): wraps to at most 3 lines, left-aligned, --r-lg corners. */
+.toast{line-height:var(--lh-body)}
+/* LOOK 4.10 rep range ask (LB2): the line is 15px --ink; its .num spans keep the line's size. */
+#range-line{font-size:var(--fs-small); color:var(--ink)}
+.toast.is-long{border-radius:var(--r-lg); text-align:left; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; line-clamp:3; overflow:hidden}
+
+/* ---------- bottom bar (LOOK 3.8) ---------- */
+.tabbar{position:fixed; left:0; right:0; bottom:0; display:flex; background:var(--surface);
+  border-top:1px solid var(--line); height:calc(var(--bar-h) + env(safe-area-inset-bottom));
+  padding-bottom:env(safe-area-inset-bottom)}
+.tab{flex:1; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:var(--tab-gap); height:var(--bar-h); color:var(--ink-2); text-decoration:none;
+  font-size:var(--fs-label); font-weight:var(--fw-semi)}
+.tab svg{width:var(--glyph); height:var(--glyph)}
+.tab.is-active{color:var(--accent)}
+.tab.is-active::before{content:""; position:absolute; top:0; left:50%; transform:translateX(-50%);
+  width:var(--tab-bar-mark-w); height:var(--tab-bar-mark-h); border-radius:var(--r-pill); background:var(--accent)}
+
+/* ---------- empty state with ghost tally (LOOK 3.9, 3.10) ---------- */
+.empty{display:flex; flex-direction:column; align-items:center; text-align:center; gap:var(--s3); padding-top:var(--s7)}
+.tally{display:inline-flex; align-items:flex-end; gap:var(--ghost-gap); height:var(--ghost-h); position:relative}
+.tally-stroke{display:block; width:var(--ghost-w); height:var(--ghost-h); border-radius:var(--stroke-r);
+  background:var(--line); transform:rotate(var(--lean))}
+.tally-stroke:nth-child(2n){transform:rotate(var(--lean-2))}
+
+/* ---------- safe-area probe for Phone check ---------- */
+.safe-probe{position:fixed; left:0; top:0; width:0; height:0; visibility:hidden;
+  padding-top:env(safe-area-inset-top); padding-bottom:env(safe-area-inset-bottom)}
+
+/* ==================== Slice 1 ==================== */
+.visually-hidden{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap}
+body.has-sheet .tabbar, body.is-typing .tabbar{display:none}
+.btn-danger{min-height:var(--tap); background:var(--surface); color:var(--ink); font-weight:var(--fw-bold); border:var(--bw-strong) solid var(--ink)}
+.btn-danger svg{width:var(--glyph-md); height:var(--glyph-md)}
+.btn-row{display:flex; gap:var(--s3)}
+.btn-row > .btn{flex:1}
+.quiet-row{display:flex; justify-content:center}
+
+/* sheet (LOOK 3.3) */
+.sheet-wrap{position:fixed; inset:0; z-index:20}
+.sheet-scrim{position:absolute; inset:0; background:var(--scrim)}
+.sheet{position:absolute; left:0; right:0; bottom:0; margin:0 auto; max-width:var(--content-max); max-height:88dvh; overflow-y:auto;
+  background:var(--surface); border-radius:var(--r-lg) var(--r-lg) 0 0; box-shadow:var(--shadow-sheet);
+  padding:var(--s3) var(--s4) calc(env(safe-area-inset-bottom) + var(--s4)); display:flex; flex-direction:column; gap:var(--s4)}
+.sheet[data-typing]{top:env(safe-area-inset-top); bottom:auto; max-height:50dvh}
+.sheet-handle{align-self:center; width:var(--handle-w); height:var(--handle-h); border-radius:var(--r-pill); background:var(--edge)}
+.q{display:flex; flex-direction:column; gap:var(--s2)}
+.q > .q-text{font-weight:var(--fw-semi)}
+.chip{display:flex; align-items:center; gap:var(--s3); min-height:var(--tap-big); width:100%; padding:0 var(--s4);
+  border:var(--bw) solid var(--edge); border-radius:var(--r-md); background:var(--surface); text-align:left; cursor:pointer}
+.chip .badge{display:inline-flex; align-items:center; justify-content:center; width:var(--badge-d); height:var(--badge-d);
+  border-radius:var(--r-pill); background:var(--surface-2); flex:none}
+.chip .grow{flex:1}
+.chip svg{width:var(--glyph-sm); height:var(--glyph-sm)}
+.chip.is-on{background:var(--accent-bg); border:var(--bw-strong) solid var(--accent)}
+.chip.is-on .badge{background:var(--accent); color:var(--on-accent)}
+.chip:not(.is-on) svg{display:none}
+.inset{background:var(--surface-2); border-radius:var(--r-md); padding:var(--s3); display:flex; flex-direction:column; gap:var(--s3)}
+.inset-backup{background:var(--backup-bg); color:var(--ink)}
+.score-grid{display:grid; grid-template-columns:repeat(6, var(--score-chip)); gap:var(--s2)}
+.score{width:var(--score-chip); height:var(--score-chip); border:var(--bw) solid var(--edge); border-radius:var(--r-md); background:var(--surface); cursor:pointer}
+.score.is-on{background:var(--accent); color:var(--on-accent); border:var(--bw-strong) solid var(--accent)}
+textarea, .field, .confirm-input{width:100%; font-size:var(--fs-input); border:var(--bw) solid var(--edge); border-radius:var(--r-md);
+  padding:var(--s3); background:var(--surface); color:var(--ink)}
+.field, .confirm-input{min-height:var(--tap)}
+/* The default-name placeholder in --ink-2, never the browser grey (LOOK 4.6, Part 2; review P21 b). */
+.field::placeholder{color:var(--ink-2); opacity:1}
+.confirm{display:flex; flex-direction:column; gap:var(--s1)}
+.seg{display:flex; flex-wrap:wrap; gap:var(--s2)}
+.seg .chip{width:auto; min-height:var(--tap-min); flex:1 1 auto; justify-content:center; white-space:nowrap; padding:0 var(--s3); gap:var(--s2)}
+
+/* Today (LOOK 4.3) */
+.day-head{display:flex; flex-direction:column; gap:var(--s2)}
+.ex-card{background:var(--surface); border:var(--bw) solid var(--line); border-radius:var(--r-lg); overflow:hidden}
+.ex-card.is-done{border:var(--bw-strong) solid var(--done)}
+.ex-head{display:flex; align-items:flex-start; gap:var(--s2); padding:var(--s4) var(--s4) var(--s2)}
+.ex-head .grow{flex:1; min-width:0}
+.ex-name{font-size:var(--fs-h2); font-weight:var(--fw-bold); line-height:var(--lh-tight); display:inline-flex; align-items:center; gap:var(--s2)}
+.ex-name svg{width:var(--card-check); height:var(--card-check); color:var(--done); flex:none}
+.ex-sub, .ex-last, .ex-since{font-size:var(--fs-small); color:var(--ink-2)}
+.ex-head .tally{height:var(--tally-h); align-self:center}
+.ex-head .tally-stroke{height:var(--tally-h); width:var(--stroke-w); background:var(--line)}
+.ex-head .tally-stroke.is-done{background:var(--chalk)}
+/* Groups of five (LOOK 3.9): four strokes, then the slash centered over them at 62deg. */
+.tally.tally-grouped{gap:var(--tally-group-gap)}
+.tally-group{display:inline-flex; align-items:flex-end; gap:var(--ghost-gap); height:100%; position:relative}
+.tally-slash{position:absolute; left:50%; top:50%; width:var(--stroke-w); height:var(--tally-slash); border-radius:var(--stroke-r);
+  background:var(--line); transform:translate(-50%, -50%) rotate(62deg)}
+.tally-slash.is-done{background:var(--chalk)}
+.set{display:grid; grid-template-columns:var(--col-setno) 1fr 1fr var(--tap); gap:var(--s2); align-items:center;
+  min-height:var(--row-h); padding:0 var(--s3) 0 calc(var(--s3) - var(--bw-state)); border-left:var(--bw-state) solid transparent;
+  border-bottom:1px solid var(--line); background:var(--bg)}
+.set-no{text-align:center; color:var(--ink-2)}
+.cell{display:flex; align-items:baseline; gap:var(--s1); min-width:0}
+.cell .unit{font-size:var(--fs-small); color:var(--ink-2)}
+.val-btn{font-family:var(--font-num); font-weight:var(--fw-bold); font-size:var(--fs-num); background:none; border:0; padding:0;
+  min-height:var(--tap-min); min-width:var(--tap-min); text-align:left; color:var(--ink); cursor:pointer}
+.val-in{font-family:var(--font-num); font-weight:var(--fw-bold); font-size:var(--fs-num); width:100%; min-height:var(--tap-min);
+  border:var(--bw-strong) solid var(--accent); background:var(--accent-bg); border-radius:var(--r-sm); color:var(--ink); padding:0 var(--s1)}
+.tick{width:var(--tap); height:var(--tap); display:flex; align-items:center; justify-content:center; background:none; border:0; cursor:pointer}
+.tick .ring{width:var(--tick-d); height:var(--tick-d); border-radius:var(--r-pill); border:var(--bw-strong) solid var(--edge);
+  display:flex; align-items:center; justify-content:center}
+.tick svg{width:var(--glyph-sm); height:var(--glyph-sm)}
+.helper{grid-column:2 / 5; font-size:var(--fs-label); color:var(--ink-2); padding-bottom:var(--s2)}
+.helper:empty{display:none}
+.set.is-open{background:var(--surface); border-left-color:var(--accent)}
+.set.is-open .tick .ring{border-color:var(--accent)}
+.set.is-done{background:var(--done-bg); border-left-color:var(--done)}
+.set.is-done .val-btn{font-weight:var(--fw-heavy)}
+.set.is-done .tick .ring{background:var(--done); border-color:var(--done); color:var(--done-bg)}
+.set.is-skipped{background:var(--skip-bg); border-left-color:var(--skip); border-left-style:dashed; min-height:var(--row-h-help)}
+.set.is-skipped .tick .ring{border-color:var(--skip); color:var(--skip)}
+.set.is-skipped .val-btn{color:var(--ink-2); text-decoration:line-through}
+.set.is-saving .helper{color:var(--ink-2)}
+.set.is-failed{background:var(--fail-bg); border-left-color:var(--fail)}
+.set.is-failed .tick .ring{border-color:var(--fail); color:var(--fail)}
+.set.is-failed .helper{color:var(--fail); font-size:var(--fs-small)}
+.strips{grid-column:1 / 5; display:flex; flex-direction:column; gap:var(--s2); padding:0 0 var(--s3) var(--col-setno)}
+.steppers{display:grid; grid-template-columns:1fr 1fr; gap:var(--s2)}
+.steppers > div{display:grid; grid-template-columns:1fr 1fr; gap:var(--s1)}
+.step{min-height:var(--tap); border:var(--bw) solid var(--edge); border-radius:var(--r-md); background:var(--surface); cursor:pointer;
+  display:flex; align-items:center; justify-content:center}
+.step svg{width:var(--glyph); height:var(--glyph)}
+.rl-chips{display:grid; grid-template-columns:repeat(5, 1fr); gap:var(--s2)}
+.br-chips{grid-template-columns:repeat(4, 1fr)}
+.rl{min-height:var(--tap-min); border:var(--bw) solid var(--edge); border-radius:var(--r-md); background:var(--surface); cursor:pointer}
+.rl.is-on{background:var(--accent-bg); border:var(--bw-strong) solid var(--accent)}
+.rl svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none; vertical-align:middle}
+.toggle{min-height:var(--tap-min); border:var(--bw) solid var(--edge); border-radius:var(--r-md); background:var(--surface);
+  display:flex; align-items:center; gap:var(--s2); padding:0 var(--s3); font-size:var(--fs-small); font-weight:var(--fw-semi); cursor:pointer; width:100%}
+.toggle[aria-pressed="true"]{background:var(--accent-bg); border:var(--bw-strong) solid var(--accent)}
+.toggle .box{flex:none; display:inline-flex; align-items:center; justify-content:center; width:var(--glyph); height:var(--glyph); border:var(--bw) solid var(--edge); border-radius:var(--stroke-r)}
+.toggle .box svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none}
+.toggle[aria-pressed="false"] .box svg{display:none}
+.toggle[aria-pressed="true"] .box{background:var(--accent); border-color:var(--accent); color:var(--on-accent)}
+.fail-note{font-size:var(--fs-label); color:var(--ink-2)}
+.ex-foot{display:flex; justify-content:space-between; align-items:center; padding:0 var(--s2)}
+.ex-foot a{color:var(--accent); font-size:var(--fs-small); font-weight:var(--fw-semi); min-height:var(--tap-min); display:inline-flex; align-items:center}
+.menu-row{display:flex; align-items:center; min-height:var(--tap); width:100%; background:none; border:0; border-bottom:1px solid var(--line);
+  font-size:var(--fs-body); text-align:left; cursor:pointer; padding:0 var(--s2)}
+.menu-row:last-child{border-bottom:0}
+.menu-row-sep{border-top:1px solid var(--line); margin-top:var(--s3)}
+.tab-dot{position:absolute; top:var(--s2); right:calc(50% - var(--glyph)); width:var(--dot); height:var(--dot); border-radius:var(--r-pill); background:var(--backup)}
+
+/* builder and picker (LOOK 4.5, 4.6) */
+progress{appearance:none; -webkit-appearance:none; width:100%; height:var(--progress-h); border:0; border-radius:var(--r-pill); background:var(--surface-2)}
+progress::-webkit-progress-bar{background:var(--surface-2); border-radius:var(--r-pill)}
+progress::-webkit-progress-value{background:var(--accent); border-radius:var(--r-pill)}
+progress::-moz-progress-bar{background:var(--accent)}
+.day-card{background:var(--surface); border:var(--bw) solid var(--line); border-radius:var(--r-lg); padding:var(--s4); display:flex; flex-direction:column; gap:var(--s3)}
+.lift-row{display:flex; flex-direction:column; gap:var(--s2); border-top:1px solid var(--line); padding-top:var(--s3)}
+.lift-nums{display:grid; grid-template-columns:repeat(4, 1fr); gap:var(--s2); align-items:center}
+.lift-nums .field{text-align:center; padding:0 var(--s1)}
+.lift-heads{display:grid; grid-template-columns:repeat(4, 1fr); gap:var(--s2); text-align:center}
+.lift-top{display:flex; align-items:center; gap:var(--s2)}
+.lift-steps{display:flex; align-items:center; justify-content:flex-end; gap:var(--s2)}
+.pick-row{display:flex; align-items:center; gap:var(--s3); width:100%; min-height:var(--tap-big); background:none; border:0;
+  border-bottom:1px solid var(--line); text-align:left; padding:0 var(--s4); cursor:pointer}
+.pick-row .grow{flex:1; min-width:0}
+.pick-row svg{width:var(--glyph); height:var(--glyph); color:var(--accent)}
+.group-label{position:sticky; top:0; background:var(--bg); padding:var(--s2) 0}
+.chips-row{display:flex; gap:var(--s2); overflow-x:auto}
+.chips-row .chip{width:auto; min-height:var(--tap-min); flex:none}
+.file-input{position:absolute; left:0; top:0; width:1px; height:1px; opacity:0; visibility:hidden; pointer-events:none}
+
+/* ---------- polish stage 3: his lift note and the check inset (LOOK 3.2, DESIGN 15 Parts 17, 18) ---------- */
+.ex-note{font-size:var(--fs-label); color:var(--ink-2); margin-top:var(--s2); overflow-wrap:anywhere}
+.check-inset{margin:var(--s2) var(--s3); gap:var(--s4)}
+.check-q{display:flex; flex-direction:column; gap:var(--s2)}
+.check-chips{display:grid; grid-template-columns:1fr 1fr; gap:var(--s3)}
+.check-chips .chip{min-height:var(--tap); background:var(--surface)}
+.check-chips .chip[disabled]{opacity:.4}
+
+/* ---------- Day done screen (LOOK 4.10, DESIGN 15 Part 14) ---------- */
+#daydone{display:flex; flex-direction:column; gap:var(--s4)}
+.tally-lg{height:var(--tally-h-lg)}
+.tally-lg .tally-stroke{width:var(--tally-w-lg); height:var(--tally-h-lg)}
+.tally-lg .tally-stroke.is-done, .tally-lg .tally-slash.is-done{background:var(--chalk)}
+.tally-lg .tally-slash{width:var(--tally-w-lg); height:calc(var(--tally-h-lg) + var(--s3))}
+.done-card{padding:0}
+.done-row{display:flex; align-items:center; gap:var(--s4); min-height:var(--tap); padding:0 var(--s4); border-bottom:1px solid var(--line)}
+.done-row:last-child{border-bottom:0}
+.done-n{font-size:var(--fs-num); min-width:var(--hist-col); text-align:right}
+.done-word{color:var(--ink-2)}

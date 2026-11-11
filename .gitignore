@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+test-output/
+*.log
+liftlog-backup-*.json
+*.mov
+*.mp4
