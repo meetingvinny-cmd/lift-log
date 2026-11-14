@@ -1,11 +1,11 @@
 // sw.js - offline shell. Classic worker, no imports.
 // VERSION must equal APP_VERSION in version.js (the static test checks it).
 // Once a version has been pushed, any change to a SHELL file ships under a new VERSION.
-const VERSION = '0.2.6';
+const VERSION = '0.3.0';
 const CACHE = 'liftlog-' + VERSION;
 // sha256 of every SHELL file (this one with this line removed). The static test
 // recomputes it and fails on a mismatch, so a changed file forces a version bump.
-const SHELL_HASH = 'd61ec2e9a9d5ebb52c778ab0466fb6c23138206869aaa30b392964e3e923ef94';
+const SHELL_HASH = '43d3e351e4234e90c8b690c3f0d7130c2b3183ec548cd7f952c4a7bee42ebf2d';
 
 // Every file the app serves. Must equal the git file list minus the files that
 // are never shipped (static test). No other file holds this list.
@@ -30,6 +30,7 @@ const SHELL = [
   'ui/settings.js',
   'ui/today.js',
   'ui/builder.js',
+  'ui/block.js',
   'icons/apple-touch-icon.png',
   'icons/icon-192.png',
   'icons/icon-512.png'

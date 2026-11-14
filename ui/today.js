@@ -2,19 +2,30 @@
 // Every tap writes at once through the store. A row shows Done only after its
 // write has committed; until then it shows Saving, and a write that fails twice
 // turns the row red with a retry.
-import { el, clear, glyph, sheet, ghostTally, toast, typedConfirm, untyped } from './dom.js';
-import { t, tn, numSplit } from './strings.js';
-import { LIMITS, isLink } from '../backup.js';
+import { el, svg, clear, glyph, sheet, ghostTally, toast, typedConfirm, untyped } from './dom.js';
+import { S, t, tn, numSplit } from './strings.js';
+import { LIMITS, isLink, SET_KINDS } from '../backup.js';
 import { MUSCLE_NAMES, EQUIPMENT_NAMES } from '../data/exercises.js';
 import { finishable, effectiveExercise, deleteReason, checksFor } from '../store.js';
 import { openBuilder } from './builder.js';
 
 const LINK_REL = 'noopener noreferrer';   // plain link to the uploader, never embedded
 const NO_DONE_SET = 'no done set';       // the store's refusal code for a day with no done set (R4-02)
+const DAY_OPEN = 'day open';             // the store's refusal code for Close block with a day open (16 B.5 row 7)
 const rowState = new Map();     // set id -> 'saving' | 'failed'
 let openId = null;              // the row he tapped open, if any
 let inset = null;               // the block check inset (15 Part 17): {day, slot, after: set id or null}
 let sinceTimer = null;
+// Slice 2: the soreness-alone sheet he put off (Ask me later) or passed (Skip) this app session,
+// by feedback row id (16 B.4.4, B.5 row 9). Ask me later folds soreness into the end sheet; Skip
+// leaves it off the end sheet.
+const soreLater = new Set();
+const soreSkipped = new Set();
+
+// Adjust each round is on for the day shown (16 B.2 note 1, read by the store with its clock).
+const adaptive = (v) => !!v && v.profile === 'adaptive';
+// Refusal codes the Slice 2 store calls give, mapped to their reason words (16 B.5 rows 7, 10).
+const REASON = { flag: 'scope.refused.flag', last: 'scope.refused.last' };
 
 const fmtNum = (n) => (n === null || n === undefined) ? '' : String(Math.round(n * 100) / 100);
 
@@ -142,16 +153,24 @@ export function breakChips(cur, label, onPick) {
 // 1 kg. The signed table (load.default_steps) is read here once Slice 2 wires rules.js in; its
 // signed values today are 5 lb for barbell, machine, cable and dumbbell and none in kg, which is
 // the same step this fallback gives. Returns {list} or {size}.
-export function loadStep(ex, unit) {
+// Slice 2 (16 B.1 step 7 a): the signed load.default_steps[unit][equipment] of the day's rule table
+// (rules, from the store's dayView) is read after the row's step_default and before the fallback,
+// the order stepFor reads. Where the engine has no step (an assist row, or a kind of equipment the
+// signed table does not list) the steppers keep the fallback, so he can still move it by hand.
+export function loadStep(ex, unit, rules) {
   if (ex && Array.isArray(ex.weight_steps) && ex.weight_steps.length) return { list: [...ex.weight_steps].sort((a, b) => a - b) };
   if (ex && typeof ex.step === 'number' && ex.step > 0) return { size: ex.step };
   if (unit !== 'kg' && ex && typeof ex.step_default === 'number' && ex.step_default > 0) return { size: ex.step_default };
+  const byUnit = rules && rules.load && rules.load.default_steps ? rules.load.default_steps[unit] : null;
+  const d = ex && byUnit && Object.prototype.hasOwnProperty.call(byUnit, ex.equipment) && Array.isArray(byUnit[ex.equipment])
+    ? byUnit[ex.equipment].filter(n => typeof n === 'number' && n > 0).sort((a, b) => a - b) : [];
+  if (d.length) return { size: d[0] };
   return { size: unit === 'kg' ? 1 : 5 };
 }
 
-export function stepLoad(ex, load, dir, unit) {
+export function stepLoad(ex, load, dir, unit, rules) {
   const v = load === null ? 0 : load;
-  const st = loadStep(ex, unit);
+  const st = loadStep(ex, unit, rules);
   if (st.list) {
     if (dir > 0) { const n = st.list.find(x => x > v); return n === undefined ? v : n; }
     const p = st.list.filter(x => x < v).pop();
@@ -188,13 +207,18 @@ async function draw(ctx, screen) {
   const unit = await store.getSetting('unit', null);
   const block = await store.activeBlock();
   const day = await store.currentDay();
-  if (!day) {
+  // A block closed with Close block keeps its planned days (16 B.5 row 7), so its next day is not
+  // shown: Today shows the Block finished state, as after the last day.
+  const closed = !!day && !!block && block.status === 'done' && day.block_id === block.id && day.status !== 'open';
+  if (!day || closed) {
     // A block whose last day is done is finished, not missing (C27).
     box.appendChild(unit === null && !block ? setupScreen(ctx) : block && block.status === 'done' ? blockDone(ctx) : noBlock(ctx));
     commit();
     return;
   }
   const v = await store.dayView(day.id);
+  // Slice 2: the why line per slot and the open row's retarget line, Adjust each round only (B.5 rows 12, 13).
+  const whys = adaptive(v) ? await store.slotWhy(day.id) : {};
 
   if (store.isStale(day)) {
     box.appendChild(el('div', { class: 'banner', id: 'stale-card', role: 'status' },
@@ -202,14 +226,19 @@ async function draw(ctx, screen) {
       el('button', { class: 'btn btn-secondary', type: 'button', id: 'stale-finish', on: { click: () => finishFlow(ctx, day.id) } }, t('today.finish'))));
   }
   const b = v.block;
+  // The sleep card (16 B.5 row 1, LOOK 4.11): above the header, on a planned day only, in both profiles.
+  if (day.status === 'planned') box.appendChild(sleepCard(ctx, screen, day, b));
   // The day menu sits at the right of the position line (LOOK 4.3, 15 Parts 1 and 12).
   const menuBtn = el('button', { class: 'btn btn-icon', type: 'button', id: 'day-menu', 'aria-label': t('day.menu'), on: { click: () => dayMenu(ctx, screen, v) } }, glyph('more'));
+  const roundPill = el('span', { class: 'pill pill-info', id: 'round-pill' }, b.passes === null ? t('today.round', { r: day.pass }) : t('today.round.of', { r: day.pass, n: b.passes }));
+  // On an easy round day the Easy round pill sits beside the round pill in its own row (LOOK 3.5, B.5 row 3).
+  const pills = v.easy ? el('div', { class: 'pill-row' }, roundPill, el('span', { class: 'pill pill-easy', id: 'easy-pill' }, tildeGlyph(), t('pill.easy'))) : roundPill;
   box.appendChild(el('div', { class: 'day-head' },
     el('div', { class: 'pos-row' },
       el('p', { class: 'label grow', id: 'day-position' }, t('today.position', { r: day.pass, label: day.label || String(day.day) })),
-      dayMenuRows(day, v.sets).length ? menuBtn : null),
+      dayMenuRows(day, v.sets, b).length ? menuBtn : null),
     el('h1', { id: 'day-label' }, dayTitle(day)),
-    el('span', { class: 'pill pill-info', id: 'round-pill' }, b.passes === null ? t('today.round', { r: day.pass }) : t('today.round.of', { r: day.pass, n: b.passes })),
+    pills,
     progressLine(v.sets)));
   if (b.notes) box.appendChild(el('p', { class: 'lead', id: 'block-notes' }, b.notes));
 
@@ -222,19 +251,28 @@ async function draw(ctx, screen) {
   const since = await store.sinceLastSet(day.id);
 
   if (inset && inset.day !== day.id) inset = null;
+  // The retarget line of the open row: only when its shown weight differs from the target (B.5 row 13).
+  let retarget = null;
+  if (adaptive(v) && open && open.kind === 'work') {
+    const shown = open.draft && open.draft.load !== null && open.draft.load !== undefined ? open.draft.load : open.target.load;
+    if (shown !== open.target.load && shown !== null && shown !== undefined) retarget = await store.retarget(open.id, shown).catch(() => null);
+  }
   for (const slot of order) {
     const sets = v.sets.filter(s => s.slot === slot);
     // The exercise as this block uses it, in every reader on the card (15 Part 18, R4-04).
     const ex = effectiveExercise(b, v.exercises.get(sets[0].exercise_id));
     const last = (await store.lastTime(sets[0].exercise_id, day.id)).filter(s => s.kind === 'work');
-    box.appendChild(card(ctx, screen, v, slot, sets, ex, last, open, since));
+    box.appendChild(card(ctx, screen, v, slot, sets, ex, last, open, since, whys[slot] || null, retarget));
   }
   // Finish day only on a day he started (or skipped through): one tap on an untouched day
   // must never close it and move him on (C34).
   if (finishable(day, v.sets)) {
     box.appendChild(el('button', { class: 'btn btn-primary', type: 'button', id: 'finish-day', on: { click: () => finishFlow(ctx, day.id) } }, t('today.finish')));
   }
-  commit({ 'data-day': day.id, 'data-status': day.status });
+  if (!commit({ 'data-day': day.id, 'data-status': day.status, 'data-profile': v.profile || 'fixed' })) return;
+  // A pick made in the picker for this day (Swap with a scope, Add exercise) goes on here (B.5 rows 10, 17).
+  const pend = ctx.todayEdit;
+  if (pend && pend.dayId === day.id) { ctx.todayEdit = null; await pickedFlow(ctx, screen, v, pend); }
 }
 
 // The day progress numbers (15 Part 13): every set row of the day counts (warm-ups, L and R
@@ -262,15 +300,24 @@ export function dayTitle(day) {
   return day.label || t('day.n', { n: day.day });
 }
 
+// The exercises a day holds: slots with a set not skipped (the store's LIFTS_PER_DAY count, 16 B.5 row 17).
+export function liveLifts(sets) {
+  return new Set((sets || []).filter(s => s.status !== 'skipped').map(s => s.slot)).size;
+}
+
 // The day menu rows that apply to this day, in the LOOK 4.3 order; rows that do not apply
 // are left out, never shown disabled. Skip day sits after the hairline, on a planned or open
-// day with no done set (15 Part 15, R4-02).
-export function dayMenuRows(day, sets) {
+// day with no done set (15 Part 15, R4-02). From Slice 2, with the day's block given: Add an
+// exercise first, on a planned or open day holding fewer than LIFTS_PER_DAY exercises (B.5 row 17),
+// and Close block last, on a block not finished (B.5 row 7).
+export function dayMenuRows(day, sets, block) {
   const rows = [];
   const live = day.status === 'planned' || day.status === 'open';
+  if (block && live && liveLifts(sets) < LIMITS.LIFTS_PER_DAY) rows.push('addex');
   if (live) rows.push('relabel');
   if (day.status === 'open') rows.push('reset');
   if (live && !(sets || []).some(s => s.status === 'done')) rows.push('skip');
+  if (block && block.status !== 'done') rows.push('end');
   return rows;
 }
 
@@ -278,15 +325,172 @@ function dayMenu(ctx, screen, v) {
   const day = v.day;
   let sh = null;
   const act = {
-    relabel: () => { sh.close(); relabelSheet(day.label, async (val) => { await ctx.store.relabelDay(day.id, val); redraw(ctx, screen); }); },
+    addex: () => { sh.close(); ctx.picker = { mode: 'addex', dayId: day.id, back: '#/today' }; ctx.go('#/picker'); },
+    relabel: () => { sh.close(); relabelSheet(day.label, async (val) => {
+      // In Adjust each round the save asks where the change goes (LOOK 4.3, B.5 row 10).
+      if (adaptive(v)) await scopeSheet((sc) => ctx.store.liveEdit({ type: 'relabel', dayId: day.id, label: val }, sc));
+      else await ctx.store.relabelDay(day.id, val);
+      redraw(ctx, screen);
+    }); },
     reset: () => { sh.close(); resetSheet(ctx, screen, v); },
-    skip: () => { sh.close(); skipDaySheet(ctx, screen, v); }
+    skip: () => { sh.close(); skipDaySheet(ctx, screen, v); },
+    end: () => {
+      sh.close();
+      // Refused while a day is open: the toast, nothing else (LOOK 4.7).
+      if (day.status === 'open') { toast(t('end.open')); return; }
+      endSheet(ctx, v);
+    }
   };
-  const words = { relabel: 'day.relabel', reset: 'day.reset', skip: 'daymenu.skip' };
-  // The hairline sets off the row that moves the block forward (LOOK 4.3).
-  sh = sheet({ id: 'day-menu-sheet' }, el('div', { class: 'card' }, dayMenuRows(day, v.sets).map(k =>
-    el('button', { class: 'menu-row' + (k === 'skip' ? ' menu-row-sep' : ''), type: 'button', 'data-dayitem': k, on: { click: act[k] } }, t(words[k])))));
+  const words = { addex: 'daymenu.addex', relabel: 'day.relabel', reset: 'day.reset', skip: 'daymenu.skip', end: 'daymenu.end' };
+  // The hairline sets off the rows that move the block forward (LOOK 4.3): it hangs on the first of them.
+  const rows = dayMenuRows(day, v.sets, v.block);
+  const sep = rows.find(k => k === 'skip' || k === 'end');
+  sh = sheet({ id: 'day-menu-sheet' }, el('div', { class: 'card' }, rows.map(k =>
+    el('button', { class: 'menu-row' + (k === sep ? ' menu-row-sep' : ''), type: 'button', 'data-dayitem': k, on: { click: act[k] } }, t(words[k])))));
 }
+
+// Close block (16 B.5 row 7, LOOK 4.11 confirm): a title, one line, a secondary confirm and a quiet
+// Cancel. The store refuses it while a day is open (code 'day open'); planned days stay; then Today
+// shows the Block finished state.
+function endSheet(ctx, v) {
+  const go = el('button', { class: 'btn btn-secondary', type: 'button', id: 'end-go' }, t('daymenu.end'));
+  const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'end-cancel' }, t('text.cancel'));
+  const sh = sheet({ id: 'end-sheet', title: t('end.title') },
+    el('p', { class: 'small' }, t('end.line')), go, el('div', { class: 'quiet-row' }, cancel));
+  cancel.addEventListener('click', () => sh.close());
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      await ctx.store.endBlock(v.block.id);
+    } catch (e) {
+      go.disabled = false;
+      toast(t(e && e.code === DAY_OPEN ? 'end.open' : 'today.notsaved'));
+      return;
+    }
+    sh.close();
+    openId = null;
+    inset = null;
+    ctx.render();
+  });
+}
+
+// The Rest of block choice (16 B.5 row 10, LOOK 3.2): Today only, then Rest of block with its line,
+// and a quiet Cancel. A chip applies the change at once through apply(scope). A refused change shows
+// its reason in the sheet in place of the line, and that chip turns off; any other failure says
+// today.notsaved and keeps the sheet. refused: a reason known before any tap ({rest: code}).
+// Resolves true once a change was saved, false on Cancel.
+export function scopeSheet(apply, refused) {
+  return new Promise((resolve) => {
+    let done = false;
+    const pre = refused || {};
+    const line = el('p', { class: 'small scope-line', id: 'scope-rest-line' }, t('scope.rest.line'));
+    const chip = (sc, key) => el('button', { class: 'chip', type: 'button', id: 'scope-' + sc, 'data-scope': sc }, el('span', { class: 'grow' }, t(key)));
+    const today = chip('today', 'scope.today');
+    const rest = chip('rest', 'scope.rest');
+    const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'scope-cancel' }, t('text.cancel'));
+    const refuse = (btn, code) => {
+      btn.setAttribute('aria-disabled', 'true');
+      btn.disabled = true;
+      line.textContent = t(REASON[code]);
+      line.setAttribute('data-refused', code);
+    };
+    if (pre.rest && REASON[pre.rest]) refuse(rest, pre.rest);
+    if (pre.today && REASON[pre.today]) refuse(today, pre.today);
+    const sh = sheet({ id: 'scope-sheet', title: t('scope.title'), onClose: () => resolve(done) },
+      el('div', { class: 'q-chips stack' }, today, rest, line), el('div', { class: 'quiet-row' }, cancel));
+    const pick = async (sc, btn) => {
+      today.disabled = true; rest.disabled = true;
+      try {
+        await apply(sc);
+      } catch (e) {
+        today.disabled = today.getAttribute('aria-disabled') === 'true';
+        rest.disabled = rest.getAttribute('aria-disabled') === 'true';
+        if (e && REASON[e.code]) refuse(btn, e.code);
+        else toast(t('today.notsaved'));
+        return;
+      }
+      done = true;
+      sh.close();
+    };
+    today.addEventListener('click', () => pick('today', today));
+    rest.addEventListener('click', () => pick('rest', rest));
+    cancel.addEventListener('click', () => sh.close());
+  });
+}
+
+// The pick of the picker on Today (16 B.5 rows 10 and 17): a swap in Adjust each round asks where it
+// goes; Add exercise opens its sets sheet, then the Rest of block choice. Nothing is written before
+// a chip is tapped.
+async function pickedFlow(ctx, screen, v, p) {
+  const dayId = v.day.id;
+  if (p.mode === 'swap') {
+    const ok = await scopeSheet((sc) => ctx.store.liveEdit({ type: 'swap', dayId, slot: p.slot, exercise_id: p.exercise_id }, sc));
+    if (ok) redraw(ctx, screen);
+    return;
+  }
+  if (p.mode !== 'addex') return;
+  const ex = v.exercises.get(p.exercise_id) || (await ctx.store.exercisesMap()).get(p.exercise_id);
+  if (!ex) return;
+  const start = await ctx.store.addExerciseDefault(dayId, p.exercise_id).catch(() => 1);
+  const n = await addExSheet(ex, start);
+  if (n === null) return;
+  const ok = await scopeSheet((sc) => ctx.store.liveEdit({ type: 'add_exercise', dayId, exercise_id: p.exercise_id, sets: n }, sc));
+  if (ok) redraw(ctx, screen);
+}
+
+// The Add exercise sets sheet (LOOK 4.3): the exercise name as its title, the addex.sets label over
+// a stepper, 1 to LIMITS.SETS_MAX; minus is off at 1 and plus at the top, both shown. Resolves the
+// count on Save, null on Cancel.
+function addExSheet(ex, start) {
+  return new Promise((resolve) => {
+    let n = Math.max(1, Math.min(LIMITS.SETS_MAX, Number.isInteger(start) ? start : 1));
+    let out = null;
+    const count = el('span', { class: 'num addex-count', id: 'addex-count', 'aria-live': 'polite' }, String(n));
+    const less = el('button', { class: 'step', type: 'button', id: 'addex-less', 'aria-label': t('addex.less') }, glyph('minus'));
+    const more = el('button', { class: 'step', type: 'button', id: 'addex-more', 'aria-label': t('addex.more') }, glyph('plus'));
+    const paint = () => { count.textContent = String(n); less.disabled = n <= 1; more.disabled = n >= LIMITS.SETS_MAX; };
+    less.addEventListener('click', () => { if (n > 1) { n--; paint(); } });
+    more.addEventListener('click', () => { if (n < LIMITS.SETS_MAX) { n++; paint(); } });
+    paint();
+    const save = el('button', { class: 'btn btn-primary', type: 'button', id: 'addex-save' }, t('text.save'));
+    const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'addex-cancel' }, t('text.cancel'));
+    const sh = sheet({ id: 'addex-sheet', title: ex.name, onClose: () => resolve(out) },
+      el('p', { class: 'label', id: 'addex-label' }, t('addex.sets')), el('div', { class: 'addex-step', role: 'group', 'aria-labelledby': 'addex-label' }, less, count, more),
+      save, el('div', { class: 'quiet-row' }, cancel));
+    save.addEventListener('click', () => { out = n; sh.close(); });
+    cancel.addEventListener('click', () => sh.close());
+  });
+}
+
+// The sleep card (16 B.5 row 1, B.4.3, LOOK 4.11): the question, his block's sleep hint when set
+// (his words, text only), and No then Yes. Tapping the picked chip clears it. It never opens the day.
+function sleepCard(ctx, screen, day, block) {
+  const cur = day.short_sleep_since_last === true ? true : day.short_sleep_since_last === false ? false : null;
+  const pick = async (val) => {
+    try { await ctx.store.answerSleep(day.id, cur === val ? null : val); } catch (e) { toast(t('today.notsaved')); }
+    await redraw(ctx, screen);
+  };
+  const chip = (val, key) => el('button', { class: 'chip' + (cur === val ? ' is-on' : ''), type: 'button', id: val ? 'sleep-yes' : 'sleep-no',
+    'aria-pressed': String(cur === val), on: { click: () => pick(val) } }, el('span', { class: 'grow' }, t(key)), glyph('check'));
+  const hint = block && typeof block.sleep_hint === 'string' && block.sleep_hint ? el('p', { class: 'sleep-hint', id: 'sleep-hint' }, block.sleep_hint) : null;
+  return el('div', { class: 'card sleep-card', id: 'sleep-card', 'data-answer': String(cur) },
+    el('p', { class: 'q-text', id: 'sleep-q' }, t('sleep.q')), hint,
+    el('div', { class: 'q-chips stack' }, chip(false, 'fb.no'), chip(true, 'fb.yes')));
+}
+
+// Our own drawn glyphs for the Slice 2 marks (LOOK 3.5, 3.1): the "~" of the Easy round pill, the
+// check in a circle of the met mark, and the hollow ring of the under goal mark. Drawn here with the
+// sprite's stroke style, so index.html stays as it is.
+const DRAWN = {
+  tilde: [['path', { d: 'M4 13.5c2.5-3 5-3 8 0s5.5 3 8 0' }]],
+  met: [['circle', { cx: '12', cy: '12', r: '9' }], ['path', { d: 'M8 12.5l2.8 2.8L16.5 9.5' }]],
+  ring: [['circle', { cx: '12', cy: '12', r: '8' }]]
+};
+function drawn(name) {
+  return svg('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' },
+    DRAWN[name].map(([tag, at]) => svg(tag, at)));
+}
+export const tildeGlyph = () => drawn('tilde');
 
 // Skip day (LOOK 4.11 confirm, 15 Part 15): a title, one line, a secondary confirm and a quiet
 // Cancel. No typed word, no undo. The store skips every planned set, ends the day and plans the
@@ -417,7 +621,7 @@ function fillTally(tally, doneFlags) {
   }
 }
 
-function card(ctx, screen, v, slot, sets, ex, last, open, since) {
+function card(ctx, screen, v, slot, sets, ex, last, open, since, why, retarget) {
   const day = v.day;
   const done = sets.filter(s => s.status === 'done').length;
   const allOver = sets.every(s => s.status !== 'planned');
@@ -443,6 +647,8 @@ function card(ctx, screen, v, slot, sets, ex, last, open, since) {
   const lift = liftOf(v, slot, sets[0].exercise_id);
   // His lift note (15 Part 18, LOOK 3.2): its own quiet line under the header, his words, text only.
   const noteLine = lift && lift.short_note ? el('p', { class: 'ex-note' }, lift.short_note) : null;
+  // The why line (16 B.5 row 12, LOOK 3.2): Adjust each round only, under his note, led by the info glyph.
+  const whyLine = adaptive(v) && why && typeof S[why] === 'string' ? el('p', { class: 'ex-why', 'data-why': why }, glyph('info'), el('span', {}, t(why))) : null;
   const menuBtn = el('button', { class: 'btn btn-icon', type: 'button', 'data-menu': String(slot), 'aria-label': t('menu.more', { exercise: name }), on: { click: () => cardMenu(ctx, v, slot, ex) } }, glyph('more'));
   const box = el('div', { class: 'ex-card' + (allOver ? ' is-done' : ''), 'data-slot': String(slot), 'data-exercise': sets[0].exercise_id },
     el('div', { class: 'ex-head' },
@@ -450,7 +656,7 @@ function card(ctx, screen, v, slot, sets, ex, last, open, since) {
         el('p', { class: 'ex-name' }, allOver ? glyph('check') : null, name),
         ex ? el('p', { class: 'ex-sub' }, t('today.sub', { muscle: MUSCLE_NAMES[ex.muscle] || '', equipment: EQUIPMENT_NAMES[ex.equipment] || '' })) : null,
         lastLine, sinceLine),
-      tally, menuBtn), noteLine);
+      tally, menuBtn), noteLine, whyLine);
   // The block check inset (15 Part 17): under the row just ticked, or above the open row when
   // opened from the card menu, while the exercise still has a planned set.
   const cks = checksFor(v.block, sets[0].exercise_id);
@@ -459,14 +665,25 @@ function card(ctx, screen, v, slot, sets, ex, last, open, since) {
   const firstPlanned = sets.find(s => s.status === 'planned');
   for (const s of sets) {
     if (showInset && !insetAt && s === firstPlanned) box.appendChild(checkInset(ctx, screen, v, slot, cks));
-    box.appendChild(setRow(ctx, screen, v, s, ex, open && open.id === s.id, lift));
+    box.appendChild(setRow(ctx, screen, v, s, ex, open && open.id === s.id, lift, open && open.id === s.id ? retarget : null));
     if (showInset && insetAt === s.id) box.appendChild(checkInset(ctx, screen, v, slot, cks));
   }
   const foot = el('div', { class: 'ex-foot' },
-    day.status !== 'done' && canAdd(v.block, ex) ? el('button', { class: 'btn btn-quiet', type: 'button', 'data-addset': String(slot), on: { click: async () => { await ctx.store.addSet(day.id, slot); redraw(ctx, screen); } } }, glyph('plus'), t('menu')[0]) : el('span', {}),
+    day.status !== 'done' && canAdd(v.block, ex) ? el('button', { class: 'btn btn-quiet', type: 'button', 'data-addset': String(slot), on: { click: () => addSetFlow(ctx, screen, v, slot) } }, glyph('plus'), t('menu')[0]) : el('span', {}),
     ex && ex.link && isLink(ex.link) ? linkTo(ex.link) : null);
   box.appendChild(foot);
   return box;
+}
+
+// Add set (Slice 1 as built in Fixed). In Adjust each round it asks where the set goes first
+// (16 B.5 row 10, LOOK 3.2): Today only or Rest of block, through liveEdit.
+async function addSetFlow(ctx, screen, v, slot) {
+  if (!adaptive(v)) {
+    await ctx.store.addSet(v.day.id, slot);
+    return redraw(ctx, screen);
+  }
+  if (await scopeSheet((sc) => ctx.store.liveEdit({ type: 'add_set', dayId: v.day.id, slot }, sc))) await redraw(ctx, screen);
+  return undefined;
 }
 
 // The block's lift for this card (his note and goal line), or null for a swapped-in slot.
@@ -519,7 +736,7 @@ function redraw(ctx, screen) {
   return draw(ctx, screen).catch(() => {});
 }
 
-function setRow(ctx, screen, v, s, ex, isOpen, lift) {
+function setRow(ctx, screen, v, s, ex, isOpen, lift, retarget) {
   const block = v.block, day = v.day;
   const st = rowState.get(s.id);
   const state = st || (s.status === 'done' ? 'done' : s.status === 'skipped' ? 'skipped' : isOpen ? 'open' : 'todo');
@@ -583,8 +800,24 @@ function setRow(ctx, screen, v, s, ex, isOpen, lift) {
 
   if (state === 'saving') helper.textContent = t('today.saving');
   else if (state === 'failed') helper.textContent = t('today.notsaved');
-  else if (isOpen || state === 'todo') helper.textContent = helperLine(s, lift);
-  else if (state === 'skipped') helper.appendChild(el('span', { class: 'pill pill-skip', 'aria-hidden': 'true' }, glyph('skip'), t('pill.skipped')));
+  else if (isOpen || state === 'todo') {
+    // A set kind other than Work shows its pill first (LOOK 3.1 Set kind, B.5 row 11).
+    const kp = kindPill(s);
+    if (kp) helper.appendChild(kp);
+    // The retarget line on the open row, Adjust each round only (B.5 row 13): the goal at the weight
+    // shown inside the band; outside it, the effort part only.
+    const rt = isOpen ? retargetLine(s, retarget) : null;
+    const words = rt !== null ? rt : helperLine(s, lift);
+    if (rt !== null) helper.setAttribute('data-retarget', retarget && retarget.effort_only ? 'effort' : 'goal');
+    if (words) helper.appendChild(document.createTextNode(words));
+  } else if (state === 'skipped') helper.appendChild(el('span', { class: 'pill pill-skip', 'aria-hidden': 'true' }, glyph('skip'), t('pill.skipped')));
+  else if (state === 'done') {
+    const kp = kindPill(s);
+    if (kp) helper.appendChild(kp);
+    // Met and missed marks (B.5 row 5, LOOK 3.1): Adjust each round only, a fact, never a fault.
+    const mk = adaptive(v) ? markOf(s) : null;
+    if (mk) helper.appendChild(el('span', { class: 'mark mark-' + mk, 'data-mark': mk }, drawn(mk === 'met' ? 'met' : 'ring'), t(mk === 'met' ? 'mark.met' : 'mark.under')));
+  }
   // Always on the row (empty hides by CSS), so a refused number can always say why (C23).
   row.appendChild(helper);
 
@@ -605,6 +838,9 @@ function setRow(ctx, screen, v, s, ex, isOpen, lift) {
       if (r.noask) await ctx.store.setSetting('rep_ask', false).catch(() => {});
     }
     ctx.wake.ensure();
+    // The first saved tick of this exercise today (16 B.4.4): no set of its slot was done before.
+    const firstOfSlot = !v.sets.some(x => x.slot === s.slot && x.status === 'done');
+    let soreAsk = false;
     rowState.set(s.id, 'saving');
     redraw(ctx, screen);
     try {
@@ -614,12 +850,25 @@ function setRow(ctx, screen, v, s, ex, isOpen, lift) {
       // Every saved tick on a card with block checks shows the inset under that row, warm-ups
       // included; the next tick replaces it (15 Part 17, R4-03, review R37).
       inset = checksFor(v.block, s.exercise_id).length ? { day: day.id, slot: s.slot, after: s.id } : null;
+      // Adjust each round (16 B.4.4, B.5 row 9): on the first saved tick the store's feedback plan is
+      // read at 'first_tick' (the soreness-alone sheet or nothing), then at 'tick' (the block checks).
+      if (adaptive(v) && firstOfSlot) {
+        const fid = day.id + ':x' + s.slot;
+        const none = { ask: [] };
+        const first = await ctx.store.feedbackPlan(day.id, s.slot, 'first_tick', { soreness_put_off: soreLater.has(fid) || soreSkipped.has(fid) }).catch(() => none);
+        soreAsk = (first.ask || []).includes('soreness');
+        const tk = await ctx.store.feedbackPlan(day.id, s.slot, 'tick', {}).catch(() => none);
+        inset = (tk.ask || []).includes('checks') ? { day: day.id, slot: s.slot, after: s.id } : null;
+      }
     } catch (e) {
       rowState.set(s.id, 'failed');
     }
     openId = null;
     await redraw(ctx, screen);
-    if (!rowState.has(s.id)) await afterSlotChange(ctx, screen, day.id, s.slot);
+    if (rowState.has(s.id)) return;
+    // It opens after the tick has committed and never blocks the next set: the row is already saved.
+    if (soreAsk) await soreSheet(ctx, v, s.slot);
+    await afterSlotChange(ctx, screen, day.id, s.slot);
   };
 
   if (day.status !== 'done') {
@@ -644,7 +893,7 @@ function strips(ctx, screen, v, s, ex, cur, helper) {
   const stepName = { 'load+': 'step.load.more', 'load-': 'step.load.less', 'reps+': 'step.reps.more', 'reps-': 'step.reps.less' };
   const stepper = (kind, dir) => el('button', { class: 'step', type: 'button', 'data-step': kind + (dir > 0 ? '+' : '-'), 'aria-label': t(stepName[kind + (dir > 0 ? '+' : '-')]),
     on: { click: () => {
-      if (kind === 'load') cur.load = stepLoad(ex, cur.load, dir, v.block.unit);
+      if (kind === 'load') cur.load = stepLoad(ex, cur.load, dir, v.block.unit, v.rules);
       else cur.reps = Math.max(0, Math.min(LIMITS.REPS_MAX, (cur.reps || 0) + dir));
       save();
     } } }, glyph(dir > 0 ? 'plus' : 'minus'));
@@ -684,8 +933,50 @@ function strips(ctx, screen, v, s, ex, cur, helper) {
   return out;
 }
 
-// Can this exercise gain a set in this block? (15 Part 9: the same rule as Add set.)
-const canAdd = (block, ex) => !(ex && effectiveExercise(block, ex).no_added_sets === true);
+// Can this exercise gain a set in this block? (15 Part 9: the same rule as Add set.) Slice 2 (16 B.1
+// step 7 b, B.14 item 8): the signed guard binds in both profiles, so an exercise never screened
+// (flags_set false) gains no set either.
+export const canAdd = (block, ex) => {
+  if (!ex) return true;
+  const e = effectiveExercise(block, ex);
+  return !(e.no_added_sets === true || e.flags_set === false);
+};
+
+// The pill a set kind other than Work shows at the start of the helper slot (LOOK 3.1, 3.5).
+function kindPill(s) {
+  if (s.kind !== 'work' || !s.set_type || s.set_type === 'normal' || typeof S['setkind.' + s.set_type + '.name'] !== 'string') return null;
+  return el('span', { class: 'pill pill-info pill-kind', 'data-kind': s.set_type }, t('setkind.' + s.set_type + '.name'));
+}
+
+// The met or missed mark of a done set (16 B.5 row 5, LOOK 3.1): a done work set with a rep goal,
+// met when its reps reach rep_low. None on a warm-up, an effort-only set or the planned failure set
+// (target.failure_set; a set he marked To failure by hand keeps its mark, LOOK 3.1).
+export function markOf(s) {
+  if (!s || s.kind !== 'work' || s.status !== 'done' || !s.done) return null;
+  const tg = s.target || {};
+  if (tg.effort_only === true || tg.failure_set === true) return null;
+  if (typeof tg.rep_low !== 'number' || typeof s.done.reps !== 'number') return null;
+  return s.done.reps >= tg.rep_low ? 'met' : 'under';
+}
+
+// The effort part of a set's goal (today.stop or today.fail), alone.
+function effortPart(s) {
+  const tg = s.target;
+  if (s.kind !== 'work') return '';
+  if (tg.reps_left_target === 0) return t('today.fail');
+  if (tg.reps_left_target !== null && tg.reps_left_target !== undefined) return t('today.stop', { n: tg.reps_left_target });
+  return '';
+}
+
+// The retarget line (16 B.5 row 13, B.3.7, LOOK 3.1 helper variants), or null to keep the goal line:
+// {rep_low} from the store gives today.retarget and the effort part; {effort_only} gives the effort
+// part only, with its leading comma left off since it starts the line.
+export function retargetLine(s, r) {
+  if (!r || s.kind !== 'work') return null;
+  if (r.effort_only === true) return effortPart(s).replace(/^, /, '');
+  if (typeof r.rep_low === 'number') return t('today.retarget', { low: r.rep_low }) + effortPart(s);
+  return null;
+}
 
 // The set menu (LOOK 3.1): New set under this one on an open day, and Delete this set,
 // shown disabled with its one reason line when it may not run.
@@ -706,7 +997,26 @@ function setMenu(ctx, screen, v, s, ex) {
     on: { click: act(async () => { await ctx.store.deleteSet(s.id); openId = null; await afterSlotChange(ctx, screen, v.day.id, s.slot); }) } }, t('set.delete'));
   rows.push(del);
   if (why) rows.push(el('p', { class: 'small menu-why', id: 'set-delete-why' }, t('set.delete.' + why)));
+  // Set kind, from Slice 2 (LOOK 3.1 set menu, B.5 row 11): work sets only, never a warm-up.
+  if (s.kind === 'work' && (v.day.status === 'planned' || v.day.status === 'open')) {
+    rows.push(el('button', { class: 'menu-row', type: 'button', 'data-setitem': 'kind', on: { click: () => { sh.close(); setKindSheet(ctx, screen, s); } } }, t('set.kind')));
+  }
   sh = sheet({ id: 'set-menu', title: t('set.menu.title', { set: setLabel(s) }) }, el('div', { class: 'card' }, rows));
+}
+
+// The set kind picker (LOOK 4.11, B.5 row 11, R4-12): one chip per work kind with its line, the
+// current one picked; a tap saves (set_type_by_hand) and closes. A save that fails keeps the sheet.
+function setKindSheet(ctx, screen, s) {
+  const cur = s.set_type || 'normal';
+  let sh = null;
+  const chips = SET_KINDS.map(k => el('button', { class: 'chip' + (k === cur ? ' is-on' : ''), type: 'button', 'data-kind': k, 'aria-pressed': String(k === cur),
+    on: { click: async () => {
+      try { await ctx.store.setSetType(s.id, k); } catch (e) { toast(t('today.notsaved')); return; }
+      sh.close();
+      await redraw(ctx, screen);
+    } } },
+    el('span', { class: 'grow kind-words' }, el('span', { class: 'kind-name' }, t('setkind.' + k + '.name')), el('span', { class: 'kind-line' }, t('setkind.' + k + '.line'))), glyph('check')));
+  sh = sheet({ id: 'setkind-sheet', title: t('set.kind') }, el('div', { class: 'q-chips stack' }, chips));
 }
 
 // Feedback rows he put off with Ask me later in this app session: they wait for Finish day.
@@ -719,23 +1029,29 @@ export function checksOnlyRow(f, later) {
     !(later && later.has(f.id)) && Object.values(f.checks || {}).some(x => x !== null);
 }
 
+// A row the soreness-alone sheet made (16 B.5 row 9): pending, soreness only, not put off. The end
+// questions are still owed after the last set.
+export function soreOnlyRow(f, later) {
+  return !!f && f.pending === true && f.soreness !== null && f.pump === null && f.workload === null && !f.note && !(later && later.has(f.id));
+}
+
 // After a slot runs out of planned sets, ask the feedback questions once.
 async function afterSlotChange(ctx, screen, dayId, slot) {
   const v = await ctx.store.dayView(dayId);
   const sets = v.sets.filter(s => s.slot === slot);
   if (sets.some(s => s.status === 'planned')) return;
   const f = v.feedback.find(x => x.id === dayId + ':x' + slot);
-  if (f && !checksOnlyRow(f, askedLater)) return;
-  await feedbackSheet(ctx, v, slot, false);
+  if (f && !checksOnlyRow(f, askedLater) && !soreOnlyRow(f, askedLater)) return;
+  await feedbackSheet(ctx, v, slot, false, { keys: await endKeys(ctx, v, slot) });
   await redraw(ctx, screen);
 }
 
 // ---------------- the card menu ----------------
 
 // The card menu order of record (LOOK 3.2, the 5.11 menu row, 14.7 F9; review P18): menu[1] to
-// menu[4], Move up, Move down, menu[5] Notes, Checks, menu[6] Video link. menu.remove and
-// menu.answers join this list in their own slices. Code index 0 to 5 is menu[1] to menu[6].
-export const CARD_MENU_ORDER = [0, 1, 2, 3, 'up', 'down', 4, 'checks', 5];
+// menu[4], Move up, Move down, Take out this exercise (Slice 2), menu[5] Notes, Checks, Change
+// answers (Slice 2), menu[6] Video link. Code index 0 to 5 is menu[1] to menu[6].
+export const CARD_MENU_ORDER = [0, 1, 2, 3, 'up', 'down', 'remove', 4, 'checks', 'answers', 5];
 
 // Rows that do not apply are left out (LOOK 3.2): a done day keeps only notes and link, a
 // no-add exercise has no Add set, the first card has no Move up and the last no Move down.
@@ -743,7 +1059,11 @@ export const CARD_MENU_ORDER = [0, 1, 2, 3, 'up', 'down', 4, 'checks', 5];
 // (14.8 G10, review P5, P17); after the last set he answers the checks on the feedback sheet.
 export function cardMenuKeep(v, slot, ex, i) {
   const at = v.slots.indexOf(slot);
+  // Change answers: only when this exercise has a saved feedback row today (B.5 row 8, LOOK 3.2).
+  if (i === 'answers') return !!savedRow(v, slot);
   if (v.day.status === 'done') return i === 4 || i === 5;
+  // Take out this exercise: on a planned or open day (B.5 row 18); on the last one the sheet says why not.
+  if (i === 'remove') return v.day.status === 'planned' || v.day.status === 'open';
   if (i === 0) return canAdd(v.block, ex);
   if (i === 'up') return at > 0;
   if (i === 'down') return at >= 0 && at < v.slots.length - 1;
@@ -751,31 +1071,57 @@ export function cardMenuKeep(v, slot, ex, i) {
   return true;
 }
 
+// The saved (not pending) feedback row of a slot today, or null.
+function savedRow(v, slot) {
+  const f = (v.feedback || []).find(x => x.id === v.day.id + ':x' + slot);
+  return f && f.pending === false ? f : null;
+}
+
 function cardMenu(ctx, v, slot, ex) {
   const words = t('menu');
   const dayId = v.day.id;
   const screen = document.getElementById('today');
+  const adj = adaptive(v);
   let sh = null;
   const act = (fn) => async () => {
     sh.close();
     try { await fn(); } catch (e) { toast(t('today.notsaved')); }
     if (screen) redraw(ctx, screen);
   };
+  // In Adjust each round a slot edit asks where it goes first (B.5 row 10); in Fixed it is Today only, as built.
+  const scoped = (edit, refused, after) => async () => {
+    sh.close();
+    const ok = await scopeSheet((sc) => ctx.store.liveEdit({ dayId, slot, ...edit }, sc), refused);
+    if (ok && after) await after();
+    if (screen) redraw(ctx, screen);
+  };
+  const lastOne = liveLifts(v.sets) <= 1;
   const rows = [
-    [0, act(() => ctx.store.addSet(dayId, slot))],
+    [0, adj ? scoped({ type: 'add_set' }) : act(() => ctx.store.addSet(dayId, slot))],
     [1, act(async () => { await ctx.store.skipSet(dayId, slot); await afterSlotChange(ctx, screen, dayId, slot); })],
     [2, act(async () => { await ctx.store.skipExercise(dayId, slot); await afterSlotChange(ctx, screen, dayId, slot); })],
-    [3, async () => { sh.close(); ctx.picker = { mode: 'swap', dayId, slot, back: '#/today' }; ctx.go('#/picker'); }],
-    ['up', act(() => ctx.store.moveSlot(dayId, slot, -1))],
-    ['down', act(() => ctx.store.moveSlot(dayId, slot, 1))],
+    [3, async () => { sh.close(); ctx.picker = { mode: 'swap', dayId, slot, back: '#/today', scoped: adj }; ctx.go('#/picker'); }],
+    ['up', adj ? scoped({ type: 'move', dir: -1 }) : act(() => ctx.store.moveSlot(dayId, slot, -1))],
+    ['down', adj ? scoped({ type: 'move', dir: 1 }) : act(() => ctx.store.moveSlot(dayId, slot, 1))],
+    // Take out this exercise (B.5 row 18): the scope sheet in both profiles; the day's last exercise
+    // is refused in both, so the sheet opens with the reason shown.
+    ['remove', scoped({ type: 'remove' }, lastOne ? { rest: 'last', today: 'last' } : null, () => afterSlotChange(ctx, screen, dayId, slot))],
     [4, () => { sh.close(); textSheet(ctx, ex, 'notes'); }],
     // Checks opens the block check inset while the exercise still has a planned set (15 Part 17,
     // 14.8 G10). It sits between Notes and Video link, the order of record (LOOK 3.2, the 5.11 menu row; P18).
     ['checks', () => { sh.close(); inset = { day: dayId, slot, after: null }; if (screen) redraw(ctx, screen); }],
+    // Change answers (B.5 row 8): the 3.3 sheet with the saved answers picked.
+    ['answers', async () => {
+      sh.close();
+      const f = savedRow(v, slot);
+      if (f) await feedbackSheet(ctx, v, slot, false, { change: f });
+      if (screen) redraw(ctx, screen);
+    }],
     [5, () => { sh.close(); textSheet(ctx, ex, 'link'); }]
   ].sort((a, b) => CARD_MENU_ORDER.indexOf(a[0]) - CARD_MENU_ORDER.indexOf(b[0]));
   const keep = ([i]) => cardMenuKeep(v, slot, ex, i);
-  const word = (i) => (i === 'up' ? t('menu.up') : i === 'down' ? t('menu.down') : i === 'checks' ? t('menu.checks') : words[i]);
+  const WORD = { up: 'menu.up', down: 'menu.down', checks: 'menu.checks', remove: 'menu.remove', answers: 'menu.answers' };
+  const word = (i) => (WORD[i] ? t(WORD[i]) : words[i]);
   sh = sheet({ id: 'card-menu' }, el('div', { class: 'card' }, rows.filter(keep).map(([i, fn]) =>
     el('button', { class: 'menu-row', type: 'button', 'data-item': String(i), on: { click: fn } }, word(i)))));
 }
@@ -833,25 +1179,71 @@ function chipStack(words, prefix, onPick, start) {
   return box;
 }
 
+// The soreness-alone sheet (16 B.5 row 9, LOOK 4.4 one-question form): Adjust each round only, at
+// the first saved tick of an exercise whose muscle was trained earlier in the block. Save writes the
+// pick (or null) into the slot's feedback row through the store's merge; Ask me later folds the
+// question into the end sheet; Skip leaves it off the end sheet. Resolves when the sheet closes.
+export function soreSheet(ctx, v, slot) {
+  return new Promise((resolve) => {
+    const sets = v.sets.filter(s => s.slot === slot);
+    if (sets.length === 0) { resolve(); return; }
+    const ex = v.exercises.get(sets[0].exercise_id);
+    const fid = v.day.id + ':x' + slot;
+    let picked = null;
+    const q = el('div', { class: 'q', 'data-q': 'soreness' }, el('p', { class: 'q-text' }, t('fb.q.soreness')),
+      chipStack(t('fb.a.soreness'), 'soreness-', (n) => { picked = n; }));
+    const save = el('button', { class: 'btn btn-primary', type: 'button', id: 'sore-save' }, t('fb.save'));
+    const later = el('button', { class: 'btn btn-quiet', type: 'button', id: 'sore-later' }, t('fb.later'));
+    const skip = el('button', { class: 'btn btn-quiet', type: 'button', id: 'sore-skip' }, t('fb.skip'));
+    // No scrim close (C39): an answer is given only by one of the three buttons.
+    const sh = sheet({ id: 'sore-sheet', title: t('fb.sore.title', { exercise: ex ? ex.name : '' }), sub: t('fb.sub.one'),
+      canDismiss: () => false, onClose: () => resolve() },
+      q, save, el('div', { class: 'quiet-stack' }, later, skip));
+    save.addEventListener('click', async () => {
+      try { await ctx.store.saveSoreness(v.day.id, slot, picked); } catch (e) { toast(t('today.notsaved')); return; }
+      soreLater.delete(fid);
+      sh.close();
+    });
+    later.addEventListener('click', () => { soreLater.add(fid); sh.close(); });
+    skip.addEventListener('click', () => { soreSkipped.add(fid); sh.close(); });
+  });
+}
+
+// The end sheet's questions in Adjust each round (16 B.4.4, B.3.14 'end'): the store's plan, with
+// soreness left off when he passed it with Skip on the soreness-alone sheet. Fixed: null (all three).
+export async function endKeys(ctx, v, slot) {
+  if (!adaptive(v)) return null;
+  const fid = v.day.id + ':x' + slot;
+  const plan = await ctx.store.feedbackPlan(v.day.id, slot, 'end', { soreness_put_off: soreLater.has(fid) }).catch(() => null);
+  if (!plan) return null;
+  return ['pump', 'soreness', 'workload'].filter(k => (plan.ask || []).includes(k) && !(k === 'soreness' && soreSkipped.has(fid)));
+}
+
 // Resolves when the sheet closes. skip=true shows Skip in place of Ask me later (Finish day).
-export function feedbackSheet(ctx, v, slot, skip) {
+// opts.keys: the questions to ask (Adjust each round, endKeys); left out, all three. opts.change: a
+// saved feedback row (Change answers, B.5 row 8): the sheet opens with its answers picked, Save
+// writes them through store.changeAnswers, and Skip closes with nothing written.
+export function feedbackSheet(ctx, v, slot, skip, opts) {
   return new Promise((resolve) => {
     const sets = v.sets.filter(s => s.slot === slot);
     // A row on a slot with no set has nothing to ask, so it never holds Finish day (SB5).
     if (!sets.length) { resolve(); return; }
     const ex = v.exercises.get(sets[0].exercise_id);
+    const change = opts && opts.change ? opts.change : null;
+    const keys = change || !(opts && Array.isArray(opts.keys)) ? ['pump', 'soreness', 'workload'] : opts.keys;
     // Only the checks this block asks on this exercise, each pre-filled with any answer the card
     // inset already gave (15 Part 17, R4-03).
     const checks = checksFor(v.block, sets[0].exercise_id);
-    const was = v.feedback.find(f => f.id === v.day.id + ':x' + slot);
+    const was = change || v.feedback.find(f => f.id === v.day.id + ':x' + slot);
     const given = (was && was.checks) || {};
     const a = { pump: null, soreness: null, workload: null, checks: {}, note: '' };
+    if (change) for (const k of ['pump', 'soreness', 'workload']) a[k] = Number.isInteger(change[k]) ? change[k] : null;
     for (const c of checks) if (given[c.key] === true || given[c.key] === false) a.checks[c.key] = given[c.key];
     let touched = false;
     const q = (key) => el('div', { class: 'q', 'data-q': key },
       el('p', { class: 'q-text' }, t('fb.q.' + key)),
-      chipStack(t('fb.a.' + key), key + '-', (n) => { a[key] = n; touched = true; }));
-    const parts = [q('pump'), q('soreness'), q('workload')];
+      chipStack(t('fb.a.' + key), key + '-', (n) => { a[key] = n; touched = true; }, a[key] === null ? undefined : a[key]));
+    const parts = keys.map(q);
     for (const c of checks) {
       // After the last set nothing is left to stop: a Yes shows the line only (r4, LOOK 4.4).
       const start = a.checks[c.key] === true ? 2 : a.checks[c.key] === false ? 1 : null;
@@ -866,11 +1258,13 @@ export function feedbackSheet(ctx, v, slot, skip) {
         }, start), inset));
     }
     const note = el('textarea', { rows: '3', maxlength: String(LIMITS.NOTE), id: 'fb-note', 'aria-label': t('fb.note') });
+    if (change && typeof change.note === 'string') note.value = change.note;
     note.addEventListener('input', () => { touched = true; });
     parts.push(el('label', { class: 'q' }, el('span', { class: 'q-text' }, t('fb.note')), note));
     const saveBtn = el('button', { class: 'btn btn-primary', type: 'button', id: 'fb-save' }, t('fb.save'));
-    const laterBtn = el('button', { class: 'btn btn-quiet', type: 'button', id: skip ? 'fb-skip' : 'fb-later' }, t(skip ? 'fb.skip' : 'fb.later'));
-    const n = 3 + checks.length;
+    const noLater = skip || !!change;
+    const laterBtn = el('button', { class: 'btn btn-quiet', type: 'button', id: noLater ? 'fb-skip' : 'fb-later' }, t(noLater ? 'fb.skip' : 'fb.later'));
+    const n = keys.length + checks.length;
     // No scrim close: an answer is given only by Save, Ask me later or Skip, so a stray tap
     // never loses the questions or leaves a pending row on a done day (C39).
     const sh = sheet({ id: 'feedback', title: t('fb.title', { exercise: ex ? ex.name : '' }), sub: t('fb.sub', { n }),
@@ -879,10 +1273,18 @@ export function feedbackSheet(ctx, v, slot, skip) {
     // A refused or failed save keeps the sheet and his answers open, with today.notsaved (SR3, SR11).
     saveBtn.addEventListener('click', async () => {
       a.note = note.value;
+      // A question this sheet did not ask sends no key, so the store keeps a stored answer (B.4.4).
+      for (const k of ['pump', 'soreness', 'workload']) if (!keys.includes(k)) delete a[k];
+      if (change) {
+        try { await ctx.store.changeAnswers(change.id, a); } catch (e) { toast(t('today.notsaved')); return; }
+        sh.close();
+        return;
+      }
       try { await ctx.store.saveFeedback(v.day.id, slot, a, false); } catch (e) { toast(t('today.notsaved')); return; }
       sh.close();
     });
     laterBtn.addEventListener('click', async () => {
+      if (change) { sh.close(); return; }
       try {
         if (skip) await ctx.store.saveFeedback(v.day.id, slot, {}, false);
         else { await ctx.store.saveFeedback(v.day.id, slot, {}, true); askedLater.add(v.day.id + ':x' + slot); }
@@ -939,7 +1341,7 @@ export async function finishFlow(ctx, dayId) {
     for (const f of v.feedback.filter(x => x.pending)) {
       const slot = Number(f.id.split(':x').pop());
       if (!v.sets.some(s => s.slot === slot)) continue;
-      await feedbackSheet(ctx, v, slot, true);
+      await feedbackSheet(ctx, v, slot, true, { keys: await endKeys(ctx, v, slot) });
       v = await store.dayView(dayId);
     }
     // (2) The overall sheet if the block has scores and the day has none yet.
@@ -1014,10 +1416,13 @@ function nudge(ctx) {
   later.addEventListener('click', () => sh.close());
 }
 
-// The swap target from the picker.
+// The pick from the picker on Today. A swap in Fixed is written here, Today only, as built; a swap
+// in Adjust each round and an Add exercise pick are held for Today, which asks the next sheets
+// (16 B.5 rows 10, 17) before anything is written.
 export async function swapTo(ctx, exerciseId) {
   const p = ctx.picker;
   ctx.picker = null;
-  if (!p || p.mode !== 'swap') return;
-  await ctx.store.swapExercise(p.dayId, p.slot, exerciseId);
+  if (!p) return;
+  if (p.mode === 'swap' && !p.scoped) { await ctx.store.swapExercise(p.dayId, p.slot, exerciseId); return; }
+  if (p.mode === 'swap' || p.mode === 'addex') ctx.todayEdit = { mode: p.mode, dayId: p.dayId, slot: p.slot, exercise_id: exerciseId };
 }

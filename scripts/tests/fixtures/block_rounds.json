@@ -1,0 +1,169 @@
+{
+ "format": "liftlog-block",
+ "schema": 2,
+ "source_id": "test-rounds",
+ "version": 1,
+ "block": {
+  "name": "Made-up rounds block",
+  "unit": "lb",
+  "profile": "fixed",
+  "rules_frozen": {
+   "profile": "fixed",
+   "rules_version": "signed-1"
+  },
+  "passes": 4,
+  "notes": "Made-up scripted block for the round tests.",
+  "checks": [
+   {
+    "key": "check_a",
+    "ask": "Made-up check question?",
+    "stop_note": "Made-up stop note."
+   }
+  ],
+  "scores": [
+   {
+    "key": "score_a",
+    "label": "Made-up score",
+    "min": 0,
+    "max": 10
+   }
+  ],
+  "rule_notes": {
+   "one_failure_set": "Made-up one failure note.",
+   "failure_on_machine": "Made-up machine note."
+  },
+  "exercise_flags": {
+   "pec_fly_machine": {
+    "no_added_sets": true,
+    "left_out_of_builder": false
+   }
+  },
+  "day_templates": [
+   {
+    "day": 1,
+    "label": "A",
+    "lifts": [
+     {
+      "slot": 1,
+      "exercise_id": "leg_press",
+      "sets": 1,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 100,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 2,
+      "exercise_id": "seated_leg_curl",
+      "sets": 2,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 50,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 3,
+      "exercise_id": "leg_extension",
+      "sets": 3,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 60,
+      "failure_set": true,
+      "reps_left_target": 0,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "failure"
+     }
+    ]
+   },
+   {
+    "day": 2,
+    "label": "B",
+    "lifts": [
+     {
+      "slot": 1,
+      "exercise_id": "chest_press_machine",
+      "sets": 1,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 80,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 2,
+      "exercise_id": "pec_fly_machine",
+      "sets": 1,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 40,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 3,
+      "exercise_id": "lying_leg_curl",
+      "sets": 1,
+      "rep_low": 10,
+      "rep_high": 12,
+      "start_load": 40,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     }
+    ]
+   }
+  ],
+  "levels": {
+   "quads": "top",
+   "chest": "middle",
+   "hamstrings": "bottom"
+  },
+  "switch_conditions": [
+   "Made-up round condition one.",
+   "Made-up round condition two.",
+   "Made-up round condition three."
+  ],
+  "sleep_hint": "Made-up rounds sleep hint.",
+  "flag_questions": {
+   "machine": "Made-up machine question?",
+   "no_added_sets": "Made-up no added sets question?",
+   "left_out_of_builder": "Made-up left out question?"
+  }
+ },
+ "exercises": []
+}

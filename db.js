@@ -7,11 +7,14 @@
 // - A lost link is reset and the call is tried once more (close event, or the lost-link errors).
 // - replaceAll is one transaction over every store but snapshots, counted inside it.
 // - clearSnapshots is the only call that clears snapshots. There is no wipe-all.
+// - Version 2 (16 B.6.2): a version 1 db is upgraded inside the upgrade transaction through the
+//   hook createStore hands in (this file imports nothing and reads no clock). Any error or a count
+//   mismatch aborts it, so the phone stays on version 1 and the open fails (upgradeFailed()).
 
 const DB_NAME = 'liftlog';
-const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
-// Schema 1. All 8 stores exist from the first version, so later slices need no upgrade.
+// All 8 stores exist from the first version, so the version 2 upgrade adds no store and no index.
 export const STORES = {
   settings:  { keyPath: 'key' },
   exercises: { keyPath: 'id', indexes: { muscle: 'muscle', equipment: 'equipment' } },
@@ -29,11 +32,101 @@ const DATA_STORES = Object.keys(STORES).filter(n => n !== 'snapshots');
 let _db = null;
 let _openError = null;
 let _versionClosed = false;     // set after a versionchange close: never reconnect
+let _upgradeFailed = false;     // set when the version 2 upgrade aborted: never try again on this page
+let _upgradeHook = null;        // (stores) => {snapshot, stores2}, from createStore (16 B.6.2)
+const _closeListeners = [];
 const _stats = { opens: 0, retries: 0 };
+const KEEP_SNAPSHOTS = 3;
+
+const keyOf = (store, row) => row[STORES[store].keyPath];
+
+// The pure half of the version 1 to 2 upgrade, shared with the fake db of the unit tests.
+// data: the seven data stores as read; snapshots: the snapshot rows as read. Calls the hook once
+// and returns the writes to make and the row count each store must hold after them. Throws on a
+// missing hook, a hook that throws, a snapshot that is not a before-upgrade copy, or migrated
+// stores that do not hold exactly the rows that were read (same keys, same count).
+export function planUpgrade(data, snapshots, hook) {
+  if (typeof hook !== 'function') throw new Error('upgrade: no upgrade hook');
+  const out = hook(data);
+  const snapshot = out && out.snapshot;
+  const stores2 = out && out.stores2;
+  if (!snapshot || typeof snapshot.id !== 'string' || snapshot.reason !== 'before-upgrade' || !Number.isFinite(snapshot.made_at)) {
+    throw new Error('upgrade: no before-upgrade copy');
+  }
+  if (!stores2) throw new Error('upgrade: no migrated stores');
+  const ops = [];
+  const counts = {};
+  for (const n of DATA_STORES) {
+    const was = data[n] || [];
+    const next = stores2[n];
+    if (!Array.isArray(next) || next.length !== was.length) throw new Error('upgrade: count mismatch in ' + n);
+    const old = new Map(was.map(r => [keyOf(n, r), JSON.stringify(r)]));
+    for (const r of next) {
+      const k = keyOf(n, r);
+      if (!old.has(k)) throw new Error('upgrade: a migrated row has a new key in ' + n);
+      if (old.get(k) !== JSON.stringify(r)) ops.push({ store: n, put: r });
+      old.delete(k);
+    }
+    if (old.size) throw new Error('upgrade: a row was lost in ' + n);
+    counts[n] = was.length;
+  }
+  // The copy, then the newest 3 kept (the same trim as every other safety copy).
+  const rest = (snapshots || []).filter(s => s.id !== snapshot.id).sort((a, b) => b.made_at - a.made_at);
+  ops.push({ store: 'snapshots', put: snapshot });
+  for (const s of rest.slice(KEEP_SNAPSHOTS - 1)) ops.push({ store: 'snapshots', del: s.id });
+  counts.snapshots = (rest.length < KEEP_SNAPSHOTS - 1 ? rest.length : KEEP_SNAPSHOTS - 1) + 1;
+  return { ops, counts };
+}
+
+// Inside the upgrade transaction, request callbacks only (no await, so it stays alive): read
+// every store, plan, write, recount. Any error aborts the transaction: nothing changes.
+function upgradeFrom1(tx) {
+  const names = [...DATA_STORES, 'snapshots'];
+  const got = {};
+  let left = names.length;
+  let failed = false;
+  const fail = (e) => {
+    if (failed) return;
+    failed = true;
+    _upgradeFailed = true;
+    _openError = e || new Error('upgrade failed');
+    try { tx.abort(); } catch (_) { /* already aborted */ }
+  };
+  const apply = () => {
+    let plan;
+    try {
+      const { snapshots, ...data } = got;
+      plan = planUpgrade(data, snapshots, _upgradeHook);
+    } catch (e) {
+      return fail(e);
+    }
+    try {
+      for (const o of plan.ops) {
+        const os = tx.objectStore(o.store);
+        const r = ('put' in o) ? os.put(o.put) : os.delete(o.del);
+        r.onerror = (ev) => fail(ev.target.error);
+      }
+      // Requests of one transaction run in order, so these counts see every write above.
+      for (const [n, want] of Object.entries(plan.counts)) {
+        const c = tx.objectStore(n).count();
+        c.onsuccess = () => { if (c.result !== want) fail(new Error('upgrade: count mismatch in ' + n)); };
+        c.onerror = (ev) => fail(ev.target.error);
+      }
+    } catch (e) {
+      fail(e);
+    }
+  };
+  for (const n of names) {
+    const r = tx.objectStore(n).getAll();
+    r.onsuccess = () => { got[n] = r.result; if (--left === 0 && !failed) apply(); };
+    r.onerror = (ev) => fail(ev.target.error);
+  }
+}
 
 function open() {
   if (_db) return Promise.resolve(_db);
   if (_versionClosed) return Promise.reject(new Error('Database closed for a newer version'));
+  if (_upgradeFailed) return Promise.reject(_openError || new Error('upgrade failed'));
   return new Promise((resolve, reject) => {
     let req;
     try {
@@ -42,8 +135,10 @@ function open() {
       _openError = e;
       return reject(e);
     }
+    let upgrading = false;
     req.onupgradeneeded = (ev) => {
       const conn = ev.target.result;
+      // oldVersion 0: a new phone, the stores are made fresh and the hook is never called.
       for (const [name, spec] of Object.entries(STORES)) {
         const store = conn.objectStoreNames.contains(name)
           ? ev.target.transaction.objectStore(name)
@@ -52,19 +147,35 @@ function open() {
           if (!store.indexNames.contains(idxName)) store.createIndex(idxName, idxKey);
         }
       }
+      if (ev.oldVersion === 1) {
+        upgrading = true;
+        try { upgradeFrom1(ev.target.transaction); } catch (e) {
+          _upgradeFailed = true;
+          _openError = e;
+          try { ev.target.transaction.abort(); } catch (_) { /* already aborted */ }
+        }
+      }
     };
     req.onsuccess = () => {
       const conn = req.result;
       // The browser can close the link on its own (storage pressure, the app sent
       // to the background). Forget it so the next call reopens.
       conn.addEventListener('close', () => { if (_db === conn) { _db = null; try { conn.close(); } catch (_) { /* gone */ } } });
-      conn.onversionchange = () => { conn.close(); _versionClosed = true; if (_db === conn) _db = null; };
+      // A newer version asks for the db: close, never reconnect, and tell the page (db.reopen).
+      conn.onversionchange = () => {
+        conn.close(); _versionClosed = true; if (_db === conn) _db = null;
+        for (const fn of _closeListeners) { try { fn(); } catch (_) { /* a screen error never stops the close */ } }
+      };
       _db = conn;
       _openError = null;
       _stats.opens++;
       resolve(conn);
     };
-    req.onerror = () => { _openError = req.error; reject(req.error); };
+    req.onerror = () => {
+      if (upgrading) _upgradeFailed = true;
+      if (!_upgradeFailed || !_openError) _openError = req.error;
+      reject(_openError || req.error);
+    };
     req.onblocked = () => reject(new Error('Database blocked by another open window'));
   });
 }
@@ -120,6 +231,14 @@ function write(store, act) {
 
 export const db = {
   openError: () => _openError,
+
+  // The version 2 upgrade hook (16 B.6.2). Set by createStore before the first open.
+  setUpgradeHook(fn) { _upgradeHook = fn; },
+  // True after the upgrade aborted on this page (the page shows db.upgradefail).
+  upgradeFailed: () => _upgradeFailed,
+  // True after a newer version closed this link (the page shows db.reopen).
+  versionClosed: () => _versionClosed,
+  onVersionClosed(fn) { _closeListeners.push(fn); },
 
   async ready() { await open(); return true; },
 

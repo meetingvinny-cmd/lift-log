@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { LIMITS, STORE_NAMES, validateBackup, validateBlock, buildBackup, isoLocal, minOf, maxOf } from '../../../backup.js';
+import { LIMITS, STORE_NAMES, validateBackup, validateBlock, buildBackup, isoLocal, minOf, maxOf, MUSCLE_DETAILS, EQUIPMENT_DETAILS, TIP_IDS } from '../../../backup.js';
 import { SEED_IDS } from '../../../data/exercises.js';
 import { createStore } from '../../../store.js';
 import { createFakeDb, fakeClock } from './fake_db.js';
@@ -16,25 +16,31 @@ const FIX = join(HERE, '..', 'fixtures');
 const NOW = Date.parse('2026-11-09T12:00:00-05:00');
 const fixtureText = () => readFileSync(join(FIX, 'backup_v1.json'), 'utf8');
 const fixture = () => JSON.parse(fixtureText());
+// The same file as schema 2 rows (16 B.6.3: the frozen result of MIGRATIONS[1] on backup_v1.json).
+// A backup built from stores is a schema 2 file, so its stores must hold schema 2 rows.
+const fixture2 = () => JSON.parse(readFileSync(join(FIX, 'backup_v1_as_v2.json'), 'utf8'));
 const check = (obj) => validateBackup(JSON.stringify(obj), { now: NOW });
 const refused = (obj, why) => { const r = check(obj); assert.equal(r.ok, false, why + ' should be refused'); return r; };
 
 // The health-coach field set of a flat_log row (5.4), check_ and score_ columns aside.
 export const FLAT_FIELDS = ['date', 'session', 'lift', 'weight', 'unit', 'load_basis', 'reps', 'count_label', 'set_number',
   'side', 'kind', 'status', 'origin', 'failure', 'reps_left', 'reps_left_plus', 'reps_left_target', 'breaks',
-  'pump', 'soreness', 'workload', 'notes', 'block', 'pass', 'day', 'set_id', 'saved_at', 'first_done_at'];
+  'pump', 'soreness', 'workload', 'notes', 'block', 'pass', 'day', 'set_id', 'saved_at', 'first_done_at',
+  // Schema 2 columns (R4-26, 16 B.6.4, 17 C.0.2).
+  'set_type', 'why', 'goal_load', 'goal_reps_low', 'goal_reps_high', 'goal_failure_set', 'met', 'exercise_id', 'done_at',
+  'short_sleep_since_last', 'body_weight', 'profile'];
 const ISO_LOCAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/;
 
 test('build then validate is ok (the v1 fixture)', () => {
   const r = validateBackup(fixtureText(), { now: NOW });
   assert.equal(r.ok, true, r.why);
-  const f = fixture();
+  const f = fixture2();
   const again = buildBackup(f.stores, { now: NOW });
   assert.equal(check(again).ok, true);
 });
 
 test('every flat_log row has every field and a date (M15)', () => {
-  const f = fixture();
+  const f = fixture2();
   const rows = buildBackup(f.stores, { now: NOW }).flat_log;
   assert.ok(rows.length > 0);
   for (const r of rows) {
@@ -47,7 +53,7 @@ test('every flat_log row has every field and a date (M15)', () => {
 });
 
 test('flat_log times and flat_log_since use the isoLocal form', () => {
-  const b = buildBackup(fixture().stores, { now: NOW });
+  const b = buildBackup(fixture2().stores, { now: NOW });
   assert.match(b.exported_at, ISO_LOCAL);
   assert.match(b.flat_log_since, ISO_LOCAL);
   for (const r of b.flat_log) { assert.match(r.first_done_at, ISO_LOCAL); if (r.saved_at !== null) assert.match(r.saved_at, ISO_LOCAL); }
@@ -55,7 +61,7 @@ test('flat_log times and flat_log_since use the isoLocal form', () => {
 });
 
 test('a day ticked but never finished gives no flat_log rows; its sets stay in stores', () => {
-  const f = fixture();
+  const f = fixture2();
   const day = f.stores.days.find(d => d.status === 'planned');
   day.status = 'open'; day.started_at = NOW - 60000; day.saved_at = NOW - 60000;
   const s = f.stores.sets.find(x => x.day_id === day.id);
@@ -67,8 +73,9 @@ test('a day ticked but never finished gives no flat_log rows; its sets stay in s
 });
 
 test('newer schema refused with the newer-version code (M8)', () => {
-  const f = fixture(); f.schema = 2;
-  assert.equal(refused(f, 'schema 2').code, 'toonew');
+  const f = fixture2(); f.schema = 3;
+  assert.equal(refused(f, 'schema 3').code, 'toonew');
+  assert.equal(check(fixture2()).ok, true, 'schema 2 reads');
 });
 
 test('wrong stores, counts and shapes are refused', () => {
@@ -150,7 +157,7 @@ function largestRows() {
   const lift = { slot: LIMITS.SLOT_MAX, exercise_id: ID(), sets: LIMITS.SETS_MAX, rep_low: LIMITS.REPS_MAX, rep_high: LIMITS.REPS_MAX,
     start_load: BIG, failure_set: false, reps_left_target: 4, warmups: Array(LIMITS.WARMUPS).fill({ reps: LIMITS.REPS_MAX, load: BIG }),
     sides: 'none', load_basis: 'per_side', count_label: 'seconds', note: W(LIMITS.NOTE),
-    short_note: W(LIMITS.WORDS), goal_line: W(LIMITS.WORDS) };
+    short_note: W(LIMITS.WORDS), goal_line: W(LIMITS.WORDS), set_type: 'failure' };
   const many = (n, fn) => Object.fromEntries(Array.from({ length: n }, (_, i) => fn(i)));
   const block = { id: ID(), source_id: ID(), version: LIMITS.BLOCK_VERSION_MAX, id_map: many(LIMITS.ID_MAP, i => [ID(i), ID(i)]),
     name: W(LIMITS.NAME), created_at: T, unit: 'lb', profile: 'fixed', rules_frozen: { profile: 'fixed', rules_version: 'none' },
@@ -161,23 +168,42 @@ function largestRows() {
     rule_notes: { one_failure_set: W(LIMITS.WORDS), failure_on_machine: W(LIMITS.WORDS) },
     exercise_flags: many(LIMITS.FLAGS, i => [ID(i), { no_added_sets: false, left_out_of_builder: false, machine: false, weight_steps: LOADS40, step: 123.45678901234568 }]),
     day_templates: Array.from({ length: LIMITS.DAYS_PER_BLOCK }, () => ({ day: LIMITS.DAY_MAX, label: W(LIMITS.LABEL), lifts: Array(LIMITS.LIFTS_PER_DAY).fill(lift) })),
-    status: 'active' };
+    status: 'active',
+    // Schema 2 block fields at their longest (16 B.6.1a, 17 C.0.3). Shape only: the bytes are the point.
+    profile_switch: { switched_at: T, ticks: [true, true, true], back_at: T },
+    levels: Object.fromEntries(MUSCLE_DETAILS.map(k => [k, 'middle'])),
+    switch_conditions: [W(LIMITS.WORDS), W(LIMITS.WORDS), W(LIMITS.WORDS)], sleep_hint: W(LIMITS.WORDS),
+    flag_questions: { machine: W(LIMITS.FLAG_Q), no_added_sets: W(LIMITS.FLAG_Q), left_out_of_builder: W(LIMITS.FLAG_Q) },
+    template_id: ID(), copied_from: { block_id: ID(), pass: LIMITS.PASS_MAX }, finished_at: T };
+  block.profile = 'adaptive';
+  block.rules_frozen = { profile: 'adaptive', rules_version: 'signed-1' };
+  const slot = { exercise_id: ID(), rep_low: LIMITS.REPS_MAX, rep_high: LIMITS.REPS_MAX, priority: 'middle', sets: LIMITS.SETS_MAX };
+  const template = { id: 'm' + 'a'.repeat(60), author: 'mine', name: W(LIMITS.NAME), made_at: T, from_block_id: ID(),
+    days: Array.from({ length: LIMITS.DAYS_PER_BLOCK }, () => ({ label: W(LIMITS.LABEL), slots: Array(LIMITS.LIFTS_PER_DAY).fill(slot) })) };
   const d5 = { load: BIG, reps: LIMITS.REPS_MAX, reps_left: 4, reps_left_plus: false, failure: false };
   return {
     settings: [{ key: 'active_block_id', value: ID() }, { key: 'seeded_version', value: W(LIMITS.VERSION_STR) },
-      { key: 'restore_note', value: { rows: Number.MAX_SAFE_INTEGER, at: T } }],
+      { key: 'restore_note', value: { rows: Number.MAX_SAFE_INTEGER, at: T } },
+      { key: 'equipment_saved', value: [...EQUIPMENT_DETAILS] }, { key: 'tips_seen', value: Object.fromEntries(TIP_IDS.map(k => [k, true])) },
+      { key: 'seen_version', value: '1234.1234.1234' }],
     exercises: [{ id: ID(), name: W(LIMITS.NAME), muscle: 'shoulders', equipment: 'bodyweight', count_label: 'seconds',
       weight_steps: LOADS40, step_default: BIG, unilateral: false, machine: false, no_added_sets: false,
-      left_out_of_builder: false, flags_set: false, link: 'https://' + W(500), notes: W(LIMITS.NOTE), custom: false, edited: false }],
-    templates: [{}],
+      left_out_of_builder: false, flags_set: false, link: 'https://' + W(500), notes: W(LIMITS.NOTE), custom: false, edited: false,
+      // Longest words, not a valid pair (the block caps test makes a valid copy).
+      muscle_detail: 'forearms_grip', equipment_detail: 'kettlebell', load_kind: 'body_plus', tags: ['overhead', 'spotter'] }],
+    templates: [template],
     blocks: [block],
     days: [{ id: ID(), block_id: ID(), pass: LIMITS.PASS_MAX, day: LIMITS.DAY_MAX, label: W(LIMITS.LABEL), status: 'planned',
       started_at: T, done_at: T, done_date: '2026-11-09', scores: many(LIMITS.SCORES, i => [KEYN(i), 10]), notes: W(LIMITS.NOTE), saved_at: T,
-      slot_order: Array.from({ length: LIMITS.SLOT_ORDER }, (_, i) => LIMITS.SLOT_MAX - i) }],
+      slot_order: Array.from({ length: LIMITS.SLOT_ORDER }, (_, i) => LIMITS.SLOT_MAX - i),
+      short_sleep_since_last: false, profile: 'adaptive', body_weight: 999.9 }],
     sets: [{ id: ID(), day_id: ID(), block_id: ID(), exercise_id: ID(), slot: LIMITS.SLOT_MAX, set_n: LIMITS.SET_N_MAX, side: 'none',
-      kind: 'warmup', target: { load: BIG, rep_low: LIMITS.REPS_MAX, rep_high: LIMITS.REPS_MAX, load_basis: 'per_side', count_label: 'seconds', reps_left_target: 4 },
-      draft: d5, done: { ...d5, unit: 'lb', breaks: null }, status: 'planned', origin: 'added', saved_at: T, first_done_at: T, why: 'Stopped by a block check' }],
-    feedback: [{ id: ID(), day_id: ID(), exercise_id: ID(), muscle: 'shoulders', pump: 4, soreness: 4, workload: 4,
+      kind: 'warmup', target: { load: BIG, rep_low: LIMITS.REPS_MAX, rep_high: LIMITS.REPS_MAX, load_basis: 'per_side', count_label: 'seconds', reps_left_target: 4,
+        failure_set: false, effort_only: false },
+      // The longest why is the schema 1 text: a schema 2 key is shorter, so this bounds both.
+      draft: d5, done: { ...d5, unit: 'lb', breaks: null }, status: 'planned', origin: 'added', saved_at: T, first_done_at: T, why: 'Stopped by a block check',
+      set_type: 'failure', set_type_by_hand: false, add_scope: 'today' }],
+    feedback: [{ id: ID(), day_id: ID(), exercise_id: ID(), muscle: 'forearms_grip', pump: 4, soreness: 4, workload: 4,
       checks: many(LIMITS.CHECKS, i => [KEYN(i), false]), note: W(LIMITS.NOTE), pending: false, saved_at: T, label_set: 'w1' }]
   };
 }
@@ -190,7 +216,9 @@ function largestFlatRow() {
   for (let i = 0; i < LIMITS.CHECKS; i++) r['check_' + KEYN(i)] = false;
   for (let i = 0; i < LIMITS.SCORES; i++) r['score_' + KEYN(i)] = 10;
   Object.assign(r, { pump: 4, soreness: 4, workload: 4, notes: W(LIMITS.NOTE) + ' | ' + W(LIMITS.NOTE), block: ID(), pass: LIMITS.PASS_MAX,
-    day: LIMITS.DAY_MAX, set_id: ID(), saved_at: iso, first_done_at: iso });
+    day: LIMITS.DAY_MAX, set_id: ID(), saved_at: iso, first_done_at: iso,
+    set_type: 'failure', why: 'why.dayskipped', goal_load: BIG, goal_reps_low: LIMITS.REPS_MAX, goal_reps_high: LIMITS.REPS_MAX,
+    goal_failure_set: false, met: false, exercise_id: ID(), done_at: iso, short_sleep_since_last: false, body_weight: 999.9, profile: 'adaptive' });
   return r;
 }
 
@@ -296,7 +324,7 @@ test('one id of each kind survives build, validate and restore', async () => {
 
 test('check_backup --since prints one NEW and one EDIT, and offset forms agree', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'liftlog-since-'));
-  const f = fixture();
+  const f = fixture2();
   const since = f.exported_at;
   const sinceMs = Date.parse(since);
   const doneDay = f.stores.days.find(d => d.status === 'done');
@@ -305,7 +333,7 @@ test('check_backup --since prints one NEW and one EDIT, and offset forms agree',
   sets[0].saved_at = sinceMs + 5000;
   // One set planned before the time and first ticked after it.
   const late = f.stores.sets.find(s => s.day_id === doneDay.id && s.status === 'skipped');
-  Object.assign(late, { status: 'done', first_done_at: sinceMs + 6000, saved_at: sinceMs + 6000, why: 'As written on your block',
+  Object.assign(late, { status: 'done', first_done_at: sinceMs + 6000, saved_at: sinceMs + 6000, why: 'why.plan',
     done: { load: 1, reps: 1, reps_left: null, reps_left_plus: false, failure: false, unit: 'lb', breaks: null } });
   const b = buildBackup(f.stores, { now: sinceMs + 10000 });
   const file = join(dir, 'second.json');
@@ -416,18 +444,23 @@ test('block caps: 15 days, 31 lifts or 501 exercises refused; the largest block 
   assert.equal(blockOk(h).ok, false, '501 exercises refused');
   // The largest block file the caps and the 5.5a limits allow.
   const big = largestRows().blocks[0];
-  const exRow = largestRows().exercises[0];
+  // The size row pairs the longest words; a valid row pairs each detail with its own group.
+  const exRow = { ...largestRows().exercises[0], muscle: 'arms', equipment: 'other' };
   const exercises = Array.from({ length: LIMITS.BLOCK_EXERCISES }, (_, i) => ({ ...exRow, id: ID(i), name: W(LIMITS.NAME - 4) + String(i).padStart(4, '0') }));
   const lift0 = big.day_templates[0].lifts[0];
   const body = { ...big, day_templates: big.day_templates.map((d, di) => ({ ...d, day: di + 1, lifts: Array.from({ length: LIMITS.LIFTS_PER_DAY }, (_, i) => ({ ...lift0, slot: i + 1, exercise_id: ID(i) })) })) };
-  for (const k of ['id', 'source_id', 'version', 'id_map', 'created_at', 'status']) delete body[k];
+  for (const k of ['id', 'source_id', 'version', 'id_map', 'created_at', 'status', 'profile_switch', 'template_id', 'copied_from', 'finished_at']) delete body[k];
+  // A block file is Fixed only, and a level names a muscle its own lifts train (16 B.6.4, 17 C.0.3).
+  body.profile = 'fixed';
+  body.rules_frozen = { profile: 'fixed', rules_version: 'signed-1' };
+  body.levels = { [exRow.muscle_detail]: 'middle' };
   // Every flag key must name a known exercise: his 500 rows first (the longest ids), then list ids.
   const flagKeys = [...exercises.map(e => e.id), ...SEED_IDS].slice(0, LIMITS.FLAGS);
   assert.equal(flagKeys.length, LIMITS.FLAGS, 'the list and his rows hold enough ids to fill the flags cap');
   const flag0 = Object.values(big.exercise_flags)[0];
   body.exercise_flags = Object.fromEntries(flagKeys.map(k => [k, flag0]));
   body.checks = body.checks.map(ck => ({ ...ck, lifts: exercises.slice(0, LIMITS.CHECK_LIFTS).map(e => e.id) }));
-  const file = { format: 'liftlog-block', schema: 1, source_id: ID(), version: LIMITS.BLOCK_VERSION_MAX, block: body, exercises };
+  const file = { format: 'liftlog-block', schema: 2, source_id: ID(), version: LIMITS.BLOCK_VERSION_MAX, block: body, exercises };
   const bytes = Buffer.byteLength(JSON.stringify(file));
   console.log('# largest block file: ' + bytes + ' bytes (' + (bytes / 1048576).toFixed(1) + ' MB), cap ' + LIMITS.MAX_BLOCK_BYTES);
   assert.ok(bytes < LIMITS.MAX_BLOCK_BYTES, 'MAX_BLOCK_BYTES is below the largest valid block file');
@@ -553,7 +586,7 @@ test('restore_note never taken from a file (A3-R8)', () => {
 });
 
 test('safety copy reasons: before-undo and before-reset pass, any other is refused (A2-10)', () => {
-  const data = buildBackup(fixture().stores, { now: NOW });
+  const data = buildBackup(fixture2().stores, { now: NOW });
   delete data.flat_log;
   const row = (reason) => ({ id: 's' + NOW, made_at: NOW, reason, last_backup_at_then: null, data });
   for (const r of ['before-undo', 'before-reset', ...SNAPSHOT_REASONS]) assert.doesNotThrow(() => validateSnapshotRow(row(r), { now: NOW, seedIds: SEED_IDS }), r);
@@ -658,7 +691,7 @@ test('the polish fixture: every polish field filled, read clean and kept through
   assert.ok(st.days.some(d => Array.isArray(d.slot_order)), 'a day card order');
   assert.ok(st.days.some(d => d.label === ''), 'a day with no label');
   assert.ok(st.days.some(d => d.status === 'skipped' && d.done_date === null && d.done_at === null), 'a skipped day');
-  assert.ok(st.sets.some(s => s.why === 'Day skipped'));
+  assert.ok(st.sets.some(s => s.why === 'why.dayskipped'), 'Day skipped comes back as its key');
   assert.ok(st.sets.some(s => s.draft && s.draft.from_copy === true), 'a copied draft');
   assert.ok(st.sets.some(s => s.draft && s.draft.breaks === 1), 'a draft with breaks');
   assert.ok(st.sets.some(s => s.done && s.done.breaks === 3), 'a done set with three or more breaks');
@@ -675,7 +708,7 @@ test('the polish fixture: every polish field filled, read clean and kept through
   await store.seed();
   await store.restoreFile(text);
   const again = await store.backupObject();
-  for (const s of ['blocks', 'days', 'sets', 'feedback']) assert.deepEqual(again.stores[s], f.stores[s], s + ' kept');
+  for (const s of ['blocks', 'days', 'sets', 'feedback']) assert.deepEqual(again.stores[s], r.stores[s], s + ' kept');
   const out = execFileSync('node', [join(HERE, '..', 'check_backup.mjs'), join(FIX, 'backup_v1_polish.json')], { encoding: 'utf8', env: { ...process.env, TZ: 'America/New_York' } });
   assert.match(out, /^ok$/m, 'check_backup.mjs exit 0');
 });
@@ -766,7 +799,7 @@ test('SR14: a link that shows one site and opens another is refused; a plain htt
 });
 
 test('SR7, SR15: a backup holds only known settings keys; restore_note and the phone check probe never ride out', () => {
-  const f = fixture();
+  const f = fixture2();
   const settings = [...f.stores.settings, { key: 'restore_note', value: { rows: 3, at: NOW } }, { key: 'phonecheck_probe', value: NOW }];
   const out = buildBackup({ ...f.stores, settings }, { now: NOW });
   assert.ok(!out.stores.settings.some(r => r.key === 'restore_note' || r.key === 'phonecheck_probe'));
@@ -875,4 +908,293 @@ test('SB5: a backup holding a pending feedback row on a slot with no set still r
   f.counts.feedback = f.stores.feedback.length;
   const r = check(f);
   assert.equal(r.ok, true, r.why);
+});
+
+// ---------------- schema 2 (DESIGN 16 B.1 step 3, B.6, B.12; 17 C.0.2, C.0.3; r4.4 R11, R12, R14) ----------------
+
+import { SCHEMA } from '../../../version.js';
+import { exerciseDefaults2, WHY_KEYS } from '../../../backup.js';
+import { SEED_EXERCISES } from '../../../data/exercises.js';
+
+// A clock after the earliest switch day, so a stored switch to Adjust each round is in range.
+const NOW2 = Date.parse('2026-12-05T12:00:00-05:00');
+const check2 = (obj) => validateBackup(JSON.stringify(obj), { now: NOW2, seedIds: SEED_IDS });
+const SET0 = 'b00000000-0000-4000-8000-000000000003:p1:d1:x1:';
+const DAY1 = 'b00000000-0000-4000-8000-000000000003:p1:d1';
+// A store-shaped schema 2 object with every new field filled at least once (made-up data only).
+function full2() {
+  // Rows as the store holds them: read once, so every optional schema 1 field has its value.
+  const st = check(fixture2()).stores;
+  const b = st.blocks[0];
+  Object.assign(b, {
+    profile: 'adaptive', rules_frozen: { profile: 'adaptive', rules_version: 'signed-1' },
+    profile_switch: { switched_at: LIMITS.ADJUST_EARLIEST_MS + 60000, ticks: [true, true, true], back_at: null },
+    levels: { quads: 'top', biceps: 'middle' }, switch_conditions: ['Made-up line one.', 'Made-up line two.', 'Made-up line three.'],
+    sleep_hint: 'Made-up hint.', flag_questions: { machine: 'Made-up one?', no_added_sets: 'Made-up two?', left_out_of_builder: '' },
+    template_id: 'mtpl-1', copied_from: { block_id: 'bold-block', pass: 2 }, finished_at: null
+  });
+  b.day_templates[0].lifts[0].set_type = 'failure';
+  const day = st.days.find(d => d.id === DAY1);
+  Object.assign(day, { short_sleep_since_last: true, body_weight: 180.5, profile: 'adaptive' });
+  const set = (tail) => st.sets.find(x => x.id === SET0 + tail);
+  Object.assign(set('s3:none'), { set_type: 'failure', set_type_by_hand: false });
+  set('s3:none').target.failure_set = true;
+  Object.assign(set('s2:none'), { set_type: 'failure', set_type_by_hand: true });
+  set('s1:none').target.failure_set = false;
+  set('s1:none').target.effort_only = true;
+  set('s4:none').add_scope = 'rest';
+  set('s4:none').why = 'why.hand_add';
+  st.feedback[0].muscle = 'quads';
+  const ex = st.exercises.find(e => e.id === 'c-00000000-0000-4000-8000-000000000001');
+  Object.assign(ex, { muscle_detail: 'biceps', equipment_detail: 'dumbbell', tags: ['overhead'] });
+  st.templates = [{ id: 'mtpl-1', author: 'mine', name: 'Made-up template', made_at: NOW2 - 60000, from_block_id: b.id,
+    days: [{ label: 'A', slots: [{ exercise_id: st.exercises[0].id, rep_low: 8, rep_high: 12, priority: 'top', sets: 3 }] }] }];
+  st.settings.push({ key: 'equipment_saved', value: ['machine', 'cable'] }, { key: 'tips_seen', value: { tip_warmup: true } },
+    { key: 'seen_version', value: '0.3.0' });
+  return buildBackup(st, { now: NOW2 });
+}
+
+test('schema 2 round trip: a store-shaped object with every new field builds and reads back unchanged', () => {
+  const f = full2();
+  assert.equal(f.schema, SCHEMA);
+  assert.equal(SCHEMA, 2);
+  const r = check2(f);
+  assert.equal(r.ok, true, r.why);
+  assert.equal(r.schema, 2);
+  for (const s of STORE_NAMES) assert.deepEqual(r.stores[s], f.stores[s], s + ' came back changed');
+  const again = buildBackup(r.stores, { now: NOW2 });
+  assert.deepEqual(check2(again).stores, r.stores, 'a second round trip changes nothing');
+});
+
+test('a schema 1 file and a before-upgrade copy of one restore through migrate as schema 2 rows', async () => {
+  const v = validateBackup(fixtureText(), { now: NOW });
+  assert.equal(v.ok, true, v.why);
+  assert.equal(v.schema, 2);
+  assert.ok(v.stores.sets.every(x => WHY_KEYS.includes(x.why) && x.set_type === 'normal'));
+  // The before-upgrade copy (16 B.6.2): data is the schema 1 backup object as it was.
+  const data = fixture();
+  delete data.flat_log;
+  const snap = validateSnapshotRow({ id: 's' + NOW, made_at: NOW, reason: 'before-upgrade', last_backup_at_then: null, data }, { now: NOW, seedIds: SEED_IDS });
+  assert.equal(snap.schema, 2);
+  assert.deepEqual(snap.stores, v.stores);
+  // A schema 1 file restored onto a phone: the stored rows are the migrated rows.
+  const db = createFakeDb();
+  const store = createStore({ db, now: () => NOW, writeLimitMs: 50 });
+  await store.seed();
+  await store.restoreFile(fixtureText());
+  const byId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  for (const s of ['blocks', 'days', 'sets', 'feedback']) assert.deepEqual((await db.all(s)).sort(byId), v.stores[s].slice().sort(byId), s);
+});
+
+test('an unknown why text in a schema 1 file refuses it; a schema 1 text in a schema 2 file refuses it', () => {
+  const f = fixture(); f.stores.sets[0].why = 'Some other words';
+  assert.equal(check(f).ok, false);
+  const g = fixture2(); g.stores.sets[0].why = 'As written on your block';
+  assert.equal(check(g).ok, false);
+  const h = fixture2(); h.stores.sets[0].why = 'why.not_done';
+  assert.equal(check(h).ok, false, 'a key not in WHY_KEYS');
+});
+
+test('after the bump a schema 1 file still refuses: SR9 id ties, SR12 repeats, a control character, an exported_at of 2099', () => {
+  const cases = [
+    ['a set id that does not match its slot', f => { const s = f.stores.sets.find(x => x.kind === 'work'); s.slot += 1; }],
+    ['a day id that does not match its round', f => { f.stores.days[0].pass = 2; }],
+    ['a feedback id with slot 0', f => { f.stores.feedback[0].id = f.stores.feedback[0].day_id + ':x0'; }],
+    ['a repeated day number', f => { const dt = f.stores.blocks[0].day_templates; dt[1].day = dt[0].day; }],
+    ['a repeated slot in one day', f => { const l = f.stores.blocks[0].day_templates[0].lifts; l[1].slot = l[0].slot; }],
+    ['a control character in a note', f => { f.stores.days[0].notes = 'a\u0001b'; }],
+    ['an exported_at of 2099', f => { f.exported_at = '2099-01-01T00:00:00.000-05:00'; }]
+  ];
+  assert.equal(check(fixture()).ok, true);
+  for (const [why, mut] of cases) { const f = fixture(); mut(f); assert.equal(f.schema, 1); refused(f, why); }
+});
+
+test('a schema 2 file must carry every new field: a missing one refuses it', () => {
+  const miss = [['exercises', 'tags'], ['exercises', 'load_kind'], ['blocks', 'levels'], ['blocks', 'profile_switch'], ['blocks', 'finished_at'],
+    ['days', 'profile'], ['days', 'body_weight'], ['sets', 'set_type'], ['sets', 'add_scope'], ['sets', 'set_type_by_hand']];
+  for (const [s, k] of miss) { const f = full2(); delete f.stores[s][0][k]; assert.equal(check2(f).ok, false, s + '.' + k + ' missing'); }
+  const f = full2(); delete f.stores.blocks[0].day_templates[0].lifts[0].set_type; assert.equal(check2(f).ok, false, 'lift set_type missing');
+  const g = full2(); delete g.stores.sets[0].target.failure_set; delete g.stores.sets[0].target.effort_only;
+  assert.equal(check2(g).ok, true, 'target.failure_set and effort_only may be missing');
+});
+
+// One case per B.6.1a row: [name, bad value(s) that refuse, edge value(s) that read].
+const blk = (f) => f.stores.blocks[0];
+const exC = (f) => f.stores.exercises.find(e => e.id === 'c-00000000-0000-4000-8000-000000000001');
+const dayD = (f) => f.stores.days.find(d => d.id === DAY1);
+const setS = (f, tail) => f.stores.sets.find(x => x.id === SET0 + tail);
+const warm = (f) => f.stores.sets.find(x => x.kind === 'warmup');
+const tpl = (f) => f.stores.templates[0];
+const setting = (f, k) => f.stores.settings.find(x => x.key === k);
+const ROWS2 = [
+  ['exercises.muscle_detail', [f => { exC(f).muscle_detail = 'quadz'; }, f => { exC(f).muscle_detail = 'quads'; }],
+    [f => { exC(f).muscle_detail = null; }, f => { exC(f).muscle_detail = 'forearms_grip'; }]],
+  ['exercises.equipment_detail', [f => { exC(f).equipment_detail = 'smithy'; }, f => { exC(f).equipment_detail = 'cable'; }, f => { exC(f).equipment_detail = null; }],
+    [f => { exC(f).equipment = 'other'; exC(f).equipment_detail = 'kettlebell'; }]],
+  ['exercises.load_kind', [f => { exC(f).load_kind = 'heavy'; }], [f => { exC(f).load_kind = 'assist'; }, f => { exC(f).load_kind = 'body_plus'; }]],
+  ['exercises.tags', [f => { exC(f).tags = ['heavy']; }, f => { exC(f).tags = ['overhead', 'overhead']; }, f => { exC(f).tags = ['overhead', 'spotter', 'overhead']; }, f => { exC(f).tags = null; }],
+    [f => { exC(f).tags = []; }, f => { exC(f).tags = ['overhead', 'spotter']; }]],
+  ['blocks.profile', [f => { blk(f).profile = 'auto'; }], [f => { blk(f).profile = 'fixed'; blk(f).rules_frozen.profile = 'fixed'; blk(f).profile_switch.back_at = NOW2 - 1000; }]],
+  ['blocks.rules_frozen', [f => { blk(f).rules_frozen.profile = 'fixed'; }, f => { blk(f).rules_frozen.rules_version = 'signed-2'; }, f => { blk(f).rules_frozen.rules_version = 'none'; },
+    f => { blk(f).rules_frozen = { profile: 'adaptive' }; }],
+    [f => { Object.assign(blk(f), { profile: 'fixed', profile_switch: null, rules_frozen: { profile: 'fixed', rules_version: 'none' } }); }]],
+  ['blocks.profile_switch', [f => { blk(f).profile_switch.switched_at = LIMITS.ADJUST_EARLIEST_MS - 1; }, f => { blk(f).profile_switch.ticks = [true, true]; },
+    f => { blk(f).profile_switch.ticks = [true, true, false]; }, f => { blk(f).profile_switch.back_at = blk(f).profile_switch.switched_at; },
+    f => { blk(f).profile_switch.back_at = NOW2 - 1000; }, f => { blk(f).profile_switch = null; },
+    f => { Object.assign(blk(f), { profile: 'fixed', rules_frozen: { profile: 'fixed', rules_version: 'signed-1' } }); }],
+    [f => { blk(f).profile_switch.switched_at = LIMITS.ADJUST_EARLIEST_MS; }]],
+  ['blocks.levels', [f => { blk(f).levels = { legs: 'top' }; }, f => { blk(f).levels = { quads: 'high' }; }, f => { blk(f).levels = { __proto__: null, constructor: 'top' }; }],
+    [f => { blk(f).levels = {}; }, f => { blk(f).levels = Object.fromEntries(MUSCLE_DETAILS.map(k => [k, 'bottom'])); }]],
+  ['blocks.switch_conditions', [f => { blk(f).switch_conditions = ['one', 'two']; }, f => { blk(f).switch_conditions = ['one', '', 'three']; },
+    f => { blk(f).switch_conditions = ['x'.repeat(121), 'two', 'three']; }, f => { blk(f).switch_conditions = ['one\ntwo', 'two', 'three']; }],
+    [f => { blk(f).switch_conditions = []; }, f => { blk(f).switch_conditions = ['x'.repeat(120), 'y', 'z']; }]],
+  ['blocks.sleep_hint', [f => { blk(f).sleep_hint = 'x'.repeat(121); }, f => { blk(f).sleep_hint = 'a\nb'; }], [f => { blk(f).sleep_hint = 'x'.repeat(120); }, f => { blk(f).sleep_hint = ''; }]],
+  ['blocks.flag_questions', [f => { delete blk(f).flag_questions.machine; }, f => { blk(f).flag_questions.machine = 'x'.repeat(201); }, f => { blk(f).flag_questions = null; }],
+    [f => { blk(f).flag_questions.left_out_of_builder = 'x'.repeat(200); }]],
+  ['blocks lift set_type', [f => { blk(f).day_templates[0].lifts[0].set_type = 'drop'; }], [f => { blk(f).day_templates[0].lifts[0].set_type = 'normal'; }]],
+  ['blocks.template_id', [f => { blk(f).template_id = 'bad id!'; }, f => { blk(f).template_id = '__proto__'; }], [f => { blk(f).template_id = null; }]],
+  ['blocks.copied_from', [f => { blk(f).copied_from.pass = 0; }, f => { blk(f).copied_from.pass = LIMITS.PASS_MAX + 1; }, f => { delete blk(f).copied_from.block_id; }, f => { blk(f).copied_from.pass = 1.5; }],
+    [f => { blk(f).copied_from.pass = LIMITS.PASS_MAX; }, f => { blk(f).copied_from = null; }]],
+  ['blocks.finished_at', [f => { blk(f).finished_at = NOW2 - 1000; }, f => { blk(f).status = 'done'; blk(f).finished_at = 'yesterday'; }],
+    [f => { blk(f).status = 'done'; blk(f).finished_at = NOW2 - 1000; }, f => { blk(f).status = 'done'; blk(f).finished_at = null; }]],
+  ['days.short_sleep_since_last', [f => { dayD(f).short_sleep_since_last = 'yes'; }], [f => { dayD(f).short_sleep_since_last = null; }, f => { dayD(f).short_sleep_since_last = false; }]],
+  ['days.profile', [f => { dayD(f).profile = 'auto'; }, f => { dayD(f).profile = null; }], [f => { dayD(f).profile = 'fixed'; }]],
+  ['days.body_weight', [f => { dayD(f).body_weight = 19.9; }, f => { dayD(f).body_weight = 1000.1; }, f => { dayD(f).body_weight = 180.55; }, f => { dayD(f).body_weight = '180'; }],
+    [f => { dayD(f).body_weight = 20; }, f => { dayD(f).body_weight = 1000; }, f => { dayD(f).body_weight = 999.9; }, f => { dayD(f).body_weight = null; }]],
+  ['sets.set_type', [f => { setS(f, 's1:none').set_type = 'drop'; }, f => { warm(f).set_type = 'failure'; }], [f => { setS(f, 's1:none').set_type = 'failure'; }]],
+  ['sets.set_type_by_hand', [f => { setS(f, 's1:none').set_type_by_hand = 'no'; }, f => { warm(f).set_type_by_hand = true; }], [f => { setS(f, 's1:none').set_type_by_hand = true; }]],
+  ['sets.add_scope', [f => { setS(f, 's1:none').add_scope = 'today'; }, f => { setS(f, 's4:none').add_scope = null; }, f => { setS(f, 's4:none').add_scope = 'later'; }],
+    [f => { setS(f, 's4:none').add_scope = 'today'; }]],
+  ['sets.why', [f => { setS(f, 's1:none').why = 'why.nope'; }, f => { setS(f, 's1:none').why = 'As written on your block'; }], [f => { setS(f, 's1:none').why = 'why.swap_hold'; }]],
+  ['sets.target.failure_set', [f => { warm(f).target.failure_set = true; }, f => { setS(f, 's1:none').target.failure_set = 'yes'; }],
+    [f => { warm(f).target.failure_set = false; }, f => { delete setS(f, 's3:none').target.failure_set; }]],
+  ['sets.target.effort_only', [f => { setS(f, 's1:none').target.effort_only = 'yes'; }], [f => { delete setS(f, 's1:none').target.effort_only; }, f => { warm(f).target.effort_only = false; }]],
+  ['feedback.muscle', [f => { f.stores.feedback[0].muscle = 'quadz'; }], [f => { f.stores.feedback[0].muscle = 'calves'; }, f => { f.stores.feedback[0].muscle = 'core'; }]],
+  ['templates rows', [f => { tpl(f).author = 'ours'; }, f => { tpl(f).id = 'xtpl-1'; }, f => { tpl(f).name = ''; }, f => { tpl(f).days[0].label = 'ABCDE'; },
+    f => { tpl(f).days = []; }, f => { tpl(f).days[0].slots = []; }, f => { tpl(f).days[0].slots[0].exercise_id = 'nobody_knows'; },
+    f => { tpl(f).days[0].slots[0].rep_low = 13; }, f => { tpl(f).days[0].slots[0].priority = 'high'; }, f => { tpl(f).days[0].slots[0].sets = LIMITS.SETS_MAX + 1; },
+    f => { tpl(f).made_at = 'today'; }, f => { tpl(f).from_block_id = 'bad id!'; },
+    f => { const t0 = tpl(f); f.stores.templates = Array.from({ length: LIMITS.ROWS.templates + 1 }, (_, i) => ({ ...t0, id: 'm' + i })); f.counts.templates = f.stores.templates.length; }],
+    [f => { tpl(f).name = 'x'.repeat(120); tpl(f).days[0].label = ''; tpl(f).days[0].slots[0] = { ...tpl(f).days[0].slots[0], rep_low: null, rep_high: null, priority: null, sets: null }; },
+      f => { const t0 = tpl(f); f.stores.templates = Array.from({ length: LIMITS.ROWS.templates }, (_, i) => ({ ...t0, id: 'm' + i })); f.counts.templates = f.stores.templates.length; }]],
+  ['settings.equipment_saved', [f => { setting(f, 'equipment_saved').value = []; }, f => { setting(f, 'equipment_saved').value = ['machine', 'machine']; },
+    f => { setting(f, 'equipment_saved').value = ['smithy']; }, f => { setting(f, 'equipment_saved').value = [...EQUIPMENT_DETAILS, 'machine']; }],
+    [f => { setting(f, 'equipment_saved').value = [...EQUIPMENT_DETAILS]; }, f => { setting(f, 'equipment_saved').value = ['band']; }]],
+  ['settings.tips_seen', [f => { setting(f, 'tips_seen').value = { tip_x: true }; }, f => { setting(f, 'tips_seen').value = { tip_rest: 1 }; }, f => { setting(f, 'tips_seen').value = { tip_rest: false }; }],
+    [f => { setting(f, 'tips_seen').value = {}; }, f => { setting(f, 'tips_seen').value = Object.fromEntries(TIP_IDS.map(k => [k, true])); }]],
+  ['settings.seen_version', [f => { setting(f, 'seen_version').value = '1.2'; }, f => { setting(f, 'seen_version').value = '0.3.0 new'; }, f => { setting(f, 'seen_version').value = '12345.1.1'; }],
+    [f => { setting(f, 'seen_version').value = '1234.1234.1234'; }]]
+];
+
+for (const [name, bads, edges] of ROWS2) {
+  test('B.6.1a ' + name + ': a bad value refuses the file, the edge reads', () => {
+    assert.equal(check2(full2()).ok, true, 'the base object reads');
+    bads.forEach((mut, i) => { const f = full2(); mut(f); assert.equal(check2(f).ok, false, name + ' bad case ' + (i + 1) + ' should be refused'); });
+    edges.forEach((mut, i) => { const f = full2(); mut(f); const r = check2(f); assert.equal(r.ok, true, name + ' edge case ' + (i + 1) + ': ' + r.why); });
+  });
+}
+
+test('B.6.1a snapshots.reason: before-delete is a safety copy reason', () => {
+  assert.ok(SNAPSHOT_REASONS.includes('before-delete'));
+  const data = buildBackup(fixture2().stores, { now: NOW });
+  delete data.flat_log;
+  assert.doesNotThrow(() => validateSnapshotRow({ id: 's' + NOW, made_at: NOW, reason: 'before-delete', last_backup_at_then: null, data }, { now: NOW, seedIds: SEED_IDS }));
+});
+
+test('buildBackup keeps equipment_saved, tips_seen and seen_version (SR7 filter, 17 C.0.2)', () => {
+  const f = full2();
+  for (const k of ['equipment_saved', 'tips_seen', 'seen_version']) assert.ok(f.stores.settings.some(r => r.key === k), k + ' dropped from the file');
+  const r = check2(f);
+  assert.deepEqual(r.stores.settings.find(x => x.key === 'tips_seen').value, { tip_warmup: true });
+});
+
+test('flat_log has every schema 2 column with its value (M15, R4-26)', () => {
+  const f = full2();
+  const row = (tail) => f.flat_log.find(r => r.set_id === SET0 + tail);
+  const day = f.stores.days.find(d => d.id === DAY1);
+  for (const r of f.flat_log) for (const k of FLAT_FIELDS) assert.ok(Object.prototype.hasOwnProperty.call(r, k), 'flat_log row lacks ' + k);
+  const s3 = row('s3:none'), s2 = row('s2:none'), s1 = row('s1:none'), w1 = row('w1:none'), s4 = row('s4:none');
+  assert.equal(s3.set_type, 'failure');
+  assert.equal(s3.goal_failure_set, true);
+  assert.equal(s3.met, null, 'the planned failure set has no met mark');
+  assert.equal(s1.goal_failure_set, false);
+  assert.equal(s1.met, null, 'an effort-only set has no met mark');
+  assert.equal(w1.met, null, 'a warm-up has no met mark');
+  assert.equal(row('s1:none').exercise_id, f.stores.sets.find(x => x.id === SET0 + 's1:none').exercise_id);
+  assert.equal(s4.why, 'why.hand_add');
+  const plain = f.stores.sets.find(x => x.id === SET0 + 's2:none');
+  assert.equal(s2.met, plain.done.reps >= plain.target.rep_low);
+  assert.equal(s2.goal_load, plain.target.load);
+  assert.equal(s2.goal_reps_low, plain.target.rep_low);
+  assert.equal(s2.goal_reps_high, plain.target.rep_high);
+  assert.equal(s2.goal_failure_set, null, 'a target with no failure_set key reads null');
+  assert.equal(s2.done_at, isoLocal(day.done_at));
+  assert.equal(s2.short_sleep_since_last, true);
+  assert.equal(s2.body_weight, 180.5);
+  assert.equal(s2.profile, 'adaptive');
+  // A missed goal reads false.
+  const st = check2(f).stores;
+  const x = st.sets.find(y => y.id === SET0 + 's2:none');
+  x.done.reps = x.target.rep_low - 1;
+  assert.equal(buildBackup(st, { now: NOW2 }).flat_log.find(r => r.set_id === x.id).met, false);
+  const skipped = f.flat_log.find(r => r.status === 'skipped');
+  assert.equal(skipped.met, null, 'a skipped set has no met mark');
+});
+
+// ---------------- the block file, schema 2 (16 B.6.4, 17 C.0.3) ----------------
+
+const block2 = () => JSON.parse(readFileSync(join(FIX, 'block_v2.json'), 'utf8'));
+const blockOk2 = (f) => validateBlock(JSON.stringify(f), { now: NOW, seedIds: SEED_IDS, seedRows: SEED_EXERCISES });
+
+test('block_v2 reads and round trips: levels, condition lines, lift set_type, the four exercise fields', () => {
+  const f = block2();
+  const r = blockOk2(f);
+  assert.equal(r.ok, true, r.why);
+  assert.deepEqual(r.block.levels, f.block.levels);
+  assert.deepEqual(r.block.switch_conditions, f.block.switch_conditions);
+  assert.equal(r.block.sleep_hint, f.block.sleep_hint);
+  assert.deepEqual(r.block.flag_questions, f.block.flag_questions);
+  assert.ok(r.block.day_templates.flatMap(d => d.lifts).some(l => l.set_type === 'failure'));
+  assert.equal(r.block.profile_switch, null);
+  for (const e of r.exercises) for (const k of ['muscle_detail', 'equipment_detail', 'load_kind', 'tags']) assert.deepEqual(e[k], f.exercises.find(x => x.id === e.id)[k], e.id + ' ' + k);
+  const again = blockOk2({ ...f, block: r.block, exercises: r.exercises.map(({ custom, ...e }) => ({ ...e, custom: true })) });
+  assert.equal(again.ok, true, again.why);
+  assert.deepEqual(again.block, r.block, 'a second read changes nothing');
+});
+
+test('block_v1 reads through validateBlock as schema 2 rows', () => {
+  const r = blockOk2(blockFile());
+  assert.equal(r.ok, true, r.why);
+  assert.deepEqual([r.block.levels, r.block.switch_conditions, r.block.sleep_hint], [{}, [], '']);
+  assert.deepEqual(r.block.flag_questions, { machine: '', no_added_sets: '', left_out_of_builder: '' });
+  assert.ok(r.block.day_templates.every(d => d.lifts.every(l => l.set_type === 'normal')));
+  for (const e of r.exercises) assert.deepEqual(e, { ...exerciseDefaults2(blockFile().exercises.find(x => x.id === e.id)), custom: true });
+});
+
+test('a block file never sets a profile or a switch, and a level names only a muscle its lifts train', () => {
+  const bad = (mut, why) => { const f = block2(); mut(f); assert.equal(blockOk2(f).ok, false, why); };
+  bad(f => { f.block.profile = 'adaptive'; f.block.rules_frozen.profile = 'adaptive'; }, 'an adaptive block file');
+  bad(f => { f.block.profile_switch = { switched_at: NOW, ticks: [true, true, true], back_at: null }; }, 'a block file with a switch');
+  bad(f => { f.block.rules_frozen.rules_version = 'signed-9'; }, 'an unknown rules version');
+  bad(f => { f.block.levels = { calves: 'top' }; }, 'a level on a muscle no lift trains');
+  bad(f => { f.block.levels = { legs: 'top' }; }, 'a level keyed by a chip group');
+  bad(f => { f.block.day_templates[0].lifts[0].set_type = 'drop'; }, 'a lift kind not on the list');
+  bad(f => { f.exercises[0].muscle_detail = 'quads'; }, 'a custom exercise detail outside its muscle group');
+  bad(f => { delete f.exercises[0].load_kind; }, 'a custom exercise with no load kind');
+  bad(f => { f.block.switch_conditions = ['only one']; }, 'one condition line');
+  // A list lift's muscle is read from seedRows: without them, a level on it refuses.
+  const f = block2();
+  assert.equal(validateBlock(JSON.stringify(f), { now: NOW, seedIds: SEED_IDS }).ok, false, 'no seedRows: a level on a list lift refuses');
+  f.block.levels = { biceps: 'top' };
+  assert.equal(validateBlock(JSON.stringify(f), { now: NOW, seedIds: SEED_IDS }).ok, true, 'a level on a file exercise needs no seedRows');
+  const g = block2(); g.block.profile_switch = null; assert.equal(blockOk2(g).ok, true, 'a null switch reads');
+  const h = block2(); delete h.block.profile_switch; assert.equal(blockOk2(h).ok, true, 'no switch key reads');
+  const k = block2(); k.block.template_id = 'mtpl-1'; k.block.finished_at = NOW;
+  const rk = blockOk2(k);
+  assert.ok(rk.ok && !('template_id' in rk.block) && !('finished_at' in rk.block), 'template_id and finished_at never ride in from a block file');
+});
+
+test('a block file of schema 3 is refused as too new', () => {
+  const f = block2(); f.schema = 3;
+  assert.equal(blockOk2(f).code, 'toonew');
 });

@@ -37,6 +37,24 @@ const MANIFEST_ENGINE = [...MANIFEST_SLICE1, 'rules.js', 'engine.js', 'scripts/t
   'scripts/tests/fixtures/seed_rows_v1.json',
   // Slice 1 polish pass, step 5 (DESIGN 15 P.1): the polish fixture and the script that builds it through the store.
   'scripts/tests/fixtures/backup_v1_polish.json', 'scripts/tests/make_fixture_polish.mjs'].sort();
+// Slice 2 so far (16 B.1 step 3, r4.4 R5): the frozen migration results and the schema 2 block
+// fixture. The later steps add the rest of MANIFEST_SLICE2 (ui/block.js, make_fixture_v2.mjs,
+// backup_v2.json, block_rounds.json) and point the file list test at it.
+const MANIFEST_SLICE2_STEP3 = [...MANIFEST_ENGINE, 'scripts/tests/fixtures/backup_v1_as_v2.json',
+  'scripts/tests/fixtures/backup_v1_polish_as_v2.json', 'scripts/tests/fixtures/block_v2.json'].sort();
+// The schema commit (16 B.1 steps 3 to 5, r4.4 R12): the schema 2 fixture made by the store and its
+// script. Later steps add ui/block.js and block_rounds.json (MANIFEST_SLICE2).
+const MANIFEST_SLICE2_STEP5 = [...MANIFEST_SLICE2_STEP3, 'scripts/tests/make_fixture_v2.mjs', 'scripts/tests/fixtures/backup_v2.json'].sort();
+// 16 B.1 step 8: the Block tab file. block_rounds.json (step 11) completes MANIFEST_SLICE2.
+const MANIFEST_SLICE2_STEP8 = [...MANIFEST_SLICE2_STEP5, 'ui/block.js'].sort();
+// MANIFEST_SLICE2 (16 B.1 Slice 2 manifest paragraph, r4.4 R5): MANIFEST_ENGINE plus ui/block.js,
+// make_fixture_v2.mjs, backup_v2.json, backup_v1_as_v2.json, backup_v1_polish_as_v2.json,
+// block_v2.json and block_rounds.json (B.1 step 11). Step 11 also adds block_rounds_script.json,
+// the answer script and its table, read by engine.test.js and e2e.py (B.12 last paragraph).
+const MANIFEST_SLICE2 = [...MANIFEST_ENGINE, 'ui/block.js', 'scripts/tests/make_fixture_v2.mjs', 'scripts/tests/fixtures/backup_v2.json',
+  'scripts/tests/fixtures/backup_v1_as_v2.json', 'scripts/tests/fixtures/backup_v1_polish_as_v2.json',
+  'scripts/tests/fixtures/block_v2.json', 'scripts/tests/fixtures/block_rounds.json',
+  'scripts/tests/fixtures/block_rounds_script.json'].sort();
 
 const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 const EXPECTED_HEAD = [
@@ -175,7 +193,9 @@ test('manifest icons and index.html links are tracked and in SHELL', () => {
 });
 
 test('git file list equals the engine manifest', () => {
-  assert.deepEqual(gitList(), MANIFEST_ENGINE, 'files in app/ differ from the engine manifest');
+  assert.deepEqual(gitList(), MANIFEST_SLICE2, 'files in app/ differ from MANIFEST_SLICE2 (the engine manifest plus the Slice 2 files)');
+  // The step chain and the paragraph list name the same files (16 B.1 Slice 2 manifest paragraph).
+  assert.deepEqual([...MANIFEST_SLICE2_STEP8, 'scripts/tests/fixtures/block_rounds.json', 'scripts/tests/fixtures/block_rounds_script.json'].sort(), MANIFEST_SLICE2);
 });
 
 test('every import is relative', () => {
@@ -252,7 +272,8 @@ test('styles.css: no raw hex, px or ms after the token block', () => {
 });
 
 test('version.js, package.json and manifest are exact', () => {
-  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.2.6'; export const SCHEMA = 1; export const RULES_VERSION = 'none';");
+  // The schema commit (16 version ladder, r4.4 R1): 0.3.0, schema 2, the signed-1 rules.
+  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.3.0'; export const SCHEMA = 2; export const RULES_VERSION = 'signed-1';");
   assert.equal(read('package.json').trim(), '{"private":true,"type":"module"}');
   const man = JSON.parse(read('manifest.webmanifest'));
   assert.deepEqual(Object.keys(man).sort(), ['background_color', 'display', 'icons', 'id', 'name', 'orientation', 'scope', 'short_name', 'start_url', 'theme_color']);
@@ -360,7 +381,7 @@ test('seed exercises: ids unique, frozen list kept, every field typed', async ()
 // ---------------- the exercise list (DESIGN 17 C.2.7, schema 1 fields; R4-07, R4-08, R4-09) ----------------
 
 test('exercise list: the 39 seed rows are frozen, every list row starts unflagged (R4-08)', async () => {
-  const { SEED_EXERCISES } = await import('../../../data/exercises.js');
+  const { SEED_EXERCISES, MUSCLE_DETAIL_CHIP, EQUIPMENT_DETAIL_CHIP, TAG_CODES, LOAD_KINDS } = await import('../../../data/exercises.js');
   const v1 = JSON.parse(read('scripts/tests/fixtures/seed_rows_v1.json'));
   const frozen = JSON.parse(read('scripts/tests/fixtures/seed_ids.json'));
   assert.equal(v1.length, 39);
@@ -381,7 +402,12 @@ test('exercise list: the 39 seed rows are frozen, every list row starts unflagge
     assert.equal(e.custom, false);
     assert.equal(e.edited, false);
     assert.equal(e.weight_steps, null, e.id + ': the list ships no weight steps');
-    assert.ok(!('tags' in e), e.id + ' ships a tags key');
+    // Schema 2 fields (17 C.2.7): the detail belongs to its group, the equipment detail's chip is
+    // the equipment, tags only from TAG_CODES (at most 2, no repeat), a known load kind.
+    assert.ok(e.muscle_detail === null || MUSCLE_DETAIL_CHIP[e.muscle_detail] === e.muscle, e.id + ': muscle_detail is not in its muscle group');
+    assert.equal(EQUIPMENT_DETAIL_CHIP[e.equipment_detail], e.equipment, e.id + ': equipment_detail chip differs from equipment');
+    assert.ok(Array.isArray(e.tags) && e.tags.length <= 2 && new Set(e.tags).size === e.tags.length && e.tags.every(x => TAG_CODES.includes(x)), e.id + ': bad tags');
+    assert.ok(LOAD_KINDS.includes(e.load_kind), e.id + ': bad load_kind');
     assert.ok(e.name.length >= 1 && e.name.length <= 120, e.id + ' name length');
   }
   const names = SEED_EXERCISES.map(e => e.name.toLowerCase());
@@ -648,6 +674,7 @@ test('engine.js and rules.js import nothing and never read the clock or a random
     assert.ok(!/\b(localStorage|sessionStorage|indexedDB|window|document|globalThis|self|fetch|navigator)\b/.test(strip(src)), f + ' touches a global');
   }
   assert.ok(shellList().includes('engine.js') && shellList().includes('rules.js'), 'SHELL must hold engine.js and rules.js');
+  assert.ok(shellList().includes('ui/block.js'), 'SHELL must hold ui/block.js (16 B.12)');
 });
 
 test('rules.js is data only: frozen, no function value, clean on both profiles', async () => {
@@ -665,12 +692,124 @@ test('rules.js is data only: frozen, no function value, clean on both profiles',
   assert.equal(m.RULES.rules_version, 'signed-1');
 });
 
-test('the engine is not wired in yet: no shipped file imports engine.js or rules.js', () => {
-  // Slice 2 wires it from store.js (DESIGN 16 B.4) and turns this check around.
-  for (const f of shipped.filter(x => x.endsWith('.js') && x !== 'engine.js')) {
-    assert.ok(!/from\s+['"][./]*(engine|rules)\.js['"]/.test(read(f)), f + ' imports the engine before Slice 2');
-    assert.ok(!/import\(\s*['"][./]*(engine|rules)\.js['"]/.test(read(f)), f + ' loads the engine with import() before Slice 2');
+// 16 B.1 step 3 a, B.10 item 3, B.12 (r4.4 R14): backup.js keeps its own lists and imports neither
+// rules.js nor data/exercises.js; each list equals its twin.
+test('backup.js lists equal their twins in rules.js and data/exercises.js', async () => {
+  const b = await import('../../../backup.js');
+  const r = await import('../../../rules.js');
+  const x = await import('../../../data/exercises.js');
+  assert.ok(!/from\s+['"][./]*(rules|engine|data\/exercises)\.js['"]/.test(read('backup.js')), 'backup.js imports a twin');
+  assert.deepEqual([...b.SET_KINDS], r.RULES.set_kinds.map(k => k.key), 'SET_KINDS');
+  assert.deepEqual([...b.RULE_VERSIONS].sort(), [...new Set(['none', ...Object.keys(r.RULES_BY_VERSION)])].sort(), 'RULE_VERSIONS');
+  assert.deepEqual([...b.RULE_VERSIONS], [...r.RULE_VERSIONS], 'RULE_VERSIONS equals the rules.js list');
+  assert.ok(b.RULE_VERSIONS.includes(r.RULES.rules_version));
+  assert.deepEqual([...b.MUSCLE_DETAILS], [...x.MUSCLE_DETAILS], 'MUSCLE_DETAILS');
+  assert.deepEqual({ ...b.MUSCLE_DETAIL_CHIP }, { ...x.MUSCLE_DETAIL_CHIP }, 'MUSCLE_DETAIL_CHIP');
+  assert.deepEqual([...b.EQUIPMENT_DETAILS], [...x.EQUIPMENT_DETAILS], 'EQUIPMENT_DETAILS');
+  assert.deepEqual({ ...b.EQUIPMENT_DETAIL_CHIP }, { ...x.EQUIPMENT_DETAIL_CHIP }, 'EQUIPMENT_DETAIL_CHIP');
+  assert.deepEqual([...b.TAG_CODES], [...x.TAG_CODES], 'TAG_CODES');
+  assert.deepEqual([...b.LOAD_KINDS], [...x.LOAD_KINDS], 'LOAD_KINDS');
+  // Every why a rules.js row names is a key a set may store (16 B.5.1).
+  const whys = [];
+  const walk = (o) => { if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) { if (k === 'why') whys.push(v); else walk(v); } };
+  walk(r.RULES);
+  assert.ok(whys.length >= 12, 'the rule rows were read');
+  for (const w of whys) assert.ok(b.WHY_KEYS.includes(w), w + ' is not in WHY_KEYS');
+  assert.equal(b.WHY_KEYS.length, 33);
+  assert.equal(new Set(b.WHY_KEYS).size, 33);
+});
+
+test('no shipped file but store.js imports engine.js or rules.js (16 B.1 step 5 R4 d)', () => {
+  // The screens reach the engine through store calls, the way no screen imports db.js.
+  const users = [];
+  for (const f of shipped.filter(x => x.endsWith('.js') && x !== 'engine.js' && x !== 'rules.js')) {
+    const src = read(f);
+    const imp = /from\s+['"][./]*(engine|rules)\.js['"]/.test(src) || /import\(\s*['"][./]*(engine|rules)\.js['"]/.test(src);
+    if (imp) users.push(f);
   }
+  assert.deepEqual(users, ['store.js'], 'only store.js imports the engine and the rule table');
+  assert.match(read('store.js'), /from '\.\/rules\.js'/);
+  assert.match(read('store.js'), /from '\.\/engine\.js'/);
+});
+
+// r4.4 R4 a: from schema 2 on a set stores a why key; the seven Slice 1 texts live only in
+// backup.js (WHY and WHY_KEY_OF, read by MIGRATIONS[1]).
+test('no shipped file but backup.js names a Slice 1 why text', async () => {
+  const b = await import('../../../backup.js');
+  assert.equal(b.WHY.length, 7);
+  // ui/strings.js holds the words of every why key (16 B.5.1), so it may name each text once, as
+  // the value of its own key and nowhere else (Slice 2 step 6 provisional call, BUILD_LOG).
+  for (const f of textShipped.filter(x => x !== 'backup.js')) {
+    let src = read(f);
+    if (f === 'ui/strings.js') {
+      for (const [w, k] of Object.entries(b.WHY_KEY_OF)) {
+        const line = "  '" + k + "': '" + w + "',\n";
+        assert.equal(src.split(line).length - 1, 1, 'ui/strings.js holds the words of ' + k + ' once, on its own line');
+        src = src.replace(line, '');
+      }
+    }
+    for (const w of b.WHY) assert.ok(!src.includes(w), f + ' names the Slice 1 why text "' + w + '"');
+  }
+});
+
+// ---------------- Slice 2 step 6: the 5.11 keys of B.5 (16 B.1 step 6) ----------------
+
+// B.5 rows 1 to 18 (rows 2, 4, 14, 15 are the step 8 and 9 builders' parts; their words go in now).
+const SLICE2_KEYS = {
+  1: ['sleep.q', 'fb.no', 'fb.yes'],
+  2: ['day.notplanned', 'day.notplanned.line', 'day.later.line', 'check.backtab'],
+  3: ['pill.easy'],
+  4: ['easy.title', 'easy.line', 'easy.line.one', 'easy.go', 'text.cancel'],
+  5: ['mark.met', 'mark.under'],
+  6: ['daymenu.skip', 'skipday.title', 'skipday.line', 'text.cancel'],
+  7: ['daymenu.end', 'end.title', 'end.line', 'end.open', 'empty.done.title', 'empty.done.line'],
+  8: ['menu.answers'],
+  9: ['fb.sore.title', 'fb.sub.one', 'fb.q.soreness', 'fb.a.soreness', 'fb.save', 'fb.later', 'fb.skip'],
+  10: ['scope.title', 'scope.today', 'scope.rest', 'scope.rest.line', 'text.cancel', 'scope.refused.flag', 'scope.refused.last'],
+  11: ['set.kind', 'setkind.normal.name', 'setkind.normal.line', 'setkind.failure.name', 'setkind.failure.line'],
+  13: ['today.retarget'],
+  14: ['block.title', 'block.head', 'block.head.open', 'profile.fixed', 'profile.adjust', 'round.short', 'round.done', 'round.now',
+    'round.easy', 'round.label', 'blockday.done', 'blockday.now', 'day.notplanned', 'block.musclesets', 'block.musclediff', 'daymenu.end'],
+  15: ['adjust.row', 'adjust.title', 'adjust.line', 'adjust.type', 'adjust.go', 'text.cancel', 'adjust.back', 'adjust.back.title', 'adjust.back.line'],
+  16: ['db.reopen', 'db.upgradefail'],
+  17: ['daymenu.addex', 'addex.sets', 'text.save', 'text.cancel'],
+  18: ['menu.remove']
+};
+
+test('ui/strings.js holds every 5.11 key of the Slice 2 screen parts (16 B.5, B.1 step 6)', async () => {
+  const { S } = await import('../../../ui/strings.js');
+  for (const [row, keys] of Object.entries(SLICE2_KEYS)) {
+    for (const k of keys) assert.ok(k in S && S[k].length > 0, 'B.5 row ' + row + ' key missing: ' + k);
+  }
+  // Each set kind of rules.js has its name and its line (R4-12); the picker lists exactly these.
+  const r = await import('../../../rules.js');
+  for (const k of r.RULES.set_kinds.map(x => x.key)) {
+    assert.equal(typeof S['setkind.' + k + '.name'], 'string', 'setkind.' + k + '.name');
+    assert.equal(typeof S['setkind.' + k + '.line'], 'string', 'setkind.' + k + '.line');
+  }
+  // The count key and its .one form fill the same slots (easy.line).
+  assert.ok('easy.line.one' in S && /\{n\}/.test(S['easy.line']));
+  // No placeholder is left in the words (B.12 static row).
+  for (const [k, v] of Object.entries(S)) for (const x of [v].flat()) assert.ok(!/OWED|TODO|TBD|DRAFT/.test(String(x)), k + ' holds a placeholder');
+});
+
+test('every why key in rules.js and in WHY_KEYS has its words in ui/strings.js (16 B.5.1)', async () => {
+  const { S } = await import('../../../ui/strings.js');
+  const b = await import('../../../backup.js');
+  const r = await import('../../../rules.js');
+  const whys = [];
+  const walk = (o) => { if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) { if (k === 'why') whys.push(v); else walk(v); } };
+  walk(r.RULES);
+  for (const k of new Set([...whys, ...b.WHY_KEYS])) assert.ok(typeof S[k] === 'string' && S[k].length > 0, k + ' has no words in ui/strings.js');
+  // The words are those 5.11 gives the Slice 1 texts (R4-29): each key reads back its old text.
+  for (const [w, k] of Object.entries(b.WHY_KEY_OF)) assert.equal(S[k], w);
+});
+
+test('version.js RULES_VERSION is the rules.js rules_version, written as a literal (16 B.2 note 4)', async () => {
+  const r = await import('../../../rules.js');
+  const v = await import('../../../version.js');
+  assert.equal(v.RULES_VERSION, r.RULES.rules_version);
+  assert.ok(!/import\s/.test(read('version.js')), 'version.js imports nothing');
 });
 
 // The engine line-up with r4.1 (DESIGN 16 B.1 step 0 list), shipped as 0.2.5, schema 1, still not wired.
@@ -1374,4 +1513,119 @@ test('G16: the tab-mode Back link on Phone check takes the back glyph, as the ic
 });
 test('G17: on Phone check the storage banner sits under the subtitle, not between the title and the subtitle (LOOK 4.2, 3.6)', () => {
   assert.match(read('ui/check.js'), /el\('h1', \{\}, t\('check\.title'\)\),\n    el\('p', \{ class: 'lead' \}, t\('check\.sub'\)\),\n    storageBox,\n    rowsBox,/);
+});
+
+// ---------------- Slice 2 step 7: the Today parts (16 B.1 step 7, B.5) ----------------
+
+// B.1 step 7 a: the steppers and stepFor read one order. On every shipped row in an lb block, in both
+// profiles, with no block entry and with a block step or list, loadStep gives the step stepFor gives.
+// Left out on purpose: assist rows (the engine never moves the assist, C11, S6a) and rows where the
+// engine has no step at all (a kind the signed table does not list), where the steppers keep the
+// 5 lb fallback so he can still move the weight by hand (provisional call, BUILD_LOG).
+test('loadStep and stepFor give the same step on every shipped row in an lb block except assist rows (16 B.1 step 7 a)', async () => {
+  const { loadStep } = await import('../../../ui/today.js');
+  const { stepFor } = await import('../../../engine.js');
+  const { RULES } = await import('../../../rules.js');
+  const { SEED_EXERCISES } = await import('../../../data/exercises.js');
+  const { effectiveExercise } = await import('../../../store.js');
+  let same = 0, assist = 0, none = 0;
+  const bad = [];
+  for (const p of ['fixed', 'adaptive']) {
+    const rules = RULES.profiles[p];
+    for (const row of SEED_EXERCISES) {
+      for (const f of [null, { no_added_sets: false, left_out_of_builder: false, step: 10 }, { no_added_sets: false, left_out_of_builder: false, weight_steps: [40, 50, 70] }]) {
+        const block = f ? { exercise_flags: { [row.id]: f } } : {};
+        const eng = stepFor(rules, row, 'lb', f);
+        if (row.load_kind === 'assist') { assist++; continue; }
+        if (eng === null) { none++; assert.deepEqual(loadStep(effectiveExercise(block, row), 'lb', rules), { size: 5 }, row.id + ': no engine step keeps the 5 lb fallback'); continue; }
+        const mine = loadStep(effectiveExercise(block, row), 'lb', rules);
+        if (JSON.stringify(mine) !== JSON.stringify(eng)) bad.push(p + ' ' + row.id + ' ' + JSON.stringify(f) + ': ' + JSON.stringify(mine) + ' vs ' + JSON.stringify(eng));
+        else same++;
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+  assert.ok(same > 1000, 'the rows were compared (' + same + ' same, ' + assist + ' assist, ' + none + ' with no engine step)');
+});
+
+// The Adjust each round parts never show on a Fixed block (16 B.5 rows 3, 5, 9, 10, 12, 13; the brief:
+// a Fixed block looks and behaves as 0.2.6 but for the sleep card, Close block, Change answers, Set
+// kind, Add exercise and Take out this exercise).
+test('Slice 2: the marks, the why line, the retarget line, the soreness sheet and the scope sheet on Add set, Move and Swap sit behind Adjust each round', () => {
+  const src = read('ui/today.js');
+  assert.match(src, /const mk = adaptive\(v\) \? markOf\(s\) : null;/, 'met and missed marks');
+  assert.match(src, /const whyLine = adaptive\(v\) && why && /, 'the why line');
+  assert.match(src, /const whys = adaptive\(v\) \? await store\.slotWhy\(day\.id\) : \{\};/, 'the why read');
+  assert.match(src, /if \(adaptive\(v\) && open && open\.kind === 'work'\) \{/, 'the retarget read');
+  assert.match(src, /if \(adaptive\(v\) && firstOfSlot\) \{/, 'the soreness-alone sheet');
+  assert.match(src, /\[0, adj \? scoped\(\{ type: 'add_set' \}\) : act\(\(\) => ctx\.store\.addSet\(dayId, slot\)\)\]/, 'Add set in the card menu');
+  assert.match(src, /\['up', adj \? scoped\(/, 'Move up');
+  assert.match(src, /\['down', adj \? scoped\(/, 'Move down');
+  assert.match(src, /scoped: adj \}; ctx\.go\('#\/picker'\);/, 'Swap');
+  assert.match(src, /if \(!adaptive\(v\)\) \{\n\s+await ctx\.store\.addSet\(v\.day\.id, slot\);/, 'the Add set button');
+  assert.match(src, /const adaptive = \(v\) => !!v && v\.profile === 'adaptive';/);
+  // The profile comes from the store's own clock and rule check (dayView), never worked out on the page.
+  assert.ok(!/Date\.now\(\)[^\n]*profile|profileFor\(/.test(src), 'today.js works out no profile itself');
+  assert.match(read('store.js'), /const profile = block \? profileOf\(block, t0\) : 'fixed';/);
+});
+
+// B.10 item 5: his own words from the block file (the sleep hint, check words) reach the page as text only.
+test('Slice 2: the sleep hint is his words as text, and the sleep card leaves on the first tick (B.5 row 1, B.10 item 5)', () => {
+  const src = read('ui/today.js');
+  assert.match(src, /el\('p', \{ class: 'sleep-hint', id: 'sleep-hint' \}, block\.sleep_hint\)/);
+  assert.match(src, /if \(day\.status === 'planned'\) box\.appendChild\(sleepCard\(ctx, screen, day, b\)\);/);
+  assert.ok(!/innerHTML|insertAdjacentHTML|outerHTML/.test(src), 'no markup is built from text');
+  // A chip tap writes the answer only: no tick, no draft, no keep-awake.
+  const card = src.slice(src.indexOf('function sleepCard('), src.indexOf('\n}\n', src.indexOf('function sleepCard(')));
+  assert.ok(/ctx\.store\.answerSleep\(day\.id, cur === val \? null : val\)/.test(card), 'tapping the picked chip clears it');
+  assert.ok(!/\.tick\(|saveDraft|wake\./.test(card), 'the sleep card never opens the day');
+});
+
+// ---------------- Slice 2, B.1 steps 8 and 9 ----------------
+
+test('Slice 2: the Adjust each round row is in the DOM only when the store allows the switch; Back to Fixed only on an adaptive block; condition words as text (16 B.9, B.10 item 5)', () => {
+  const src = read('ui/settings.js');
+  const fn = span(src, 'async function adjustRow(ctx, card) {', '\n}');
+  assert.match(fn, /const block = await store\.activeBlock\(\);\n  if \(!block\) return;/, 'the active block only');
+  assert.match(fn, /if \(await store\.switchAllowed\(block\.id\)\) \{\n    card\.appendChild\(el\('button', \{ class: 'row row-link menu-row', type: 'button', id: 'adjust-row'/, 'the row is put in only when switchAllowed is true');
+  assert.match(fn, /\} else if \(await store\.switchBackAllowed\(block\.id\)\) \{\n    card\.appendChild\(el\('button', \{ class: 'row row-link menu-row', type: 'button', id: 'adjust-back'/, 'Back to Fixed');
+  assert.equal(src.split("id: 'adjust-row'").length - 1, 1, 'one Adjust each round row');
+  assert.ok(!/hidden/.test(fn), 'the row is left out, never hidden');
+  // The settings page works out no date and no profile itself: the store's clock decides (M27).
+  assert.ok(!/Date|2026-12|localDate|profileFor/.test(fn), 'settings.js works out no date or profile');
+  assert.match(src, /el\('span', \{ class: 'grow' \}, words\)\);/, 'the condition words are a text child');
+  assert.match(src, /await ctx\.store\.switchProfile\(block\.id, ticks\.slice\(\), input\.value\);/, 'the store gets the ticks and the typed word as typed (M39)');
+  assert.ok(!/innerHTML|insertAdjacentHTML|outerHTML/.test(src), 'no markup is built from text');
+});
+
+test('Slice 2: the #/day/ route goes through the store check and to the Block tab otherwise; the view has no tick button, stepper, menu or Finish day (16 B.5 row 2, B.10 item 9)', () => {
+  const app = read('app.js');
+  assert.match(app, /if \(route\.startsWith\(DAYVIEW\)\) \{ root\.appendChild\(renderDayView\(ctx, route\.slice\(DAYVIEW\.length\)\)\); root\.appendChild\(tabbar\('#\/block'\)\); return; \}/);
+  assert.match(app, /'#\/block': \(\) => renderBlock\(ctx\),/);
+  const src = read('ui/block.js');
+  const fn = span(src, 'async function drawDay(ctx, screen, dayId) {', '\n}');
+  assert.match(fn, /try \{ p = await ctx\.store\.dayPreview\(dayId\); \} catch \(e\) \{ p = null; \}\n  if \(!p\) \{ ctx\.go\('#\/block'\); return; \}/, 'a bad id goes to the Block tab');
+  const view = src.slice(src.indexOf('export function renderDayView('));
+  assert.ok(!/'data-tick'|'data-step'|'data-setmenu'|'data-menu'|'data-addset'|finish-day|day-menu|sleepCard|\.tick\(|saveDraft|liveEdit/.test(view), 'nothing on the view can write');
+  assert.ok(!/el\('(button|input)'/.test(view), 'no button and no field on the read-only view');
+  assert.match(read('store.js'), /async function dayPreview\(dId\) \{\n    checkId\(dId\);/, 'checkId first');
+});
+
+test('Slice 2: a day of the easy round opens the stop sheet while hard days are left (16 B.5 row 4)', () => {
+  const fn = span(read('ui/block.js'), 'function openDay(ctx, ov, d) {', '\n}');
+  assert.match(fn, /const n = easyStop\(ov, d\);\n  if \(n > 0\) \{ easySheet\(ctx, n\); return; \}/);
+});
+
+test('Slice 2: Phone check prints the rules fact as Error when the rule table fails, with no new word (16 B.2 note 5)', () => {
+  const src = read('ui/check.js');
+  assert.match(src, /if \(ctx\.store && !ctx\.store\.rulesOk\(\)\) factsBox\.appendChild\(factRow\(t\('settings\.rules'\), t\('check\.error'\), 'rules'\)\);/);
+});
+
+
+test('r4.5 ruling 1: the Add an exercise sets stepper names its buttons by addex.less and addex.more, never the rep words', () => {
+  const src = read('ui/today.js');
+  assert.ok(src.includes("id: 'addex-less', 'aria-label': t('addex.less')"), 'addex-less is named by addex.less');
+  assert.ok(src.includes("id: 'addex-more', 'aria-label': t('addex.more')"), 'addex-more is named by addex.more');
+  const strings = read('ui/strings.js');
+  assert.ok(strings.includes("'addex.less': '1 set less'") && strings.includes("'addex.more': '1 set more'"), 'the two words are the architect words of r4.5');
 });

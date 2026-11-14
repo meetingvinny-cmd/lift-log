@@ -41,6 +41,10 @@ export function renderSettings(ctx) {
     el('span', { class: 'grow' }, t('settings.undo')), glyph('chevron'));
   const storageBox = el('div', { class: 'banner banner-storage', id: 'storage-banner', role: 'status', hidden: true }, el('p', { class: 'grow' }, t('storage.unprotected')));
   const bigLine = el('p', { class: 'small what-to-do', id: 'backup-big', role: 'status', hidden: true });
+  const blockCard = el('div', { class: 'card', id: 'block-card' },
+    el('button', { class: 'row row-link menu-row', type: 'button', id: 'load-block-row', on: { click: () => ctx.loadBlockFile() } },
+      el('span', { class: 'grow' }, t('settings.load')), glyph('chevron')));
+  adjustRow(ctx, blockCard).catch(() => {});
 
   async function paint() {
     const last = await store.getSetting('last_backup_at', null);
@@ -68,9 +72,7 @@ export function renderSettings(ctx) {
       el('div', { class: 'card' }, ...loggingRows(ctx))),
     el('div', { class: 'group', id: 'block-group' },
       el('p', { class: 'label' }, t('settings.group.block')),
-      el('div', { class: 'card' },
-        el('button', { class: 'row row-link menu-row', type: 'button', id: 'load-block-row', on: { click: () => ctx.loadBlockFile() } },
-          el('span', { class: 'grow' }, t('settings.load')), glyph('chevron')))),
+      blockCard),
     el('div', { class: 'group', id: 'units-group' },
       el('p', { class: 'label' }, t('settings.units')),
       el('div', { class: 'card' }, el('div', { class: 'row check-row' }, unitsSeg(ctx), el('span', { class: 'what-to-do' }, t('settings.units.line'))))),
@@ -143,6 +145,111 @@ function lookSeg(ctx) {
       (k) => { applyTheme(k); ctx.store.setSetting('theme', k); }, 'look'));
   });
   return box;
+}
+
+// ---------------- Adjust each round (16 B.9, B.5 row 15, LOOK 4.9) ----------------
+
+const ADJUST_WORD = 'ADJUST';
+
+// The switch may go only with all three of his ticks on the block's three condition lines and
+// the word typed exactly (after trim, case kept). The store checks the same again (M39).
+export function adjustReady(ticks, typed, lines) {
+  return lines === 3 && Array.isArray(ticks) && ticks.length === 3 && ticks.every(x => x === true) && String(typed).trim() === ADJUST_WORD;
+}
+
+// The block's own condition words (his block file through coach_words.json), as given.
+export function conditionLines(block) {
+  return block && Array.isArray(block.switch_conditions) ? block.switch_conditions.filter(w => typeof w === 'string' && w !== '') : [];
+}
+
+// The BLOCK group row, on the active block only. The Adjust each round row is put in the DOM only
+// when the store says the switch may run (from 2026-12-01 local by the store's clock, a valid rule
+// table, a block not done, on Fixed; M27); an adaptive block gets Back to Fixed in its place.
+async function adjustRow(ctx, card) {
+  const store = ctx.store;
+  const block = await store.activeBlock();
+  if (!block) return;
+  if (await store.switchAllowed(block.id)) {
+    card.appendChild(el('button', { class: 'row row-link menu-row', type: 'button', id: 'adjust-row', on: { click: () => adjustSheet(ctx, block) } },
+      el('span', { class: 'grow' }, t('adjust.row')), glyph('chevron')));
+  } else if (await store.switchBackAllowed(block.id)) {
+    card.appendChild(el('button', { class: 'row row-link menu-row', type: 'button', id: 'adjust-back', on: { click: () => backSheet(ctx, block) } },
+      el('span', { class: 'grow' }, t('adjust.back')), glyph('chevron')));
+  }
+}
+
+// One check row (LOOK 4.10 boxed skin): his words as text; the box fills when ticked.
+function boxOf(on) {
+  return el('span', { class: 'box', 'aria-hidden': 'true' }, on ? glyph('check') : null);
+}
+function conditionRow(i, words, onFlip) {
+  let on = false;
+  const btn = el('button', { class: 'row check-box-row', type: 'button', role: 'checkbox', 'aria-checked': 'false', 'data-cond': String(i) }, boxOf(false), el('span', { class: 'grow' }, words));
+  btn.addEventListener('click', () => {
+    on = !on;
+    btn.setAttribute('aria-checked', String(on));
+    btn.querySelector('.box').replaceWith(boxOf(on));
+    onFlip(on);
+  });
+  return btn;
+}
+
+// The sheet (B.9): the three check rows, adjust.line, the typed field, the primary disabled until
+// all three are ticked and the field holds ADJUST, and Cancel. No condition words: no rows, and the
+// primary stays disabled.
+export function adjustSheet(ctx, block) {
+  const lines = conditionLines(block);
+  const ticks = lines.map(() => false);
+  const go = el('button', { class: 'btn btn-primary', type: 'button', id: 'adjust-go' }, t('adjust.go'));
+  const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'adjust-cancel' }, t('text.cancel'));
+  const input = el('input', { type: 'text', class: 'confirm-input', id: 'adjust-in', autocapitalize: 'characters', autocomplete: 'off',
+    spellcheck: 'false', 'aria-label': t('adjust.type'), maxlength: String(LIMITS.KEY) });
+  const paint = () => {
+    const ok = adjustReady(ticks, input.value, lines.length);
+    go.disabled = !ok;
+    go.setAttribute('aria-disabled', String(!ok));
+  };
+  const rows = lines.map((w, i) => conditionRow(i, w, (on) => { ticks[i] = on; paint(); }));
+  input.addEventListener('input', paint);
+  paint();
+  // A scrim tap closes it only while nothing is ticked or typed (LOOK 3.3).
+  const sh = sheet({ id: 'adjust-sheet', title: t('adjust.title'), canDismiss: () => !ticks.some(Boolean) && input.value === '' },
+    ...rows, el('p', { class: 'small', id: 'adjust-line' }, t('adjust.line')),
+    el('label', { class: 'confirm' }, el('span', { class: 'small' }, t('adjust.type')), input), go, el('div', { class: 'quiet-row' }, cancel));
+  cancel.addEventListener('click', () => sh.close());
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      await ctx.store.switchProfile(block.id, ticks.slice(), input.value);
+    } catch (e) {
+      paint();
+      toast(t('today.notsaved'));
+      return;
+    }
+    sh.close();
+    ctx.render();
+  });
+}
+
+// Back to Fixed (B.9): one plain confirm, no typed word, no danger skin (it lowers risk).
+function backSheet(ctx, block) {
+  const go = el('button', { class: 'btn btn-secondary', type: 'button', id: 'adjust-back-go' }, t('adjust.back'));
+  const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'adjust-back-cancel' }, t('text.cancel'));
+  const sh = sheet({ id: 'adjust-back-sheet', title: t('adjust.back.title') },
+    el('p', { class: 'small' }, t('adjust.back.line')), go, el('div', { class: 'quiet-row' }, cancel));
+  cancel.addEventListener('click', () => sh.close());
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      await ctx.store.switchBack(block.id);
+    } catch (e) {
+      go.disabled = false;
+      toast(t('today.notsaved'));
+      return;
+    }
+    sh.close();
+    ctx.render();
+  });
 }
 
 // ---------------- restore and undo (DESIGN 5.3, 5.5) ----------------

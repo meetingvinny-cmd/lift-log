@@ -1,0 +1,235 @@
+{
+ "format": "liftlog-block",
+ "schema": 2,
+ "source_id": "test-source-2",
+ "version": 1,
+ "block": {
+  "name": "Test block two",
+  "unit": "lb",
+  "profile": "fixed",
+  "rules_frozen": {
+   "profile": "fixed",
+   "rules_version": "signed-1"
+  },
+  "passes": 4,
+  "notes": "Made-up test block.",
+  "checks": [
+   {
+    "key": "check_a",
+    "ask": "Made-up check question?",
+    "stop_note": "Made-up stop note."
+   }
+  ],
+  "scores": [
+   {
+    "key": "score_a",
+    "label": "Made-up score",
+    "min": 0,
+    "max": 10
+   }
+  ],
+  "rule_notes": {
+   "one_failure_set": "Made-up one failure note.",
+   "failure_on_machine": "Made-up machine note."
+  },
+  "exercise_flags": {
+   "leg_press": {
+    "no_added_sets": false,
+    "left_out_of_builder": false
+   },
+   "ex_p": {
+    "no_added_sets": true,
+    "left_out_of_builder": false
+   }
+  },
+  "day_templates": [
+   {
+    "day": 1,
+    "label": "A",
+    "lifts": [
+     {
+      "slot": 1,
+      "exercise_id": "leg_press",
+      "sets": 3,
+      "rep_low": 8,
+      "rep_high": 12,
+      "start_load": 150,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [
+       {
+        "reps": 10,
+        "load": 90
+       },
+       {
+        "reps": 5,
+        "load": 120
+       }
+      ],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 2,
+      "exercise_id": "ex_p",
+      "sets": 2,
+      "rep_low": 10,
+      "rep_high": 15,
+      "start_load": 40,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "LR",
+      "load_basis": "per_hand",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 3,
+      "exercise_id": "seated_leg_curl",
+      "sets": 2,
+      "rep_low": 15,
+      "rep_high": 20,
+      "start_load": 70,
+      "failure_set": true,
+      "reps_left_target": 0,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "failure"
+     }
+    ]
+   },
+   {
+    "day": 2,
+    "label": "B",
+    "lifts": [
+     {
+      "slot": 1,
+      "exercise_id": "chest_press_machine",
+      "sets": 3,
+      "rep_low": 8,
+      "rep_high": 12,
+      "start_load": 100,
+      "failure_set": false,
+      "reps_left_target": 2,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": null,
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 2,
+      "exercise_id": "ex_q",
+      "sets": 2,
+      "rep_low": 30,
+      "rep_high": 30,
+      "start_load": null,
+      "failure_set": false,
+      "reps_left_target": null,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "total",
+      "count_label": "seconds",
+      "note": "",
+      "set_type": "normal"
+     },
+     {
+      "slot": 3,
+      "exercise_id": "farmer_carry",
+      "sets": 2,
+      "rep_low": 3,
+      "rep_high": 3,
+      "start_load": 50,
+      "failure_set": false,
+      "reps_left_target": null,
+      "warmups": [],
+      "sides": "none",
+      "load_basis": "per_hand",
+      "count_label": "laps",
+      "note": "",
+      "set_type": "normal"
+     }
+    ]
+   }
+  ],
+  "levels": {
+   "quads": "top",
+   "hamstrings": "middle",
+   "biceps": "bottom"
+  },
+  "switch_conditions": [
+   "Made-up condition line one.",
+   "Made-up condition line two.",
+   "Made-up condition line three."
+  ],
+  "sleep_hint": "Made-up sleep hint.",
+  "flag_questions": {
+   "machine": "Made-up machine question?",
+   "no_added_sets": "Made-up no added sets question?",
+   "left_out_of_builder": "Made-up left out question?"
+  }
+ },
+ "exercises": [
+  {
+   "id": "ex_p",
+   "name": "Made-up exercise P",
+   "muscle": "arms",
+   "equipment": "other",
+   "count_label": "reps",
+   "weight_steps": [
+    2.5,
+    5
+   ],
+   "step_default": 5,
+   "unilateral": false,
+   "machine": false,
+   "no_added_sets": false,
+   "left_out_of_builder": false,
+   "flags_set": true,
+   "link": "",
+   "notes": "",
+   "custom": true,
+   "edited": false,
+   "muscle_detail": "biceps",
+   "equipment_detail": "kettlebell",
+   "load_kind": "external",
+   "tags": [
+    "overhead"
+   ]
+  },
+  {
+   "id": "ex_q",
+   "name": "Made-up exercise Q",
+   "muscle": "core",
+   "equipment": "bodyweight",
+   "count_label": "reps",
+   "weight_steps": [
+    2.5,
+    5
+   ],
+   "step_default": 5,
+   "unilateral": false,
+   "machine": false,
+   "no_added_sets": false,
+   "left_out_of_builder": false,
+   "flags_set": true,
+   "link": "",
+   "notes": "",
+   "custom": true,
+   "edited": false,
+   "muscle_detail": "abs_core",
+   "equipment_detail": "body",
+   "load_kind": "body_plus",
+   "tags": []
+  }
+ ]
+}

@@ -17,22 +17,33 @@ const A = RULES.profiles.adaptive;
 const F = RULES.profiles.fixed;
 const FIX = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const blockV1 = () => JSON.parse(readFileSync(join(FIX, 'block_v1.json'), 'utf8'));
+// The scripted block of B.12 (B.1 step 11, r4.2 fold-in) and its answer script with the expected
+// table, one JSON beside the fixture so e2e.py plays and checks the same numbers.
+const ROUNDS_TEXT = () => readFileSync(join(FIX, 'block_rounds.json'), 'utf8');
+const ROUNDS_SCRIPT = () => JSON.parse(readFileSync(join(FIX, 'block_rounds_script.json'), 'utf8'));
 const MIN = 60000, HOUR = 3600000;
-const SLICE1_WHY = 'As written on your block';
+const SLICE1_WHY = 'why.plan';
+// The store writes planDay's rows with the schema 2 fields (16 B.3.9, r4.1 Q20); the compare
+// leaves them out, as the B.12 field list says (set_type, set_type_by_hand, target.failure_set).
+const slice1Shape = (s) => {
+  const { set_type: _a, set_type_by_hand: _b, add_scope: _c, ...rest } = s;
+  const { failure_set: _d, effort_only: _e, ...target } = s.target;
+  return { ...rest, target };
+};
 
 // ---------------- Fixed equals the Slice 1 planner ----------------
 
-test('Fixed planDay deep-equals the Slice 1 rows for every day of 3 rounds (block_v1)', async () => {
+for (const [name, read] of [['block_v1', () => blockV1()], ['block_rounds', () => JSON.parse(ROUNDS_TEXT())]]) test('Fixed planDay deep-equals the Slice 1 rows for every day of 3 rounds (' + name + ')', async () => {
   const db = createFakeDb();
   const clock = fakeClock('2026-11-02T18:00:00-05:00');
   const store = createStore({ db, now: clock.now, writeLimitMs: 50 });
   await store.seed();
-  const file = blockV1();
+  const file = read();
   const block = await store.createBlock({ ...file.block, day_templates: file.block.day_templates });
   let checked = 0;
   for (let i = 0; i < 2 * 3; i++) {
     const day = await store.currentDay();
-    const have = (await db.byIndex('sets', 'day_id', day.id)).sort((a, b) => a.id < b.id ? -1 : 1);
+    const have = (await db.byIndex('sets', 'day_id', day.id)).map(slice1Shape).sort((a, b) => a.id < b.id ? -1 : 1);
     const want = planDay(F, block, {}, { pass: day.pass, day: day.day }).sets.map(s => ({ ...s, why: SLICE1_WHY })).sort((a, b) => a.id < b.id ? -1 : 1);
     assert.deepEqual(have, want, 'round ' + day.pass + ' day ' + day.day + ' differs from Slice 1');
     checked += have.length;
@@ -44,7 +55,7 @@ test('Fixed planDay deep-equals the Slice 1 rows for every day of 3 rounds (bloc
     await store.finishDay(day.id);
     clock.add(2 * 24 * HOUR);
   }
-  assert.ok(checked > 40);
+  assert.ok(checked >= (name === 'block_v1' ? 41 : 27), checked + ' rows compared');
 });
 
 test('currentPosition gives the same day as the Slice 1 currentDay', async () => {
@@ -148,6 +159,116 @@ test('scripted rounds, Fixed: every count as written, no easy round', () => {
     const lift = b.day_templates[p.day.day - 1].lifts.find(l => l.slot === s.slot);
     assert.deepEqual([s.target.load, s.target.rep_low, s.target.reps_left_target], [lift.start_load, lift.rep_low, lift.reps_left_target]);
   }
+});
+
+// ---------------- the scripted rounds on block_rounds.json (B.12, B.1 step 11) ----------------
+
+// Plays block_rounds.json for 4 rounds through the store on the fake db, by the answer script
+// (block_rounds_script.json: the same file e2e.py plays by taps). The plan of each day is read
+// after the sleep answer and before the first tick. Returns { plans, db, block }.
+async function playRounds(profile) {
+  const S = ROUNDS_SCRIPT();
+  const text = ROUNDS_TEXT();
+  const file = JSON.parse(text);
+  const db = createFakeDb();
+  const clock = fakeClock(profile === 'fixed' ? S.fixed_clock : S.adaptive_clock);
+  const store = createStore({ db, now: clock.now, writeLimitMs: 50 });
+  await store.seed();
+  await store.setSetting('unit', 'lb');
+  const block = await store.importBlock(text, true);
+  const plans = {};
+  for (let pass = 1; pass <= 4; pass++) for (let day = 1; day <= 2; day++) {
+    const key = pass + ':' + day;
+    const sc = { ...S.defaults, ...(S.days[key] || {}) };
+    if (profile === 'adaptive' && key === S.switch_on) {
+      clock.add(MIN);
+      await store.switchProfile(block.id, [true, true, true], 'ADJUST');
+    }
+    const cd = await store.currentDay();
+    assert.deepEqual([cd.pass, cd.day], [pass, day], 'the current day at ' + key);
+    clock.add(MIN);
+    await store.answerSleep(cd.id, sc.sleep);
+    let v = await store.dayView(cd.id);
+    plans[key] = { day: cd.id, sets: v.sets.map(s => ({ ...s, target: { ...s.target } })) };
+    if (sc.add_rest) {
+      if (profile === 'adaptive') await store.liveEdit({ type: 'add_set', dayId: cd.id, slot: sc.add_rest }, 'rest');
+      else await store.addSet(cd.id, sc.add_rest);   // Fixed: Add set does not ask (Today only)
+    }
+    v = await store.dayView(cd.id);
+    const lifts = file.block.day_templates[day - 1].lifts;
+    for (const s of v.sets.slice().sort((a, b) => a.slot - b.slot || a.set_n - b.set_n)) {
+      const lift = lifts.find(l => l.slot === s.slot);
+      const named = sc.reps && sc.reps[s.slot] && sc.reps[s.slot][s.set_n] !== undefined ? sc.reps[s.slot][s.set_n] : null;
+      clock.add(MIN);
+      await store.tick(s.id, { load: s.target.load ?? lift.start_load, reps: named ?? s.target.rep_low ?? lift.rep_low, reps_left: null, reps_left_plus: false, failure: false });
+    }
+    for (const lift of lifts) {
+      const fb = { ...S.defaults, ...((sc.fb && sc.fb[lift.slot]) || {}) };
+      clock.add(MIN);
+      await store.saveFeedback(cd.id, lift.slot, { pump: fb.pump, soreness: fb.soreness, workload: fb.workload, checks: { check_a: fb.check_a }, note: '' }, false);
+    }
+    clock.add(MIN);
+    await store.finishDay(cd.id, { score_a: sc.score_a });
+    clock.add(24 * 60 * MIN);
+  }
+  return { plans, db, block };
+}
+// One slot of a planned day as the table writes it: the why, then [load, rep_low, rep_high, reps_left_target] per set number.
+const tableSlot = (plan, slot) => {
+  const w = plan.sets.filter(s => s.slot === slot && s.kind === 'work' && s.origin === 'plan').sort((a, b) => a.set_n - b.set_n);
+  return { why: w.length ? w[0].why : null, sets: w.map(s => [s.target.load, s.target.rep_low, s.target.rep_high, s.target.reps_left_target]) };
+};
+
+for (const profile of ['adaptive', 'fixed']) {
+  test('scripted rounds (block_rounds.json), ' + profile + ': every planned count, load, rep goal and reps-left goal matches the script table', async () => {
+    const S = ROUNDS_SCRIPT();
+    const { plans } = await playRounds(profile);
+    assert.deepEqual(Object.keys(plans), Object.keys(S.expect[profile]));
+    for (const [key, slots] of Object.entries(S.expect[profile])) {
+      for (const [slot, want] of Object.entries(slots)) assert.deepEqual(tableSlot(plans[key], Number(slot)), want, profile + ' ' + key + ' slot ' + slot);
+    }
+  });
+}
+
+test('scripted rounds (block_rounds.json), Fixed: every round as the block file writes it, no easy round, no why but the plan', async () => {
+  const S = ROUNDS_SCRIPT();
+  const file = JSON.parse(ROUNDS_TEXT());
+  const { plans } = await playRounds('fixed');
+  for (const [key, plan] of Object.entries(plans)) {
+    const day = Number(key.split(':')[1]);
+    for (const lift of file.block.day_templates[day - 1].lifts) {
+      const want = Array.from({ length: lift.sets }, () => [lift.start_load, lift.rep_low, lift.rep_high, lift.reps_left_target]);
+      assert.deepEqual(tableSlot(plan, lift.slot), { why: 'why.plan', sets: want }, 'Fixed ' + key + ' slot ' + lift.slot);
+    }
+  }
+  assert.ok(Object.values(S.expect.fixed).every(d => Object.values(d).every(x => x.why === 'why.plan')), 'the Fixed table holds no easy round');
+});
+
+test('scripted rounds (block_rounds.json), Adjust each round: rounds 2 to 4 hit every rule the script names', async () => {
+  const S = ROUNDS_SCRIPT();
+  const { plans, db } = await playRounds('adaptive');
+  const why = (key, slot) => tableSlot(plans[key], slot).why;
+  const n = (key, slot) => tableSlot(plans[key], slot).sets.length;
+  const first = (key, slot) => tableSlot(plans[key], slot).sets[0];
+  assert.deepEqual([why('2:1', 1), n('1:1', 1), n('2:1', 1)], ['why.R8', 1, 2], 'R8 add');
+  assert.deepEqual([why('2:1', 2), n('1:1', 2), n('2:1', 2)], ['why.R1', 2, 1], 'R1 cut (soreness 4 on the bottom muscle)');
+  assert.deepEqual([why('2:1', 3), n('2:1', 3)], ['why.top', 3], 'the top of 3');
+  assert.deepEqual([why('2:2', 1), n('2:2', 1)], ['why.check', 1], 'the yes check gate');
+  assert.deepEqual([why('2:2', 2), n('2:2', 2)], ['why.flag', 1], 'the lift flagged no_added_sets');
+  // The hand add with Rest of block on round 2 day A slot 1: the round's one add with the R8 add, held at 3.
+  const added = (await db.all('sets')).filter(s => s.day_id === plans['2:1'].day && s.slot === 1 && s.origin === 'added');
+  assert.deepEqual(added.map(s => s.add_scope), ['rest']);
+  assert.deepEqual([why('3:1', 1), n('2:1', 1), n('3:1', 1)], ['why.R8', 2, 3], 'the hand add counts as the one add, held at 3');
+  assert.deepEqual([why('3:1', 3), n('3:1', 3), first('3:1', 3)[1]], ['why.missed', 3, 8], 'the missed gate (a set under goal in round 2): no add, goal done plus 1');
+  assert.deepEqual([why('3:2', 1), n('3:2', 1)], ['why.sleep', 1], 'the sleep gate (Yes on the card)');
+  assert.deepEqual([first('2:2', 1)[0], first('2:2', 1)[1], first('3:2', 1)[0], first('3:2', 1)[1]], [80, 8, 75, 10], 'two misses in a row: load down one step, the rep goal back to the planned goal');
+  assert.deepEqual([why('3:2', 3), n('3:2', 3)], ['why.R6', 1], 'the score 5 gate (score_a 5 on round 3 day A)');
+  for (const key of ['4:1', '4:2']) for (const slot of [1, 2, 3]) {
+    const t = tableSlot(plans[key], slot);
+    assert.equal(t.why, 'why.easy', 'easy round ' + key + ' slot ' + slot);
+    assert.ok(t.sets.length <= 2 && t.sets.every(x => x[3] === 8), 'easy round: 2 sets at most, 4 or more reps left');
+  }
+  assert.deepEqual(S.expect.adaptive['4:1']['1'].sets, [[105, 7, 8, 8], [105, 7, 7, 8]], 'the table agrees: 115 x 0.9 to the nearest 5, reps x 0.67');
 });
 
 // ---------------- planDay edges ----------------

@@ -250,7 +250,8 @@ export function renderPicker(ctx) {
     on: { click: () => { chip = i; chips.forEach((c, j) => { c.classList.toggle('is-on', j === i); c.setAttribute('aria-pressed', String(j === i)); }); paint(); } } }, glyph('check'), w));
 
   const pick = async (exerciseId) => {
-    if (p.mode === 'swap') {
+    // Swap and Add an exercise on Today (16 B.5 row 17) go back to Today with the pick.
+    if (p.mode === 'swap' || p.mode === 'addex') {
       await swapTo(ctx, exerciseId);
       ctx.go('#/today');
       return;
@@ -283,7 +284,7 @@ export function renderPicker(ctx) {
   search.addEventListener('input', paint);
   screen.append(
     el('div', { class: 'topbar' }, el('button', { class: 'btn btn-quiet', type: 'button', id: 'picker-back', on: { click: () => { ctx.picker = null; ctx.go(p.back); } } }, glyph('back'), t('builder.back')),
-      el('h2', { class: 'grow' }, p.mode === 'swap' ? t('menu')[3] : t('builder.addex'))),
+      el('h2', { class: 'grow' }, p.mode === 'swap' ? t('menu')[3] : p.mode === 'addex' ? t('daymenu.addex') : t('builder.addex'))),
     search, el('div', { class: 'chips-row' }, chips), list,
     el('button', { class: 'btn btn-secondary', type: 'button', id: 'picker-make', on: { click: () => make(search.value.trim()) } }, glyph('plus'), t('picker.make')));
   paint();

@@ -170,7 +170,8 @@ test('builder start weight steps in the unit of the build: kg plus on a step_def
 
 test('the card menu order of record: Notes, then Checks, then Video link (G16, review P18)', async () => {
   const { CARD_MENU_ORDER } = await import('../../../ui/today.js');
-  assert.deepEqual(CARD_MENU_ORDER, [0, 1, 2, 3, 'up', 'down', 4, 'checks', 5]);
+  // Slice 2 (16 B.5 rows 8, 18; LOOK 3.2): Take out this exercise after Move down, Change answers after Checks.
+  assert.deepEqual(CARD_MENU_ORDER, [0, 1, 2, 3, 'up', 'down', 'remove', 4, 'checks', 'answers', 5]);
   const { t } = await import('../../../ui/strings.js');
   assert.equal(t('menu')[4], 'Notes', 'code index 4 is menu[5] Notes');
   assert.equal(t('menu')[5], 'Video link', 'code index 5 is menu[6] Video link');
@@ -317,4 +318,159 @@ test('SB5: Finish day passes over a pending feedback row whose slot holds no set
   assert.equal(calls[4][1], '#/daydone/' + dId);
   // The sheet itself gives way at once when its slot has no set.
   assert.equal(await feedbackSheet(ctx, v, 9, true), undefined);
+});
+
+// ---------------- Slice 2, B.1 step 7: the Today parts (16 B.5) ----------------
+
+test('Slice 2 day menu: Add an exercise first on a day with room, Close block last on a block not finished (B.5 rows 7, 17)', async () => {
+  const { dayMenuRows } = await import('../../../ui/today.js');
+  const { LIMITS } = await import('../../../backup.js');
+  const block = { status: 'active' };
+  const rows = (n, status) => Array.from({ length: n }, (_, i) => ({ slot: i + 1, status: status || 'planned' }));
+  assert.deepEqual(dayMenuRows({ status: 'planned' }, rows(2), block), ['addex', 'relabel', 'skip', 'end']);
+  assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }], block), ['addex', 'relabel', 'reset', 'end']);
+  assert.deepEqual(dayMenuRows({ status: 'open' }, rows(LIMITS.LIFTS_PER_DAY), block), ['relabel', 'reset', 'skip', 'end'], 'a full day leaves Add an exercise out');
+  assert.ok(dayMenuRows({ status: 'open' }, [...rows(LIMITS.LIFTS_PER_DAY - 1), { slot: 99, status: 'skipped' }], block).includes('addex'), 'a skipped card is not counted');
+  assert.ok(!dayMenuRows({ status: 'planned' }, rows(1), { status: 'done' }).includes('end'), 'a finished block has no Close block');
+  assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }]), ['relabel', 'reset'], 'with no block given, the Slice 1 rows only');
+});
+
+test('Slice 2 met and missed marks: a done work set with a rep goal; none on a warm-up, an effort-only set or the planned failure set (B.5 row 5)', async () => {
+  const { markOf } = await import('../../../ui/today.js');
+  const done = (reps, target, extra) => ({ kind: 'work', status: 'done', done: { reps }, target: { rep_low: 8, rep_high: 12, effort_only: false, failure_set: false, ...target }, ...extra });
+  assert.equal(markOf(done(8)), 'met');
+  assert.equal(markOf(done(12)), 'met');
+  assert.equal(markOf(done(7)), 'under');
+  assert.equal(markOf(done(7, {}, { kind: 'warmup' })), null, 'no mark on a warm-up');
+  assert.equal(markOf(done(7, { effort_only: true })), null, 'no mark on an effort-only set');
+  assert.equal(markOf(done(7, { failure_set: true })), null, 'no mark on the planned failure set');
+  assert.equal(markOf(done(7, {}, { set_type: 'failure', set_type_by_hand: true })), 'under', 'a set he marked To failure keeps its mark');
+  assert.equal(markOf(done(7, { rep_low: null })), null, 'no rep goal, no mark');
+  assert.equal(markOf({ ...done(9), status: 'planned' }), null, 'only a done set');
+});
+
+test('Slice 2 retarget line: the goal at the weight shown, or the effort part alone outside the band (B.5 row 13)', async () => {
+  const { retargetLine } = await import('../../../ui/today.js');
+  const s = { kind: 'work', target: { load: 100, rep_low: 8, rep_high: 12, reps_left_target: 2 } };
+  assert.equal(retargetLine(s, { rep_low: 9 }), 'goal at this weight: 9 reps, stop 2 short');
+  assert.equal(retargetLine({ ...s, target: { ...s.target, reps_left_target: 0 } }, { rep_low: 7 }), 'goal at this weight: 7 reps, to failure');
+  assert.equal(retargetLine(s, { effort_only: true }), 'stop 2 short', 'outside the band: the effort part only');
+  assert.equal(retargetLine(s, null), null, 'Fixed (the store gives null): the goal line stands');
+  assert.equal(retargetLine({ ...s, kind: 'warmup' }, { rep_low: 9 }), null);
+});
+
+test('Slice 2 canAdd: no added set on a lift marked no_added_sets or never screened, in both profiles (B.1 step 7 b)', async () => {
+  const { canAdd } = await import('../../../ui/today.js');
+  const row = { id: 'r', no_added_sets: false, flags_set: true };
+  assert.equal(canAdd({}, row), true);
+  assert.equal(canAdd({}, { ...row, no_added_sets: true }), false);
+  assert.equal(canAdd({}, { ...row, flags_set: false }), false, 'an unscreened row gains no set');
+  assert.equal(canAdd({ exercise_flags: { r: { no_added_sets: false, left_out_of_builder: false } } }, { ...row, flags_set: false }), true, 'a block entry screens it');
+  assert.equal(canAdd({ exercise_flags: { r: { no_added_sets: true, left_out_of_builder: false } } }, row), false, 'the block entry wins');
+  assert.equal(canAdd({}, null), true);
+});
+
+test('Slice 2 loadStep reads the signed default steps of the day table after the row step_default, before the fallback (B.1 step 7 a)', async () => {
+  const { loadStep, stepLoad } = await import('../../../ui/today.js');
+  const rules = { load: { default_steps: { lb: { barbell: [2.5, 5] }, kg: { barbell: [1.25] } } } };
+  const bar = { equipment: 'barbell', weight_steps: null, step_default: 0 };
+  assert.deepEqual(loadStep(bar, 'lb', rules), { size: 2.5 }, 'the smallest signed step');
+  assert.deepEqual(loadStep(bar, 'kg', rules), { size: 1.25 });
+  assert.equal(stepLoad(bar, 100, 1, 'lb', rules), 102.5);
+  assert.deepEqual(loadStep({ ...bar, step_default: 10 }, 'lb', rules), { size: 10 }, 'the row step_default comes first in lb');
+  assert.deepEqual(loadStep({ ...bar, equipment: 'bodyweight' }, 'lb', rules), { size: 5 }, 'a kind the table does not list: the fallback');
+  assert.deepEqual(loadStep(bar, 'lb'), { size: 5 }, 'no table given: the Slice 1 fallback');
+});
+
+test('Slice 2 card menu: Take out this exercise on a planned or open day; Change answers only with a saved row today (B.5 rows 8, 18)', async () => {
+  const { cardMenuKeep } = await import('../../../ui/today.js');
+  const v = (status, feedback) => ({ day: { id: 'd', status }, block: { checks: [] }, slots: [1, 2], sets: [{ slot: 1, status: 'planned' }, { slot: 2, status: 'planned' }], feedback: feedback || [] });
+  assert.equal(cardMenuKeep(v('planned'), 1, { id: 'a' }, 'remove'), true);
+  assert.equal(cardMenuKeep(v('open'), 1, { id: 'a' }, 'remove'), true);
+  assert.equal(cardMenuKeep(v('done'), 1, { id: 'a' }, 'remove'), false);
+  assert.equal(cardMenuKeep(v('open'), 1, { id: 'a' }, 'answers'), false, 'no row');
+  assert.equal(cardMenuKeep(v('open', [{ id: 'd:x1', pending: true }]), 1, { id: 'a' }, 'answers'), false, 'a pending row is not saved');
+  assert.equal(cardMenuKeep(v('open', [{ id: 'd:x1', pending: false }]), 1, { id: 'a' }, 'answers'), true);
+  assert.equal(cardMenuKeep(v('open', [{ id: 'd:x1', pending: false }]), 2, { id: 'a' }, 'answers'), false, 'the row of another slot');
+});
+
+test('Slice 2 a row the soreness-alone sheet made still owes the end questions (B.5 row 9)', async () => {
+  const { soreOnlyRow } = await import('../../../ui/today.js');
+  const f = { id: 'd:x1', pending: true, pump: null, soreness: 2, workload: null, note: '', checks: {} };
+  assert.equal(soreOnlyRow(f), true);
+  assert.equal(soreOnlyRow({ ...f, pump: 3 }), false);
+  assert.equal(soreOnlyRow({ ...f, pending: false }), false);
+  assert.equal(soreOnlyRow({ ...f, soreness: null }), false);
+  assert.equal(soreOnlyRow(f, new Set(['d:x1'])), false, 'one he put off waits for Finish day');
+});
+
+test('Slice 2 end sheet questions: Fixed asks all three with no store read; Adjust each round asks the store plan (B.4.4)', async () => {
+  const { endKeys } = await import('../../../ui/today.js');
+  const calls = [];
+  const ctx = (ask) => ({ store: { feedbackPlan: async (...a) => { calls.push(a); return { ask }; } } });
+  const v = (profile) => ({ profile, day: { id: 'd' } });
+  assert.equal(await endKeys(ctx(['pump']), v('fixed'), 1), null);
+  assert.equal(await endKeys(ctx(['pump']), {}, 1), null, 'an old view with no profile reads as Fixed');
+  assert.equal(calls.length, 0, 'Fixed reads no plan');
+  assert.deepEqual(await endKeys(ctx(['pump', 'workload', 'checks']), v('adaptive'), 1), ['pump', 'workload'], 'soreness asked at the first tick is left out');
+  assert.deepEqual(await endKeys(ctx(['pump', 'soreness', 'workload', 'checks']), v('adaptive'), 1), ['pump', 'soreness', 'workload']);
+  assert.deepEqual(calls[0].slice(0, 3), ['d', 1, 'end']);
+});
+
+test('Slice 2 the picker pick: a Fixed swap is written Today only; an Adjust each round swap and Add exercise wait for Today (B.5 rows 10, 17)', async () => {
+  const { swapTo } = await import('../../../ui/today.js');
+  const writes = [];
+  const store = { swapExercise: async (...a) => writes.push(a) };
+  const c1 = { store, picker: { mode: 'swap', dayId: 'd', slot: 2 } };
+  await swapTo(c1, 'cable_row');
+  assert.deepEqual(writes, [['d', 2, 'cable_row']]);
+  assert.equal(c1.picker, null);
+  const c2 = { store, picker: { mode: 'swap', dayId: 'd', slot: 2, scoped: true } };
+  await swapTo(c2, 'cable_row');
+  assert.deepEqual(c2.todayEdit, { mode: 'swap', dayId: 'd', slot: 2, exercise_id: 'cable_row' });
+  const c3 = { store, picker: { mode: 'addex', dayId: 'd' } };
+  await swapTo(c3, 'leg_curl');
+  assert.equal(c3.todayEdit.mode, 'addex');
+  assert.equal(writes.length, 1, 'nothing written before a scope is picked');
+});
+
+// 16 B.1 step 8: the Block tab words (LOOK 4.7) and the Easy round stop sheet count (B.5 row 4).
+test('Slice 2 Block tab: the day row word, the round word and the signed change', async () => {
+  const { dayWord, roundWord, diffText } = await import('../../../ui/block.js');
+  assert.deepEqual(dayWord({ status: 'planned', now: true }), ['blockday.now', 'now']);
+  assert.deepEqual(dayWord({ status: 'done', now: false }), ['blockday.done', 'done']);
+  assert.deepEqual(dayWord({ status: 'notplanned', now: false }), ['day.notplanned', 'notplanned']);
+  assert.deepEqual(dayWord({ status: 'skipped', now: false }), ['pill.skipped', 'skipped']);
+  assert.equal(dayWord({ status: 'planned', now: false }), null, 'a planned day that is not current has no word');
+  assert.equal(roundWord({ state: 'done', easy: false }), 'round.done');
+  assert.equal(roundWord({ state: 'now', easy: true }), 'round.now');
+  assert.equal(roundWord({ state: 'later', easy: true }), 'round.easy');
+  assert.equal(roundWord({ state: 'later', easy: false }), null);
+  assert.equal(diffText(1), '+1');
+  assert.equal(diffText(-2), '-2');
+  assert.equal(diffText(0), null, 'no change, no line');
+  assert.equal(diffText(null), null, 'no last round, no line');
+});
+
+test('Slice 2 Easy round stop sheet: a day of the easy round while hard days are left gives the count; any other day opens', async () => {
+  const { easyStop } = await import('../../../ui/block.js');
+  const ov = { hard_left: 3, rounds: [{ pass: 1, easy: false }, { pass: 2, easy: true }] };
+  assert.equal(easyStop(ov, { pass: 2 }), 3);
+  assert.equal(easyStop(ov, { pass: 1 }), 0, 'a hard day opens');
+  assert.equal(easyStop({ ...ov, hard_left: 0 }, { pass: 2 }), 0, 'every hard day finished: the easy day opens');
+});
+
+// 16 B.9: the switch needs his three ticks on three condition lines and ADJUST typed exactly.
+test('Slice 2 Adjust each round: three ticks and ADJUST exact after trim; no three lines never', async () => {
+  const { adjustReady, conditionLines } = await import('../../../ui/settings.js');
+  const T3 = [true, true, true];
+  assert.equal(adjustReady(T3, 'ADJUST', 3), true);
+  assert.equal(adjustReady(T3, '  ADJUST ', 3), true, 'spaces round the word are trimmed');
+  assert.equal(adjustReady(T3, 'adjust', 3), false, 'case is kept');
+  assert.equal(adjustReady(T3, 'ADJUSTED', 3), false);
+  assert.equal(adjustReady([true, true, false], 'ADJUST', 3), false, 'two ticks');
+  assert.equal(adjustReady([], 'ADJUST', 0), false, 'no condition words: the primary stays disabled');
+  assert.deepEqual(conditionLines({ switch_conditions: ['a', '', 'b', 3, 'c'] }), ['a', 'b', 'c']);
+  assert.deepEqual(conditionLines({ switch_conditions: null }), []);
+  assert.deepEqual(conditionLines({}), []);
 });

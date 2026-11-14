@@ -10,6 +10,7 @@ import { renderCheck } from './ui/check.js';
 import { renderSettings, applyTheme, loadBlockFlow } from './ui/settings.js';
 import { renderToday, renderDayDone } from './ui/today.js';
 import { renderBuilder, renderPicker, hasDraft } from './ui/builder.js';
+import { renderBlock, renderDayView } from './ui/block.js';
 
 const root = document.getElementById('app');
 const store = createStore({ db });
@@ -334,7 +335,7 @@ function emptyState(titleKey, lineKey) {
 
 const STANDALONE_ROUTES = {
   '#/today': () => renderToday(ctx),
-  '#/block': () => emptyState('empty.next.title', 'empty.next.line'),
+  '#/block': () => renderBlock(ctx),
   '#/history': () => emptyState('empty.next.title', 'empty.next.line'),
   '#/settings': () => renderSettings(ctx),
   '#/check': () => renderCheck(ctx),
@@ -343,6 +344,8 @@ const STANDALONE_ROUTES = {
 };
 const NO_BAR = new Set(['#/builder', '#/picker']);
 const DAYDONE = '#/daydone/';
+// The read-only day view (16 B.5 row 2): the store checks the id; a bad one goes to the Block tab.
+const DAYVIEW = '#/day/';
 
 function currentRoute() {
   const h = location.hash || '';
@@ -367,6 +370,7 @@ function render() {
   // The Day done screen (15 Part 14): a pushed full screen with no bottom bar. The day id from
   // the address is checked by the store and must name the day this session just finished.
   if (route.startsWith(DAYDONE)) { root.appendChild(renderDayDone(ctx, route.slice(DAYDONE.length))); return; }
+  if (route.startsWith(DAYVIEW)) { root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length))); root.appendChild(tabbar('#/block')); return; }
   const make = STANDALONE_ROUTES[route];
   if (!make) { go('#/today'); return; }
   root.appendChild(make());
@@ -392,17 +396,30 @@ function storageBlocked(err) {
       el('p', { class: 'raw' }, String((err && (err.name || err.message)) || err)))));
 }
 
+// The two upgrade lines (16 B.5 row 16, LOOK 3.6 Blocked skin): no title, the one line leads with
+// the glyph, in place of the whole screen. db.upgradefail adds the raw error line.
+function dbBlocked(key, err) {
+  clear(root);
+  root.appendChild(el('section', { class: 'screen' },
+    el('div', { class: 'blocked', id: 'db-blocked', role: 'alert' },
+      el('div', { class: 'blocked-head' }, glyph('warn'), el('p', {}, t(key))),
+      err ? el('p', { class: 'raw' }, String(err.name || err.message || err)) : null)));
+}
+
 // ---------------- boot ----------------
 
 async function boot() {
   // Register first, so the offline copy is built even if storage fails below.
   registerWorker();
 
+  // A newer version closed this page's link: one line, and nothing more is written here.
+  store.onVersionClosed(() => dbBlocked('db.reopen'));
   try {
     await db.ready();
   } catch (e) {
     knowDay();
-    storageBlocked(e);
+    if (store.upgradeFailed()) dbBlocked('db.upgradefail', e);
+    else storageBlocked(e);
     return;
   }
   // The look is set before the first render.

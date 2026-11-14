@@ -264,6 +264,8 @@ export function renderCheck(ctx) {
     factsBox.appendChild(factRow(info[3], sf.size, 'screen'));
     factsBox.appendChild(factRow(info[4], sf.safe, 'safe'));
     factsBox.appendChild(factRow(info[5], checkedAt(new Date()), 'checked'));
+    // A rule table that fails validateRules (16 B.2 note 5): the rules fact line says Error. No new word.
+    if (ctx.store && !ctx.store.rulesOk()) factsBox.appendChild(factRow(t('settings.rules'), t('check.error'), 'rules'));
     factsBox.appendChild(el('div', { class: 'row' }, el('span', { class: 'raw', id: 'check-ua' }, navigator.userAgent)));
     factsBox.appendChild(el('div', { class: 'row' }, el('span', { class: 'raw', id: 'check-usage' }, await usageLine(ctx))));
     summary.textContent = [ctx.version, standalone ? mode[0] : mode[1], t('check.count', { n: yes, total: rows.length })].join(' | ');

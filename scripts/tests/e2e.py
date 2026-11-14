@@ -4,6 +4,8 @@
     python3 scripts/tests/e2e.py --suite slice0 [--viewport 440|375|both]   local server
     python3 scripts/tests/e2e.py --suite update                             update tests, local only
     python3 scripts/tests/e2e.py --suite twoapp                             needs LIFTLOG_AT_DIR
+    python3 scripts/tests/e2e.py --suite slice2 [--part NAME]               Slice 2 screens and the scripted rounds
+    python3 scripts/tests/e2e.py --suite upgrade                            0.2.6 (git archive of bae7bec) to 0.3.0, local only
     python3 scripts/tests/e2e.py --suite slice0 --url URL                   against a live copy
 
 The local server serves a temp parent folder with the app at /lift-log/, on a free port.
@@ -396,7 +398,7 @@ def suite_slice0(browser, base, vp, local):
         page.click("a.tab[href='#/settings']")
         page.wait_for_selector("#settings")
         check(tag + "(2) icon: settings shows version " + APP_VERSION, page.inner_text("[data-fact='version'] .val") == APP_VERSION)
-        check(tag + "(2) icon: settings shows rules 'none yet'", page.inner_text("[data-fact='rules'] .val") == "none yet")
+        check(tag + "(2) icon: settings shows rules 'signed-1'", page.inner_text("[data-fact='rules'] .val") == "signed-1")
         layout(page, tag, "settings")
         page.click("#open-check")
 
@@ -1310,10 +1312,15 @@ def make_at_copy(base, name, fixed=True, touch=False):
     sw = os.path.join(dst, "sw.js")
     text = open(sw).read()
     old = "keys.filter(k => k !== CACHE)"
+    done_form = "keys.filter(k => k.startsWith('artic-') && k !== CACHE)"
+    # Since its 7ef2e0a the other app ships the fix itself. A fixed copy keeps (or gets) the fixed
+    # line; an unfixed copy (the twoapp control) gets the old line back. Each form must be found once.
+    if text.count(old) + text.count(done_form) != 1:
+        raise RuntimeError("the other app's cache filter line was not found once")
     if fixed:
-        if text.count(old) != 1:
-            raise RuntimeError("the other app's cache filter line was not found once")
-        text = text.replace(old, "keys.filter(k => k.startsWith('artic-') && k !== CACHE)")
+        text = text.replace(old, done_form)
+    else:
+        text = text.replace(done_form, old)
     if touch:
         text += "\n// twoapp test build\n"
     open(sw, "w").write(text)
@@ -1693,10 +1700,13 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         sid = tick(page, fb="save")
         page.reload(); page.wait_for_selector("#today[data-day]"); settle(page)
         check(tag + "offline: a set logged with no server and no network is there after a reload", state_of(page, sid) == "done")
-        for route, sel, name in (("#/block", ".empty", "block tab"), ("#/history", ".empty", "history tab")):
-            go_route(page, route, sel)
-            check(tag + "offline: the " + name + " shows Coming next", page.inner_text(".empty h2").strip() == "Coming next")
-            layout(page, tag, name)
+        # From 0.3.0 the Block tab shows the Block overview (16 B.1 step 8); History still shows Coming next.
+        go_route(page, "#/block", "#block #round-strip")
+        check(tag + "offline: the block tab shows the Block overview", page.locator("#block [data-blockday]").count() >= 1)
+        layout(page, tag, "block tab")
+        go_route(page, "#/history", ".empty")
+        check(tag + "offline: the history tab shows Coming next", page.inner_text(".empty h2").strip() == "Coming next")
+        layout(page, tag, "history tab")
         ctx.set_offline(False)
         ctx.close()
 
@@ -2554,7 +2564,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         answer_fb(page, "later")
         whys = [set_why(page, x) for x in (s2, s3)]
         check(tag + "polish: check Yes after set 1 offers Stop and Stop skips the rest (Part 17)",
-              warm_inset and under_s1 and offered and all(w["status"] == "skipped" and w["why"] == "Stopped by a block check" for w in whys),
+              warm_inset and under_s1 and offered and all(w["status"] == "skipped" and w["why"] == "why.stopped" for w in whys),
               {"warm-up inset": warm_inset, "under set 1": under_s1, "offered": offered, "rest": [(w["status"], w["why"]) for w in whys]})
         ctx.close()
 
@@ -2573,7 +2583,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
             answer_fb(page, "later")
             w3 = set_why(page, s3)
         check(tag + "polish: check inset after set 2 offers Stop and Stop skips set 3 (Part 17)",
-              again and w3["status"] == "skipped" and w3["why"] == "Stopped by a block check", {"again": again, "set 3": (w3["status"], w3["why"])})
+              again and w3["status"] == "skipped" and w3["why"] == "why.stopped", {"again": again, "set 3": (w3["status"], w3["why"])})
         ctx.close()
 
         # Once Yes, the next inset shows No disabled with the sticky line; a Yes after the last set shows the line and no Stop.
@@ -2979,6 +2989,1254 @@ def suite_slice1(browser, base, vp, local, cb, parts):
     check(tag + "slice1 zero console errors", not audit.errors, audit.errors[:5])
 
 
+# ---------------- Slice 2 (DESIGN 16 B.12 e2e slice2), the Today cases of B.1 step 7 ----------------
+
+def clock_at(ms):
+    """An init script that sets the page clock: Date is replaced by a class that runs from the
+    given instant (16 B.12: init script, no app hook). The worker keeps the real clock."""
+    return ("(() => { const R = Date; const off = %d - R.now();"
+            " class D extends R { constructor(...a) { if (a.length) super(...a); else super(R.now() + off); }"
+            " static now() { return R.now() + off; } }"
+            " globalThis.Date = D; })();" % ms)
+
+
+def ny_ms(y, mo, d, h=12, mi=0):
+    """A New York wall time as epoch ms (EST, UTC-5, for the November and December dates used here)."""
+    import calendar
+    return (calendar.timegm((y, mo, d, h + 5, mi, 0)) * 1000)
+
+
+DB_ALL = "async (s) => { const { db } = await import('./db.js'); return db.all(s); }"
+FIXED_NOW = ny_ms(2026, 11, 20, 12)     # before 2026-12-01: every block plans as Fixed
+ADAPT_NOW = ny_ms(2026, 12, 5, 9)       # after the backup_v2.json switch (2026-12-02) and its export (12-04)
+BLOCK_V2 = os.path.join(APP_DIR, "scripts", "tests", "fixtures", "block_v2.json")
+BACKUP_V2 = os.path.join(APP_DIR, "scripts", "tests", "fixtures", "backup_v2.json")
+ROUNDS = os.path.join(APP_DIR, "scripts", "tests", "fixtures", "block_rounds.json")
+ROUNDS_SCRIPT = os.path.join(APP_DIR, "scripts", "tests", "fixtures", "block_rounds_script.json")
+
+
+def suite_slice2(browser, base, vp, parts):
+    tag = "[%s] slice2 " % vp
+    o = urlparse(base)
+    origin = o.scheme + "://" + o.netloc
+    audit = Audit(origin)
+    want = lambda name: (not parts) or name in parts
+
+    def new(now_ms):
+        ctx, page = new_context(browser, audit, standalone=True, vp=vp, extra=[clock_at(now_ms)])
+        page.set_default_timeout(10000)
+        page.goto(base)
+        page.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(page)
+        settle(page, 300)
+        return ctx, page
+
+    def rows(page, store):
+        return page.evaluate(DB_ALL, store)
+
+    def toast_text(page):
+        return page.evaluate("() => { const t = document.querySelector('.toast.is-on'); return t ? t.textContent : null; }")
+
+    def fixed_page():
+        ctx, page = new(FIXED_NOW)
+        page.click("#unit-lb")
+        load_block_file(page, BLOCK_V2)
+        return ctx, page
+
+    def adaptive_page():
+        ctx, page = new(ADAPT_NOW)
+        out = restore_from(page, BACKUP_V2)
+        go_route(page, "#/today", "#today[data-day]")
+        return ctx, page, out
+
+    def day_row(page):
+        did = page.get_attribute("#today", "data-day")
+        return next((d for d in rows(page, "days") if d["id"] == did), None)
+
+    def menu_item(page, slot, item):
+        page.click("[data-menu='%s']" % slot)
+        page.wait_for_selector("#card-menu")
+        page.click("#card-menu [data-item='%s']" % item)
+        settle(page, 300)
+
+    def day_item(page, item):
+        page.click("#day-menu")
+        page.wait_for_selector("#day-menu-sheet")
+        page.click("#day-menu-sheet [data-dayitem='%s']" % item)
+        settle(page, 300)
+
+    def scope(page, which):
+        page.wait_for_selector("#scope-sheet")
+        page.click("#scope-" + which)
+        poll(page, "() => !document.getElementById('scope-sheet')")
+        settle(page, 300)
+
+    # (a) Fixed: the sleep card, no Adjust each round part, the set kind picker.
+    def part_fixed():
+        ctx, page = fixed_page()
+        check(tag + "fixed: Today shows the Fixed profile", page.get_attribute("#today", "data-profile") == "fixed")
+        card = page.locator("#sleep-card")
+        check(tag + "sleep card: on a planned day, above the header, with the question and his sleep hint",
+              card.count() == 1 and page.inner_text("#sleep-q").strip() == "Any night under 6 hours of sleep since your last lift day?"
+              and page.inner_text("#sleep-hint").strip() == "Made-up sleep hint."
+              and page.evaluate("() => { const c = document.getElementById('sleep-card'), h = document.querySelector('.day-head'); return !!c && !!h && !!(c.compareDocumentPosition(h) & Node.DOCUMENT_POSITION_FOLLOWING); }"),
+              page.inner_text("#today")[:120])
+        check(tag + "sleep card: no answer shows both chips plain", page.get_attribute("#sleep-no", "aria-pressed") == "false" and page.get_attribute("#sleep-yes", "aria-pressed") == "false")
+        page.click("#sleep-no"); settle(page, 400)
+        d = day_row(page)
+        check(tag + "sleep card: No is stored and picked, and the day stays planned (a chip never opens the day)",
+              page.get_attribute("#sleep-no", "aria-pressed") == "true" and d["short_sleep_since_last"] is False and d["status"] == "planned", d and d["status"])
+        page.click("#sleep-no"); settle(page, 400)
+        d = day_row(page)
+        check(tag + "sleep card: tapping the picked chip clears it", d["short_sleep_since_last"] is None and page.get_attribute("#sleep-no", "aria-pressed") == "false")
+        page.click("#sleep-yes"); settle(page, 400)
+        d = day_row(page)
+        check(tag + "sleep card: Yes is stored and picked", d["short_sleep_since_last"] is True and page.get_attribute("#sleep-yes", "aria-pressed") == "true" and d["status"] == "planned")
+        layout(page, tag, "sleep card")
+        # The first tick hides the card and keeps the answer.
+        sid = open_set(page)
+        tick(page, sid)
+        d = day_row(page)
+        check(tag + "sleep card: hidden once the day opens; the answer stays", page.locator("#sleep-card").count() == 0 and d["status"] == "open" and d["short_sleep_since_last"] is True)
+        # No Adjust each round part on a Fixed block.
+        check(tag + "fixed: no why line, no soreness sheet, no marks", page.locator(".ex-why").count() == 0 and page.locator("#sore-sheet").count() == 0
+              and page.locator(".mark").count() == 0)
+        # Set kind (both profiles): a warm-up has no Set kind row; a work set's picker has the two kinds.
+        warm = page.evaluate("() => { const r = [...document.querySelectorAll('.set.is-open')][0]; return r ? r.getAttribute('data-set') : null; }")
+        if warm and ":w" in warm:
+            page.click("[data-setmenu='%s']" % warm); page.wait_for_selector("#set-menu")
+            check(tag + "set kind: never offered on a warm-up", page.locator("#set-menu [data-setitem='kind']").count() == 0)
+            page.keyboard.press("Escape"); scrim_tap(page) if page.locator("#set-menu").count() else None; settle(page)
+            while (open_set(page) or "").find(":w") >= 0:
+                tick(page)
+        sid = open_set(page)
+        page.click("[data-setmenu='%s']" % sid); page.wait_for_selector("#set-menu")
+        page.click("#set-menu [data-setitem='kind']")
+        page.wait_for_selector("#setkind-sheet")
+        chips = page.eval_on_selector_all("#setkind-sheet [data-kind]", "els => els.map(e => [e.getAttribute('data-kind'), e.getAttribute('aria-pressed'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+        check(tag + "set kind: the picker lists Work then To failure with their lines, the current one picked",
+              [c[0] for c in chips] == ["normal", "failure"] and chips[0][1] == "true" and chips[1][1] == "false"
+              and "Work" in chips[0][2] and "Counts in your totals and in sets per muscle." in chips[0][2]
+              and "To failure" in chips[1][2] and "Counts as a work set." in chips[1][2], chips)
+        layout(page, tag, "set kind picker")
+        page.click("#setkind-sheet [data-kind='failure']")
+        poll(page, "() => !document.getElementById('setkind-sheet')"); settle(page, 400)
+        row = next(r for r in rows(page, "sets") if r["id"] == sid)
+        pill = page.locator(q(sid) + " .helper .pill-kind[data-kind='failure']")
+        check(tag + "set kind: To failure shows its pill in the helper slot and is stored as his pick",
+              pill.count() == 1 and pill.inner_text().strip() == "To failure" and row["set_type"] == "failure" and row["set_type_by_hand"] is True, row["set_type"])
+        ctx.close()
+
+    # (a) Fixed: round 2 day A's first tick opens no soreness sheet (none in Fixed, 16 B.3.14).
+    def part_fixed_round2():
+        ctx, page = fixed_page()
+        for _ in range(2):   # round 1 day A, then day B, every set ticked with its target
+            guard = 0
+            while open_set(page) and guard < 40:
+                tick(page, fb="save")
+                guard += 1
+            check(tag + "fixed round 2: a day finishes", finish(page))
+        d = day_row(page)
+        check(tag + "fixed round 2: Today is round 2 day A", d and d["pass"] == 2 and d["day"] == 1, d and (d["pass"], d["day"]))
+        sid = open_set(page)
+        page.click(q(sid) + " [data-tick]")
+        wait_state(page, sid, "done"); settle(page, 600)
+        check(tag + "soreness sheet: none at round 2 day A's first tick in Fixed", page.locator("#sore-sheet").count() == 0)
+        ctx.close()
+
+    # Close block (both profiles; shown here on Fixed): refused with a day open, then the Block finished state.
+    def part_close():
+        ctx, page = fixed_page()
+        sid = open_set(page)
+        tick(page, sid)
+        day_item(page, "end")
+        check(tag + "close block: refused while a day is open with the end.open toast, no sheet",
+              page.locator("#end-sheet").count() == 0 and toast_text(page) == "Finish the open day first.", toast_text(page))
+        ctx.close()
+        ctx, page = fixed_page()
+        page.click("#day-menu"); page.wait_for_selector("#day-menu-sheet")
+        items = page.eval_on_selector_all("#day-menu-sheet [data-dayitem]", "els => els.map(e => [e.getAttribute('data-dayitem'), e.classList.contains('menu-row-sep')])")
+        check(tag + "day menu: Add an exercise first, Close block last, the hairline on the first block-moving row",
+              items and items[0][0] == "addex" and items[-1][0] == "end" and [k for k, s_ in items if s_] == ["skip"], items)
+        page.click("#day-menu-sheet [data-dayitem='end']")
+        page.wait_for_selector("#end-sheet")
+        check(tag + "close block: the confirm says what happens", "The block is marked finished. Your logged days stay." in page.inner_text("#end-sheet")
+              and page.inner_text("#end-go").strip() == "Close block")
+        layout(page, tag, "close block confirm")
+        page.click("#end-go")
+        # PD210: a missing Block finished state fails this check by its name, never a timeout.
+        try:
+            page.wait_for_selector("#block-done", timeout=10000)
+            shown = True
+        except Exception:
+            shown = False
+        blocks = rows(page, "blocks"); days = rows(page, "days")
+        check(tag + "close block: Today shows the Block finished state; the block is done and its planned day stays",
+              shown and blocks[0]["status"] == "done" and any(d["status"] == "planned" for d in days), {"shown": shown, "days": [d["status"] for d in days]})
+        ctx.close()
+
+    # Add exercise and Take out this exercise (both profiles; Fixed here): the picker, the sets sheet, the scope sheet.
+    def part_add_remove():
+        ctx, page = fixed_page()
+        day_item(page, "addex")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='cable_row']")
+        page.wait_for_selector("#addex-sheet")
+        check(tag + "add exercise: the sets sheet starts at 1 in Fixed, minus off at 1", page.inner_text("#addex-count").strip() == "1" and page.is_disabled("#addex-less"))
+        page.click("#addex-more"); settle(page, 200)
+        check(tag + "add exercise: plus moves the count", page.inner_text("#addex-count").strip() == "2")
+        layout(page, tag, "add exercise sets sheet")
+        page.click("#addex-save")
+        page.wait_for_selector("#scope-sheet")
+        check(tag + "rest of block: the sheet asks Change which days? with Today only first, then Rest of block and its line",
+              page.inner_text("#scope-sheet h2").strip() == "Change which days?"
+              and page.eval_on_selector_all("#scope-sheet [data-scope]", "els => els.map(e => e.getAttribute('data-scope'))") == ["today", "rest"]
+              and page.inner_text("#scope-rest-line").strip() == "Later days that have this slot. Done days never change.")
+        layout(page, tag, "rest of block choice")
+        scope(page, "today")
+        added = [r for r in rows(page, "sets") if r["exercise_id"] == "cable_row"]
+        tpl = rows(page, "blocks")[0]["day_templates"][0]["lifts"]
+        check(tag + "add exercise: Today only adds a card with 2 sets and leaves the block as written",
+              page.locator("[data-exercise='cable_row'] .set").count() == 2 and len(added) == 2 and all(r["origin"] == "added" for r in added)
+              and not any(l["exercise_id"] == "cable_row" for l in tpl), len(added))
+        day_item(page, "addex")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='leg_extension']")
+        page.wait_for_selector("#addex-sheet")
+        page.click("#addex-save")
+        scope(page, "rest")
+        tpl = rows(page, "blocks")[0]["day_templates"][0]["lifts"]
+        check(tag + "add exercise: Rest of block also adds the lift to the block's day", any(l["exercise_id"] == "leg_extension" for l in tpl), [l["exercise_id"] for l in tpl])
+        # Take out this exercise, Today only: every set not done is skipped.
+        slot = page.get_attribute("[data-exercise='cable_row']", "data-slot")
+        menu_item(page, slot, "remove")
+        scope(page, "today")
+        st = [r["status"] for r in rows(page, "sets") if r["exercise_id"] == "cable_row"]
+        check(tag + "remove: Today only skips every set not done", st and all(x == "skipped" for x in st), st)
+        ctx.close()
+        # The day's last exercise is refused, with its reason in the sheet.
+        ctx, page = fixed_page()
+        for s_ in ("2", "3"):
+            menu_item(page, s_, "remove")
+            scope(page, "today")
+            answer_fb(page, "later")
+        menu_item(page, "1", "remove")
+        page.wait_for_selector("#scope-sheet")
+        check(tag + "remove: the last exercise is refused with A day keeps at least 1 exercise.",
+              page.is_disabled("#scope-rest") and page.get_attribute("#scope-rest", "aria-disabled") == "true"
+              and page.inner_text("#scope-rest-line").strip() == "A day keeps at least 1 exercise.")
+        page.click("#scope-cancel"); settle(page)
+        ctx.close()
+
+    # Change answers (both profiles): the saved sheet reopens with its answers, and Save writes a new saved_at.
+    def part_answers():
+        ctx, page = fixed_page()
+        slot = "3"   # seated leg curl: 2 sets, then the feedback sheet
+        guard = 0
+        while guard < 4 and page.locator("[data-slot='%s'] .set[data-state='todo'], [data-slot='%s'] .set.is-open" % (slot, slot)).count():
+            sid = page.evaluate("(sl) => { const r = document.querySelector('[data-slot=\"' + sl + '\"] .set:not([data-state=\"done\"]):not([data-state=\"skipped\"])'); return r ? r.getAttribute('data-set') : null; }", slot)
+            if not sid:
+                break
+            page.click(q(sid) + " [data-tick]")
+            wait_state(page, sid, "done"); settle(page, 500)
+            if page.locator("#feedback").count():
+                page.click("#feedback [data-answer='pump-2']")
+                page.click("#fb-save"); poll(page, "() => !document.getElementById('feedback')"); settle(page)
+            guard += 1
+        before = next(f for f in rows(page, "feedback") if f["id"].endswith(":x" + slot))
+        menu_item(page, slot, "answers")
+        page.wait_for_selector("#feedback")
+        check(tag + "change answers: the sheet opens with the saved answer picked", page.get_attribute("#feedback [data-answer='pump-2']", "aria-pressed") == "true")
+        page.click("#feedback [data-answer='pump-4']")
+        page.wait_for_timeout(1100)   # a new saved_at, later than the first
+        page.click("#fb-save"); poll(page, "() => !document.getElementById('feedback')"); settle(page)
+        after = next(f for f in rows(page, "feedback") if f["id"].endswith(":x" + slot))
+        check(tag + "change answers: Save writes the new answer with a new saved_at", after["pump"] == 4 and after["saved_at"] > before["saved_at"] and after["pending"] is False,
+              {"before": before["pump"], "after": after["pump"]})
+        ctx.close()
+
+    # (b) Adjust each round (the backup_v2.json block, switched on 2026-12-02; clock 2026-12-05).
+    def part_adaptive():
+        ctx, page, out = adaptive_page()
+        check(tag + "adaptive: the restore worked and Today shows Adjust each round", out == "restored" and page.get_attribute("#today", "data-profile") == "adaptive", out)
+        d = day_row(page)
+        check(tag + "adaptive: Today is round 2 day A, planned", d and d["pass"] == 2 and d["day"] == 1 and d["status"] == "planned", d and (d["pass"], d["day"], d["status"]))
+        check(tag + "sleep card: shown in Adjust each round too", page.locator("#sleep-card").count() == 1)
+        whys = page.eval_on_selector_all(".ex-why", "els => els.map(e => [e.closest('.ex-card').getAttribute('data-slot'), e.getAttribute('data-why'), e.innerText.trim()])")
+        check(tag + "why line: each card shows its plan reason under the header",
+              ["1", "why.sleep", "Sleep was short or not answered this round."] in whys and ["2", "why.R11", "No clear signal. Sets stay the same."] in whys
+              and ["3", "why.R7", "This muscle is on Hold. Sets stay the same."] in whys, whys)
+        layout(page, tag, "adaptive today")
+        # The first saved tick (the leg press warm-up): the soreness question alone (quads trained in round 1).
+        sid = open_set(page)
+        page.click(q(sid) + " [data-tick]")
+        wait_state(page, sid, "done")
+        # PD214: a sheet that never opens fails this check by its name, never a timeout.
+        try:
+            page.wait_for_selector("#sore-sheet", timeout=8000)
+            sore_shown = True
+        except Exception:
+            sore_shown = False
+        check(tag + "soreness sheet: alone at round 2 day A's first tick in Adjust each round",
+              sore_shown and page.locator("#feedback").count() == 0 and page.inner_text("#sore-sheet h2").strip().endswith(", one question")
+              and "1 quick question" in page.inner_text("#sore-sheet") and page.locator("#sore-sheet [data-answer^='soreness-']").count() == 4
+              and page.locator("#sore-save").count() == 1 and page.locator("#sore-later").count() == 1 and page.locator("#sore-skip").count() == 1)
+        if not sore_shown:
+            ctx.close()
+            return
+        layout(page, tag, "soreness sheet")
+        page.click("#sore-sheet [data-answer='soreness-2']")
+        page.click("#sore-save"); poll(page, "() => !document.getElementById('sore-sheet')"); settle(page)
+        f = next((x for x in rows(page, "feedback") if x["id"] == d["id"] + ":x1"), None)
+        check(tag + "soreness sheet: Save stores soreness in the slot's row, still pending", f and f["soreness"] == 2 and f["pending"] is True, f)
+        # The retarget line: the open work row at a weight inside the band, then outside it.
+        sid = open_set(page)
+        page.click(q(sid) + " [data-step='load+']"); settle(page, 500)
+        h = page.locator(q(sid) + " .helper")
+        check(tag + "retarget line: inside the band the helper gives the goal at this weight",
+              h.get_attribute("data-retarget") == "goal" and h.inner_text().strip().startswith("goal at this weight: 7 reps"), h.inner_text())
+        for _ in range(4):
+            page.click(q(sid) + " [data-step='load+']"); settle(page, 400)
+        check(tag + "retarget line: outside the band only the effort part shows", h.get_attribute("data-retarget") == "effort" and h.inner_text().strip() == "stop 1 short", h.inner_text())
+        for _ in range(5):
+            page.click(q(sid) + " [data-step='load-']"); settle(page, 400)
+        check(tag + "retarget line: back at the target the goal line stands", h.get_attribute("data-retarget") is None, h.inner_text())
+        # Met and missed marks: a set at its goal is met; one rep under is under goal; the failure set has none.
+        tick(page, sid, fb="none")
+        check(tag + "marks: a done set that met its rep goal shows met", page.inner_text(q(sid) + " [data-mark='met']").strip() == "met")
+        sid2 = open_set(page)
+        page.click(q(sid2) + " [data-step='reps-']"); settle(page, 400)
+        page.click(q(sid2) + " [data-tick]"); settle(page, 500)
+        if page.locator("#range-sheet").count():
+            page.click("#range-log")
+        wait_state(page, sid2, "done"); settle(page, 500)
+        answer_fb(page, "skip" if page.locator("#fb-skip").count() else "later")
+        check(tag + "marks: a done set under its rep goal shows under goal, never in the fail color",
+              page.inner_text(q(sid2) + " [data-mark='under']").strip() == "under goal"
+              and page.evaluate("(id) => { const m = document.querySelector('[data-set=\"' + id + '\"] .mark'); return !!m && getComputedStyle(m).color !== getComputedStyle(document.documentElement).getPropertyValue('--fail'); }", sid2))
+        check(tag + "marks: none on a warm-up", page.locator("[data-set$=':w1:none'] .mark").count() == 0)
+        ctx.close()
+
+    # (c) Live edits in Adjust each round: Add set, Move, Swap, Relabel, Add exercise, Take out; done days untouched.
+    def part_live():
+        ctx, page, out = adaptive_page()
+        done_before = json.dumps(sorted([r for r in rows(page, "sets") if ":p1:" in r["id"]], key=lambda r: r["id"]), sort_keys=True)
+        n0 = page.locator("[data-slot='1'] .set").count()
+        page.click("[data-addset='1']")
+        scope(page, "today")
+        check(tag + "rest of block: Add set asks first in Adjust each round; Today only adds one row", page.locator("[data-slot='1'] .set").count() == n0 + 1)
+        menu_item(page, "1", "down")
+        scope(page, "rest")
+        order = [l["slot"] for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"]]
+        check(tag + "rest of block: Move down with Rest of block reorders the block's day", order[:2] == [2, 1], order)
+        menu_item(page, "2", "3")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='leg_extension']")
+        scope(page, "rest")
+        lifts = rows(page, "blocks")[0]["day_templates"][0]["lifts"]
+        check(tag + "rest of block: a later planned day shows the new exercise (the block's day now holds it)",
+              any(l["exercise_id"] == "leg_extension" for l in lifts) and page.locator("[data-exercise='leg_extension']").count() == 1, [l["exercise_id"] for l in lifts])
+        day_item(page, "relabel")
+        page.wait_for_selector("#relabel-sheet")
+        page.fill("#relabel-in", "Z")
+        page.click("#relabel-save")
+        scope(page, "rest")
+        poll(page, "() => !document.getElementById('relabel-sheet')")
+        check(tag + "rest of block: Relabel with Rest of block writes the block's day label", rows(page, "blocks")[0]["day_templates"][0]["label"] == "Z")
+        day_item(page, "addex")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='cable_fly']")
+        page.wait_for_selector("#addex-sheet")
+        page.click("#addex-save")
+        scope(page, "rest")
+        check(tag + "rest of block: Add exercise with Rest of block adds a card and a block lift",
+              page.locator("[data-exercise='cable_fly']").count() == 1 and any(l["exercise_id"] == "cable_fly" for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"]))
+        menu_item(page, "3", "remove")
+        scope(page, "today")
+        answer_fb(page, "later")
+        st = [r["status"] for r in rows(page, "sets") if r["id"].startswith(page.get_attribute("#today", "data-day") + ":x3:")]
+        check(tag + "remove: Today only in Adjust each round skips the card's sets", st and all(x == "skipped" for x in st), st)
+        done_after = json.dumps(sorted([r for r in rows(page, "sets") if ":p1:" in r["id"]], key=lambda r: r["id"]), sort_keys=True)
+        check(tag + "rest of block: the done days are the same before and after every edit", done_before == done_after)
+        ctx.close()
+
+    # ---------------- B.1 steps 8 and 9: the Block tab, the read-only day view, the switch ----------------
+
+    def clear_sheets(page):
+        """Pass the sheets a tick can open (the soreness-alone sheet, the end sheet, the range ask)."""
+        for _ in range(6):
+            settle(page, 300)
+            if page.locator("#sore-sheet").count():
+                page.click("#sore-skip"); poll(page, "() => !document.getElementById('sore-sheet')"); continue
+            if page.locator("#feedback").count():
+                # The end sheet after a tick has Ask me later; the Finish day one has Skip (today.js noLater).
+                page.click("#fb-skip" if page.locator("#fb-skip").count() else "#fb-later")
+                poll(page, "() => !document.getElementById('feedback')"); continue
+            if page.locator("#range-sheet").count():
+                page.click("#range-log"); continue
+            break
+
+    def play_day(page):
+        """Tick every set of the day Today shows at its target, then Finish day (through Day done)."""
+        guard = 0
+        while open_set(page) and guard < 60:
+            sid = open_set(page)
+            page.click(q(sid) + " [data-tick]")
+            wait_state(page, sid, "done")
+            clear_sheets(page)
+            guard += 1
+        finish(page)
+        leave_day_done(page)
+        go_route(page, "#/today", "#today[data-day]")
+
+    def block_tab(page, rnd=None):
+        go_route(page, "#/block", "#block #round-strip")
+        if rnd is not None:
+            page.click("#round-strip [data-round='%d']" % rnd)
+            poll(page, "() => { const c = document.querySelector(\"#round-strip [data-round='%d']\"); return !!c && c.getAttribute('aria-pressed') === 'true'; }" % rnd)
+            settle(page, 300)
+
+    def strip(page):
+        return page.eval_on_selector_all("#round-strip [data-round]", "els => els.map(e => [e.getAttribute('data-round'), e.getAttribute('data-state'), e.getAttribute('data-easy'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+
+    def day_rows(page):
+        return page.eval_on_selector_all("#block-days [data-blockday]", "els => els.map(e => [e.getAttribute('data-blockday'), e.getAttribute('data-status'), e.getAttribute('data-now'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+
+    def no_write_controls(page):
+        return page.evaluate("() => { const v = document.getElementById('dayview'); return !!v && v.querySelectorAll('button, input, [data-tick], [data-step], [data-setmenu], [data-menu], #day-menu, #finish-day, #sleep-card').length === 0; }")
+
+    # (e) Block overview: strip states, day rows, muscle sets with the change line; the views of a
+    # day not planned yet and of a round 1 day planned but not current; the bad id route case.
+    def part_block():
+        ctx, page, out = adaptive_page()
+        block_tab(page)
+        st = strip(page)
+        check(tag + "(e) block overview: the round strip shows R1 done, R2 now, R3 later and R4 easy",
+              [x[:3] for x in st] == [["1", "done", "false"], ["2", "now", "false"], ["3", "later", "false"], ["4", "later", "true"]]
+              and st[0][3] == "R1 done" and st[1][3] == "R2 now" and st[3][3] == "R4 easy", st)
+        check(tag + "(e) block overview: the head line names the block, its rounds and Adjust each round",
+              page.inner_text("#block-head").strip() == "Made-up schema two block · 4 rounds · Adjust each round", page.inner_text("#block-head"))
+        check(tag + "(e) block overview: the current round has the accent border",
+              page.evaluate("() => { const c = document.querySelector(\"#round-strip [data-round='2']\"), o = document.querySelector(\"#round-strip [data-round='3']\"); return getComputedStyle(c).borderTopWidth === '2px' && getComputedStyle(o).borderTopWidth === '1px'; }"))
+        dr = day_rows(page)
+        check(tag + "(e) block overview: ROUND 2 day rows read Day A Now and Day B Not planned yet",
+              page.inner_text("#round-label").strip() == "ROUND 2" and len(dr) == 2 and dr[0][1] == "planned" and dr[0][2] == "true" and dr[0][3].endswith("Now")
+              and dr[1][1] == "notplanned" and dr[1][3].endswith("Not planned yet") and page.locator("#block-days [data-status='notplanned'] .pill-info").count() == 1, dr)
+        # Sets this round by muscle: every work set of round 2 not skipped, by muscle key, against round 1.
+        exs = {e["id"]: e for e in rows(page, "exercises")}
+        def by_muscle(pass_n):
+            seen, out_ = set(), {}
+            for x in rows(page, "sets"):
+                if (":p%d:" % pass_n) not in x["id"] or x["kind"] != "work" or x["status"] == "skipped":
+                    continue
+                k = (x["day_id"], x["slot"], x["set_n"])
+                if k in seen:
+                    continue
+                seen.add(k)
+                e = exs.get(x["exercise_id"]) or {}
+                key = e.get("muscle_detail") or e.get("muscle")
+                out_[key] = out_.get(key, 0) + 1
+            return out_
+        now_, before = by_muscle(2), by_muscle(1)
+        table = page.eval_on_selector_all("#muscle-table [data-muscle]", "els => els.map(e => [e.getAttribute('data-muscle'), e.querySelector('.muscle-sets').innerText.trim(), e.querySelector('.muscle-diff').innerText.trim()])")
+        want = []
+        for k in sorted(set(now_) | set(before)):
+            d = now_.get(k, 0) - before.get(k, 0)
+            want.append([k, str(now_.get(k, 0)), "" if d == 0 else ("%+d from last round" % d)])
+        check(tag + "(e) block overview: the sets this round by muscle with the change line", table == want and any(w[2] for w in want), {"page": table, "want": want})
+        check(tag + "(e) block overview: Close block is a secondary button", page.locator("#block-end.btn-secondary").count() == 1)
+        layout(page, tag, "block overview")
+        # A round 4 day (easy round, not planned yet) with hard days left: the stop sheet (plural line).
+        block_tab(page, 4)
+        page.click("#block-days [data-blockday$=':p4:d1']")
+        page.wait_for_selector("#easy-sheet")
+        check(tag + "stop sheet: with 4 hard days left the line counts them",
+              page.inner_text("#easy-line").strip() == "4 hard days are not finished yet." and page.inner_text("#easy-sheet h2").strip() == "Finish the hard days first")
+        page.click("#easy-cancel"); poll(page, "() => !document.getElementById('easy-sheet')")
+        # Round 3 day A: not planned yet, read only.
+        block_tab(page, 3)
+        page.click("#block-days [data-blockday$=':p3:d1']")
+        page.wait_for_selector("#dayview[data-state='notplanned']")
+        check(tag + "(e) not planned yet: the pill and its line, one row per set, empty cells, nothing that writes",
+              page.inner_text("#state-pill").strip() == "Not planned yet" and page.inner_text("#day-line").strip() == "Its numbers are set when the day before it is finished."
+              and page.locator("#dayview .set.is-notplanned").count() >= 3 and no_write_controls(page)
+              and page.inner_text("#day-back").strip() == "< Back" and page.locator(".tab.is-active[data-tab='#/block']").count() == 1)
+        layout(page, tag, "not planned yet")
+        # Bad ids: each goes to the Block tab.
+        bid = rows(page, "blocks")[0]["id"]
+        for bad in ("nope", "__proto__", bid + ":p9:d1", bid + ":p1:d7", "x%20y"):
+            page.evaluate("h => { location.hash = h; }", "#/day/" + bad)
+            try:
+                page.wait_for_selector("#block #round-strip", timeout=6000)
+                ok = True
+            except Exception:
+                ok = False
+            check(tag + "(e) bad id: #/day/" + bad[-12:] + " goes to the Block tab", ok and page.locator("#dayview").count() == 0)
+        ctx.close()
+        # A round 1 day planned but not current: its targets read only with day.later.line.
+        ctx, page = fixed_page()
+        block_tab(page)
+        page.click("#block-days [data-blockday$=':p1:d2']")
+        page.wait_for_selector("#dayview[data-state='later']")
+        helpers = page.eval_on_selector_all("#dayview .set .helper", "els => els.map(e => e.innerText.trim()).filter(Boolean)")
+        check(tag + "(e) planned not current: the line names the day before, the targets show read only",
+              page.inner_text("#day-line").strip() == "Opens after Day A." and page.locator("#state-pill").count() == 0 and len(helpers) >= 1 and no_write_controls(page), helpers[:2])
+        page.click("#day-back")
+        page.wait_for_selector("#block #round-strip")
+        check(tag + "(e) the Back link goes to the Block tab", page.locator("#dayview").count() == 0)
+        ctx.close()
+
+    # (d) Skip day, then open that day from the Block tab: read only, status stays skipped (R47).
+    def part_skipview():
+        ctx, page = fixed_page()
+        d = day_row(page)
+        day_item(page, "skip")
+        page.wait_for_selector("#skipday-sheet")
+        page.click("#skipday-go")
+        page.wait_for_selector("#skipday-sheet", state="detached")
+        settle(page, 400)
+        block_tab(page)
+        dr = day_rows(page)
+        check(tag + "(d) block overview: the skipped day shows the Skipped pill, the next day Now",
+              dr[0][1] == "skipped" and dr[0][3].endswith("Skipped") and dr[1][2] == "true", dr)
+        page.click("#block-days [data-blockday='%s']" % d["id"])
+        page.wait_for_selector("#dayview[data-state='skipped']")
+        page.evaluate("() => { const r = document.querySelector('#dayview .set'); if (r) r.click(); }")
+        settle(page, 400)
+        after = next(x for x in rows(page, "days") if x["id"] == d["id"])
+        check(tag + "(d) read only: a skipped day opened from the Block tab has no tick, set tap or day menu and stays skipped",
+              no_write_controls(page) and page.inner_text("#state-pill").strip() == "Skipped" and after["status"] == "skipped"
+              and page.locator("#dayview .set.is-skipped").count() >= 1, after["status"])
+        layout(page, tag, "skipped day read only")
+        ctx.close()
+
+    # (a) and (b) the switch: absent before 2026-12-01; by three ticks and typed ADJUST after; no
+    # condition words keep it shut; Back to Fixed with one confirm.
+    def part_switch():
+        ctx, page = fixed_page()
+        go_route(page, "#/settings", "#settings #block-card")
+        settle(page, 600)
+        check(tag + "(a) settings: the Adjust each round row is not in the DOM at 2026-11-20",
+              page.locator("#adjust-row").count() == 0 and page.locator("#adjust-back").count() == 0 and page.locator("#load-block-row").count() == 1)
+        ctx.close()
+        ctx, page = new(ADAPT_NOW)
+        page.click("#unit-lb")
+        load_block_file(page, BLOCK_V2)
+        go_route(page, "#/settings", "#settings #block-card")
+        page.wait_for_selector("#adjust-row", timeout=8000)
+        check(tag + "(b) settings: the row reads Adjust each round inside the BLOCK group",
+              page.inner_text("#adjust-row").strip() == "Adjust each round" and page.locator("#block-group #adjust-row").count() == 1)
+        page.click("#adjust-row")
+        page.wait_for_selector("#adjust-sheet")
+        conds = page.eval_on_selector_all("#adjust-sheet [data-cond]", "els => els.map(e => [e.getAttribute('aria-checked'), e.innerText.trim()])")
+        check(tag + "(b) switch: the sheet shows his three condition lines as check rows, then the line and the field",
+              [c[1] for c in conds] == ["Made-up condition line one.", "Made-up condition line two.", "Made-up condition line three."]
+              and all(c[0] == "false" for c in conds) and page.inner_text("#adjust-line").strip() == "Your coach must say yes to all 3 first."
+              and page.is_disabled("#adjust-go"), conds)
+        layout(page, tag, "adjust sheet")
+        page.click("#adjust-sheet [data-cond='0']"); page.click("#adjust-sheet [data-cond='1']")
+        page.fill("#adjust-in", "ADJUST")
+        check(tag + "(b) switch: two ticks and ADJUST keep the primary disabled", page.is_disabled("#adjust-go"))
+        page.click("#adjust-sheet [data-cond='2']")
+        page.fill("#adjust-in", "adjust")
+        check(tag + "(b) switch: three ticks and the word in small letters keep it disabled", page.is_disabled("#adjust-go"))
+        page.fill("#adjust-in", " ADJUST ")
+        check(tag + "(b) switch: three ticks and ADJUST turn the primary on", not page.is_disabled("#adjust-go"))
+        page.click("#adjust-go")
+        poll(page, "() => !document.getElementById('adjust-sheet')")
+        page.wait_for_selector("#adjust-back", timeout=8000)
+        b = rows(page, "blocks")[0]
+        check(tag + "(b) switch: the block is on Adjust each round with his three ticks; the row now reads Back to Fixed",
+              b["profile"] == "adaptive" and b["profile_switch"]["ticks"] == [True, True, True] and b["profile_switch"]["back_at"] is None
+              and page.inner_text("#adjust-back").strip() == "Back to Fixed" and page.locator("#adjust-row").count() == 0, b["profile"])
+        go_route(page, "#/today", "#today[data-day]")
+        check(tag + "(b) switch: Today shows Adjust each round", page.get_attribute("#today", "data-profile") == "adaptive")
+        go_route(page, "#/settings", "#settings #block-card")
+        page.wait_for_selector("#adjust-back")
+        page.click("#adjust-back")
+        page.wait_for_selector("#adjust-back-sheet")
+        check(tag + "(b) back to Fixed: one confirm with its title and line, no typed word",
+              page.inner_text("#adjust-back-sheet h2").strip() == "Go back to Fixed?" and "Days not started go back to as written. Logged days stay." in page.inner_text("#adjust-back-sheet")
+              and page.locator("#adjust-back-sheet input").count() == 0)
+        page.click("#adjust-back-go")
+        poll(page, "() => !document.getElementById('adjust-back-sheet')")
+        page.wait_for_selector("#adjust-row", timeout=8000)
+        b = rows(page, "blocks")[0]
+        check(tag + "(b) back to Fixed: the block is Fixed, back_at is set, the Adjust each round row is back",
+              b["profile"] == "fixed" and b["profile_switch"]["back_at"] is not None, b["profile"])
+        ctx.close()
+        # A block with no condition words: no check rows, and the primary never turns on.
+        ctx, page = new(ADAPT_NOW)
+        page.click("#unit-lb")
+        load_block_file(page, os.path.join(FIXTURES, "block_v1.json"))
+        go_route(page, "#/settings", "#settings #block-card")
+        page.wait_for_selector("#adjust-row", timeout=8000)
+        page.click("#adjust-row")
+        page.wait_for_selector("#adjust-sheet")
+        page.fill("#adjust-in", "ADJUST")
+        check(tag + "(b) switch: with no condition words the sheet has no check rows and stays shut",
+              page.locator("#adjust-sheet [data-cond]").count() == 0 and page.locator("#adjust-line").count() == 1 and page.is_disabled("#adjust-go"))
+        ctx.close()
+
+    # (b) the stop sheet when an easy-round day is opened from the Block tab while round 3 day B is open (M40).
+    def part_stop():
+        ctx, page, out = adaptive_page()
+        for _ in range(3):      # round 2 day A, round 2 day B, round 3 day A
+            play_day(page)
+        d = day_row(page)
+        check(tag + "stop sheet: Today is round 3 day B", d and d["pass"] == 3 and d["day"] == 2, d and (d["pass"], d["day"]))
+        sid = open_set(page)
+        page.click(q(sid) + " [data-tick]")
+        wait_state(page, sid, "done")
+        clear_sheets(page)
+        block_tab(page, 4)
+        page.click("#block-days [data-blockday$=':p4:d1']")
+        try:
+            page.wait_for_selector("#easy-sheet", timeout=6000)
+            shown = True
+        except Exception:
+            shown = False
+        check(tag + "stop sheet: an easy-round day opened from the Block tab while round 3 day B is open shows the stop sheet",
+              shown and page.inner_text("#easy-line").strip() == "1 hard day is not finished yet." and page.inner_text("#easy-go").strip() == "Go to the open day"
+              and page.locator("#dayview").count() == 0)
+        layout(page, tag, "easy round stop sheet")
+        if shown:
+            page.click("#easy-go")
+            page.wait_for_selector("#today[data-day]")
+            check(tag + "stop sheet: the primary goes to the open day", page.get_attribute("#today", "data-day") == d["id"] and page.get_attribute("#today", "data-status") == "open")
+        ctx.close()
+
+    # ---------------- B.1 step 11: block_rounds.json played by taps with its answer script ----------------
+    # The same script and table engine.test.js plays through the store (16 B.12 last paragraph), so the
+    # browser and node prove the same numbers: counts, loads, rep goals and reps-left goals per round.
+
+    SCRIPT = json.load(open(ROUNDS_SCRIPT))
+    ROUND_LIFTS = {d["day"]: {l["slot"]: l for l in d["lifts"]} for d in json.load(open(ROUNDS))["block"]["day_templates"]}
+
+    def day_sets(page, did):
+        return sorted([r for r in rows(page, "sets") if r["day_id"] == did], key=lambda r: (r["slot"], r["set_n"], r["id"]))
+
+    def table_of(page, did):
+        """The planned work sets of a day as the table writes them: {slot: {why, sets: [[load, low, high, left]]}}."""
+        out = {}
+        for r in day_sets(page, did):
+            if r["kind"] != "work" or r["origin"] != "plan" or r["side"] not in ("none", "L"):
+                continue
+            s_ = out.setdefault(str(r["slot"]), {"why": r["why"], "sets": []})
+            t_ = r["target"]
+            s_["sets"].append([t_["load"], t_["rep_low"], t_["rep_high"], t_["reps_left_target"]])
+        return out
+
+    def fmt_num(v):
+        return str(int(v)) if float(v).is_integer() else str(v)
+
+    def type_val(page, sid, kind, value):
+        """Types a value into the open row's load or reps cell (the val button turns into its field)."""
+        page.click(q(sid) + " [data-val='%s']" % kind)
+        sel = q(sid) + " [data-input='%s']" % kind
+        page.wait_for_selector(sel, timeout=5000)
+        fill_change(page, sel, fmt_num(value))
+        settle(page, 300)
+
+    def pick(page, sel):
+        """Taps a chip unless it is already picked (a second tap would clear it)."""
+        if page.locator(sel).count() and page.get_attribute(sel, "aria-pressed") != "true":
+            page.click(sel)
+
+    def answer_sheets(page, key, seen):
+        """Answers what a tick opened by the script: the range ask (log it), the soreness-alone sheet
+        (the slot's soreness, Save) and the feedback sheet (every question it shows, the check, Save)."""
+        sc = SCRIPT["days"].get(key, {})
+        for i_ in range(8):
+            settle(page, 600 if i_ == 0 else 300)   # a sheet opens after the redraw that follows the tick
+            if page.locator("#range-sheet").count():
+                page.click("#range-log"); continue
+            if page.locator("#sore-sheet").count():
+                seen["sore"] = seen.get("sore", 0) + 1
+                slot = seen["slot"]
+                a = dict(SCRIPT["defaults"]); a.update((sc.get("fb") or {}).get(str(slot), {}))
+                pick(page, "#sore-sheet [data-answer='soreness-%d']" % a["soreness"])
+                page.click("#sore-save"); poll(page, "() => !document.getElementById('sore-sheet')")
+                continue
+            if page.locator("#feedback").count():
+                slot = seen["slot"]
+                a = dict(SCRIPT["defaults"]); a.update((sc.get("fb") or {}).get(str(slot), {}))
+                for k in ("pump", "soreness", "workload"):
+                    pick(page, "#feedback [data-answer='%s-%d']" % (k, a[k]))
+                pick(page, "#feedback [data-answer='check-check_a-%d']" % (2 if a["check_a"] else 1))
+                page.click("#fb-save"); poll(page, "() => !document.getElementById('feedback')")
+                continue
+            break
+
+    def log_open_sets(page, key, profile, seen, stop_after=None):
+        """Logs every set of the day Today shows at its fill values, in the order the app opens them.
+        stop_after=n returns after n sets (the rest are logged by a second call)."""
+        sc = SCRIPT["days"].get(key, {})
+        day_n = int(key.split(":")[1])
+        guard, done = 0, 0
+        while open_set(page) and guard < 40:
+            sid = open_set(page)
+            row = next(r for r in rows(page, "sets") if r["id"] == sid)
+            lift = ROUND_LIFTS[day_n][row["slot"]]
+            named = ((sc.get("reps") or {}).get(str(row["slot"])) or {}).get(str(row["set_n"]))
+            want_load = row["target"]["load"] if row["target"]["load"] is not None else lift["start_load"]
+            want_reps = named if named is not None else (row["target"]["rep_low"] if row["target"]["rep_low"] is not None else lift["rep_low"])
+            # What the row shows before typing: a draft (a weight copied down from an earlier set) else the target.
+            draft = row.get("draft") or {}
+            shown_load = draft["load"] if draft.get("load") is not None else row["target"]["load"]
+            shown_reps = draft["reps"] if draft.get("reps") is not None else row["target"]["rep_low"]
+            if shown_load != want_load:
+                type_val(page, sid, "load", want_load)
+            if shown_reps != want_reps:
+                type_val(page, sid, "reps", want_reps)
+            seen["slot"] = row["slot"]
+            page.click(q(sid) + " [data-tick]")
+            settle(page, 400)
+            if page.locator("#range-sheet").count():
+                page.click("#range-log")
+            wait_state(page, sid, "done")
+            answer_sheets(page, key, seen)
+            guard += 1
+            done += 1
+            if stop_after is not None and done >= stop_after:
+                return
+
+    def check_plan(page, tag_, key, profile):
+        did = page.get_attribute("#today", "data-day")
+        have = table_of(page, did)
+        want = SCRIPT["expect"][profile][key]
+        check(tag_ + key + ": every planned count, load, rep goal and reps-left goal equals the script table", have == want, {"have": have, "want": want})
+        # Each planned row's helper line on the screen reads the table's target (ui/today.js helperLine on the table row).
+        bad = []
+        for slot, w in want.items():
+            plan = [r for r in day_sets(page, did) if r["slot"] == int(slot) and r["kind"] == "work" and r["origin"] == "plan" and r["side"] in ("none", "L")]
+            for r, t_ in zip(plan, w["sets"]):
+                tgt = dict(r["target"]); tgt.update({"load": t_[0], "rep_low": t_[1], "rep_high": t_[2], "reps_left_target": t_[3]})
+                line = page.evaluate("async ([s]) => { const m = await import('./ui/today.js'); return m.helperLine(s, null); }", [dict(r, target=tgt)])
+                shown = page.inner_text(q(r["id"]) + " .helper").strip() if page.locator(q(r["id"]) + " .helper").count() else None
+                if shown is None or not shown.endswith(line.strip()):
+                    bad.append([r["id"][-12:], shown, line])
+        check(tag_ + key + ": every planned row's helper line reads the table's goal", not bad, bad[:3])
+        if profile == "adaptive" and page.get_attribute("#today", "data-profile") == "adaptive":
+            whys = {s_: page.get_attribute("[data-slot='%s'] .ex-why" % s_, "data-why") if page.locator("[data-slot='%s'] .ex-why" % s_).count() else None for s_ in want}
+            check(tag_ + key + ": each card's why line names the table's reason", whys == {s_: w["why"] for s_, w in want.items()}, whys)
+
+    def switch_on(page):
+        """Adjust each round by his three ticks and typed ADJUST (16 B.9), back on Today after."""
+        go_route(page, "#/settings", "#settings #block-card")
+        page.wait_for_selector("#adjust-row", timeout=8000)
+        page.click("#adjust-row")
+        page.wait_for_selector("#adjust-sheet")
+        for i in range(3):
+            page.click("#adjust-sheet [data-cond='%d']" % i)
+        page.fill("#adjust-in", "ADJUST")
+        page.click("#adjust-go")
+        poll(page, "() => !document.getElementById('adjust-sheet')")
+        page.wait_for_selector("#adjust-back", timeout=8000)
+        go_route(page, "#/today", "#today[data-day]")
+
+    def play_rounds(profile):
+        tag_ = tag + "rounds " + profile + " "
+        now_ms = ny_ms(2026, 11, 20, 12) if profile == "fixed" else ny_ms(2026, 12, 2, 12)
+        ctx, page = new(now_ms)
+        page.click("#unit-lb")
+        load_block_file(page, ROUNDS)
+        seen = {}
+        for pass_n in range(1, 5):
+            for day_n in (1, 2):
+                key = "%d:%d" % (pass_n, day_n)
+                sc = dict(SCRIPT["defaults"]); sc.update(SCRIPT["days"].get(key, {}))
+                if profile == "adaptive" and key == SCRIPT["switch_on"]:
+                    switch_on(page)
+                    b = rows(page, "blocks")[0]
+                    check(tag_ + key + ": switched to Adjust each round by three ticks and ADJUST", b["profile"] == "adaptive" and b["profile_switch"]["ticks"] == [True, True, True])
+                if profile == "fixed" and day_n == 1:
+                    go_route(page, "#/settings", "#settings #block-card")
+                    settle(page, 400)
+                    check(tag_ + key + ": the Adjust each round row is not in the DOM", page.locator("#adjust-row").count() == 0 and page.locator("#adjust-back").count() == 0)
+                    go_route(page, "#/today", "#today[data-day]")
+                d = day_row(page)
+                if not check(tag_ + key + ": Today is round %d day %d" % (pass_n, day_n), d and d["pass"] == pass_n and d["day"] == day_n, d and (d["pass"], d["day"])):
+                    break
+                page.click("#sleep-yes" if sc["sleep"] else "#sleep-no")
+                poll(page, "() => { const c = document.getElementById('%s'); return !!c && c.getAttribute('aria-pressed') === 'true'; }" % ("sleep-yes" if sc["sleep"] else "sleep-no"))
+                settle(page, 400)
+                check_plan(page, tag_, key, profile)
+                easy = page.locator("#easy-pill").count() == 1
+                if profile == "fixed":
+                    check(tag_ + key + ": no Easy round pill in Fixed", not easy)
+                elif pass_n == 4:
+                    check(tag_ + key + ": the Easy round pill shows in round 4", easy and page.inner_text("#easy-pill").strip() == "Easy round", page.inner_text("#today")[:80])
+                if sc.get("add_rest"):
+                    n0 = page.locator("[data-slot='%d'] .set" % sc["add_rest"]).count()
+                    page.click("[data-addset='%d']" % sc["add_rest"])
+                    if profile == "adaptive":
+                        scope(page, "rest")
+                    settle(page, 400)
+                    added = [r for r in day_sets(page, d["id"]) if r["slot"] == sc["add_rest"] and r["origin"] == "added"]
+                    check(tag_ + key + ": Add set on slot %d adds one row (%s)" % (sc["add_rest"], "Rest of block" if profile == "adaptive" else "Today only, no scope sheet in Fixed"),
+                          page.locator("[data-slot='%d'] .set" % sc["add_rest"]).count() == n0 + 1 and [r["add_scope"] for r in added] == (["rest"] if profile == "adaptive" else ["today"]),
+                          [r["add_scope"] for r in added])
+                if profile == "adaptive" and key == "3:2":
+                    # (b) the stop sheet: an easy-round day opened from the Block tab while round 3 day B is open.
+                    log_open_sets(page, key, profile, seen, stop_after=1)
+                    block_tab(page, 4)
+                    page.click("#block-days [data-blockday$=':p4:d1']")
+                    try:
+                        page.wait_for_selector("#easy-sheet", timeout=6000)
+                        shown = True
+                    except Exception:
+                        shown = False
+                    check(tag_ + key + ": an easy-round day opened from the Block tab while round 3 day B is open shows the stop sheet",
+                          shown and page.inner_text("#easy-line").strip() == "1 hard day is not finished yet.")
+                    if shown:
+                        page.click("#easy-go")
+                        page.wait_for_selector("#today[data-day]")
+                    else:
+                        go_route(page, "#/today", "#today[data-day]")
+                    settle(page, 300)
+                log_open_sets(page, key, profile, seen)
+                ok = finish(page, score=sc["score_a"], stay=True)
+                on_done = page.locator("#daydone").count() == 1 and page.evaluate("() => location.hash.startsWith('#/daydone/')")
+                check(tag_ + key + ": Finish day goes through the Day done screen", ok and on_done)
+                leave_day_done(page)
+                go_route(page, "#/today", "#today > *")
+                fin = next((x for x in rows(page, "days") if x["id"] == d["id"]), None)
+                check(tag_ + key + ": the day is done with the script's score", fin and fin["status"] == "done" and fin["scores"].get("score_a") == sc["score_a"], fin and (fin["status"], fin["scores"]))
+        if profile == "fixed":
+            check(tag_ + "no first-tick sheet on any day of the Fixed run", seen.get("sore", 0) == 0, seen.get("sore", 0))
+            whys = {r["why"] for r in rows(page, "sets") if r["origin"] == "plan"}
+            check(tag_ + "no easy round and no reason but the plan on any planned row", whys == {"why.plan"}, sorted(whys))
+        else:
+            check(tag_ + "the soreness-alone sheet opened at first ticks in Adjust each round", seen.get("sore", 0) >= 1, seen.get("sore", 0))
+        layout(page, tag_, "rounds end")
+        ctx.close()
+
+    def part_rounds_fixed():
+        play_rounds("fixed")
+
+    def part_rounds_adaptive():
+        play_rounds("adaptive")
+
+    # (c) the live edits of B.12 not covered above: swap Today only (next round back to the block
+    # lift), swap Rest of block (later days show the new exercise with no weight), Add exercise
+    # Rest of block (1 set, effort only); a done day is deep-equal before and after each.
+    def part_live2():
+        ctx, page, out = adaptive_page()
+        did = page.get_attribute("#today", "data-day")
+        done_before = json.dumps(sorted([r for r in rows(page, "sets") if ":p1:" in r["id"]], key=lambda r: r["id"]), sort_keys=True)
+        tpl0 = [l["exercise_id"] for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"]]
+        # Swap Today only on slot 2.
+        menu_item(page, "2", "3")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='lying_leg_curl']")
+        scope(page, "today")
+        tpl1 = [l["exercise_id"] for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"]]
+        check(tag + "(c) swap Today only: today's card is the new exercise, the block's day keeps its lift",
+              # Today only is the Slice 1 slot rule (16 B.3.13): the new exercise takes a new slot in the old
+              # card's place and the old slot's planned sets are skipped.
+              page.locator("[data-exercise='lying_leg_curl']").count() == 1
+              and page.locator("[data-slot='2'] .set").count() == page.locator("[data-slot='2'] .set[data-state='skipped']").count() > 0
+              and tpl1 == tpl0, {"before": tpl0, "after": tpl1})
+        # Swap Rest of block on slot 1: the block's day takes the new exercise with no weight.
+        menu_item(page, "1", "3")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='hack_squat']")
+        scope(page, "rest")
+        lift1 = next(l for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"] if l["slot"] == 1)
+        check(tag + "(c) swap Rest of block: the block's day holds the new exercise with no weight",
+              lift1["exercise_id"] == "hack_squat" and lift1["start_load"] is None and page.locator("[data-exercise='hack_squat']").count() == 1, lift1)
+        block_tab(page, 3)
+        page.click("#block-days [data-blockday$=':p3:d1']")
+        page.wait_for_selector("#dayview")
+        check(tag + "(c) swap Rest of block: a later day shows the new exercise; the Today only swap does not reach it",
+              page.locator("#dayview [data-slot='1'][data-exercise='hack_squat']").count() == 1
+              and page.locator("#dayview [data-slot='2'][data-exercise='seated_leg_curl']").count() == 1)
+        go_route(page, "#/today", "#today[data-day]")
+        # Add exercise with Rest of block: 1 set, effort only.
+        day_item(page, "addex")
+        page.wait_for_selector("#picker")
+        page.click("[data-pick='cable_fly']")
+        page.wait_for_selector("#addex-sheet")
+        start = page.inner_text("#addex-count").strip()
+        page.click("#addex-save")
+        scope(page, "rest")
+        new_rows = [r for r in day_sets(page, did) if r["exercise_id"] == "cable_fly" and r["kind"] == "work"]
+        lift_new = next((l for l in rows(page, "blocks")[0]["day_templates"][0]["lifts"] if l["exercise_id"] == "cable_fly"), None)
+        check(tag + "(c) Add exercise with Rest of block: 1 set, an effort goal only, on today and on the block's day",
+              start == "1" and len(new_rows) == 1 and new_rows[0]["target"]["load"] is None and new_rows[0]["target"]["rep_low"] is None
+              and lift_new is not None and lift_new["sets"] == 1, {"start": start, "rows": [r["target"] for r in new_rows], "lift": lift_new})
+        done_mid = json.dumps(sorted([r for r in rows(page, "sets") if ":p1:" in r["id"]], key=lambda r: r["id"]), sort_keys=True)
+        check(tag + "(c) the done days are the same before and after the swaps and the add", done_before == done_mid)
+        # Next round: the Today only swap is gone (slot 2 is the block lift again), the Rest of block swap stays.
+        for _ in range(2):
+            play_day(page)
+        d = day_row(page)
+        check(tag + "(c) swap Today only: the next round's day A has the block lift back on slot 2; Rest of block keeps the new one on slot 1",
+              d and d["pass"] == 3 and d["day"] == 1 and page.locator("[data-slot='2'][data-exercise='seated_leg_curl']").count() == 1
+              and page.locator("[data-slot='1'][data-exercise='hack_squat']").count() == 1, d and (d["pass"], d["day"]))
+        ctx.close()
+
+    for name, fn in (("fixed", part_fixed), ("fixed2", part_fixed_round2), ("close", part_close), ("addremove", part_add_remove),
+                     ("answers", part_answers), ("adaptive", part_adaptive), ("live", part_live),
+                     ("block", part_block), ("skipview", part_skipview), ("switch", part_switch), ("stop", part_stop),
+                     ("roundsfixed", part_rounds_fixed), ("roundsadaptive", part_rounds_adaptive), ("live2", part_live2)):
+        if not want(name):
+            continue
+        section(tag + name, fn)
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, "e2e_slice2_%s_network.json" % vp), "w") as f:
+        json.dump({"origin": origin, "requests": len(audit.requests), "off_origin": audit.off_origin(), "csp_violations": audit.csp}, f, indent=1)
+    off = audit.off_origin()
+    check(tag + "network audit: zero requests off our origin and zero CSP violations", not off and not audit.csp,
+          "%d requests, %d off origin, %d CSP %s" % (len(audit.requests), len(off), len(audit.csp), (off + audit.csp)[:3]))
+    check(tag + "zero console errors", not audit.errors, audit.errors[:5])
+
+
+# ---------------- suite upgrade (16 B.12 row "e2e.py --suite upgrade", r4.4 R8) ----------------
+
+# The last schema 1 build: the live public 0.2.6, the same app files as main 383be49, the commit
+# just before the schema commit (B.1 R1). It is exported with git archive into the copy base.
+OLD_COMMIT = "bae7bec"
+OLD_VERSION = "0.2.6"
+# Keeps the 0.2.6 page running 0.2.6 after 0.3.0 takes the origin: on that page only, a waiting
+# worker is never asked to take over and controllerchange never reloads it (a harness patch, the
+# app is not changed). The new tab is not patched, so it takes 0.3.0 the way a phone does.
+PIN_OLD = ("(() => { const pm = ServiceWorker.prototype.postMessage;"
+           " ServiceWorker.prototype.postMessage = function (m, ...r) { if (m && m.type === 'SKIP_WAITING') return; return pm.call(this, m, ...r); };"
+           " const add = ServiceWorkerContainer.prototype.addEventListener;"
+           " ServiceWorkerContainer.prototype.addEventListener = function (t, ...r) { if (t === 'controllerchange') return; return add.call(this, t, ...r); }; })();")
+# M38's first edit (mutants.js row M38): MIGRATIONS[1] throws half way through the sets.
+M38_FIND = "  if (Array.isArray(s.sets)) s.sets = s.sets.map(x => {\n"
+M38_REPLACE = "  if (Array.isArray(s.sets)) s.sets = s.sets.map((x, i, all) => {\n    if (i === Math.floor(all.length / 2)) throw new Error('planted throw half way');\n"
+DB_INFO = "async () => { const l = indexedDB.databases ? await indexedDB.databases() : []; const d = l.find(x => x.name === 'liftlog'); return d ? d.version : null; }"
+# Every store read straight from IndexedDB at the version the db is at (no app code), for the abort case.
+RAW_DUMP = """async () => { const v = (await indexedDB.databases()).find(x => x.name === 'liftlog').version;
+  const conn = await new Promise((res, rej) => { const r = indexedDB.open('liftlog', v); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const out = {}; for (const s of %s) { out[s] = await new Promise((res, rej) => { const q = conn.transaction(s).objectStore(s).getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
+  conn.close(); return JSON.stringify({ version: v, stores: out }); }""" % STORES7
+
+
+def make_old_build(base, name):
+    """The 0.2.6 served copy: git archive of OLD_COMMIT into the copy base, scripts/ left out."""
+    src = os.path.join(base, name + "-archive")
+    dst = os.path.join(base, name)
+    for p_ in (src, dst):
+        shutil.rmtree(p_, ignore_errors=True)
+    os.makedirs(src)
+    # A planted copy made by mutants.js is a fresh repo with one commit, so it reads the old build
+    # from the source repo it was copied from (LIFTLOG_SOURCE_REPO, set by mutants.js).
+    repo = os.environ.get("LIFTLOG_SOURCE_REPO") or APP_DIR
+    tar = subprocess.run(["git", "-C", repo, "archive", "--format=tar", OLD_COMMIT], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", src], input=tar, check=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("scripts"))
+    v = open(os.path.join(dst, "version.js")).read()
+    if ("APP_VERSION = '%s'" % OLD_VERSION) not in v or "SCHEMA = 1" not in v:
+        raise RuntimeError("the archived build is not %s on schema 1" % OLD_VERSION)
+    return dst
+
+
+def make_m38_build(base, name):
+    """0.3.0 with MIGRATIONS[1] throwing half way (the M38 build of 16 B.12), on a scratch copy."""
+    dst = make_build(base, name)
+    p_ = os.path.join(dst, "backup.js")
+    text = open(p_).read()
+    if text.count(M38_FIND) != 1:
+        raise RuntimeError("the M38 find text is not in backup.js once")
+    open(p_, "w").write(text.replace(M38_FIND, M38_REPLACE))
+    return dst
+
+
+def suite_upgrade(browser, base, cb):
+    tag = "[440] upgrade "
+    o = urlparse(base)
+    origin = o.scheme + "://" + o.netloc
+    audit = Audit(origin)
+    OLD = make_old_build(cb, "upgrade-old")
+    NEW = make_build(cb, "upgrade-new")
+    M38 = make_m38_build(cb, "upgrade-m38")
+    out_dir = os.path.join(cb, "upgrade-files")
+    os.makedirs(out_dir, exist_ok=True)
+    reopen_words = "New version ready. Close the app and open it again."
+    fail_words = "The update could not finish. Nothing was changed. Close the app and open it again."
+
+    def old_block():
+        """A made-up schema 1 block for 0.2.6: day A has a laps lift (break chips), 2 rounds."""
+        f = json.load(open(os.path.join(FIXTURES, "block_v1.json")))
+        lift = lambda slot, ex, sets, load, **more: dict({"slot": slot, "exercise_id": ex, "sets": sets, "rep_low": 8, "rep_high": 12, "start_load": load,
+                                                           "failure_set": False, "reps_left_target": 2, "warmups": [], "sides": "none", "load_basis": "total",
+                                                           "count_label": None, "note": ""}, **more)
+        f["source_id"] = "upgrade-old"
+        f["block"]["passes"] = 2
+        f["block"]["day_templates"] = [
+            {"day": 1, "label": "A", "lifts": [lift(1, "leg_press", 2, 100), lift(2, "farmer_carry", 2, 50, rep_low=None, rep_high=None, count_label="laps", load_basis="per_hand")]},
+            {"day": 2, "label": "B", "lifts": [lift(1, "lat_pulldown", 2, 80), lift(2, "leg_extension", 1, 60)]}]
+        f["exercises"] = []
+        # No custom rows here, so no flag may name one (the block check refuses an unknown id, badref).
+        f["block"]["exercise_flags"] = {k: v for k, v in f["block"]["exercise_flags"].items() if not k.startswith("ex_")}
+        path = os.path.join(out_dir, "block_upgrade_old.json")
+        json.dump(f, open(path, "w"))
+        return path
+
+    def fb_save(page):
+        settle(page, 300)
+        if page.locator("#feedback").count():
+            for k in ("pump", "soreness", "workload"):
+                if page.locator("#feedback [data-answer='%s-2']" % k).count():
+                    page.click("#feedback [data-answer='%s-2']" % k)
+            page.click("#fb-save")
+            poll(page, "() => !document.getElementById('feedback')")
+            settle(page)
+
+    def old_day(page, breaks=False, move=False):
+        """0.2.6: one day ticked at its targets with feedback on every lift, then Finish day."""
+        if move:
+            page.click("[data-menu='2']")
+            page.wait_for_selector("#card-menu")
+            page.click("#card-menu [data-item='up']")
+            settle(page, 500)
+        guard = 0
+        while open_set(page) and guard < 20:
+            sid = open_set(page)
+            if breaks and page.locator(q(sid) + " [data-br='1']").count():
+                page.click(q(sid) + " [data-br='1']"); settle(page, 400)
+                breaks = False
+            page.click(q(sid) + " [data-tick]")
+            settle(page, 400)
+            if page.locator("#range-sheet").count():
+                page.click("#range-log")
+            wait_state(page, sid, "done")
+            fb_save(page)
+            guard += 1
+        return finish(page)
+
+    def norm_rows(stores):
+        return {s_: sorted(stores.get(s_, []), key=lambda r_: json.dumps(r_, sort_keys=True)) for s_ in ("settings", "exercises", "templates", "blocks", "days", "sets", "feedback")}
+
+    def ids(rows_):
+        return sorted(r_.get("id", r_.get("key")) for r_ in rows_)
+
+    def wait_new(page, timeout=40):
+        """Waits until this tab runs 0.3.0 (it took the waiting worker and reloaded once)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                v = page.evaluate("async () => (await import('./version.js')).APP_VERSION")
+                if v == APP_VERSION and page.locator(".tabbar").count():
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    # (1) to (4): 0.2.6 logs its rows, 0.3.0 opens in a second tab of the same origin.
+    def case_main():
+        SERVE["app"] = OLD
+        ctx, p1 = new_context(browser, audit, standalone=True)
+        p1.add_init_script(PIN_OLD)
+        p1.set_default_timeout(10000)
+        p1.goto(base)
+        p1.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(p1)
+        check(tag + "the old tab runs " + OLD_VERSION, p1.evaluate("async () => (await import('./version.js')).APP_VERSION") == OLD_VERSION)
+        p1.click("#unit-lb")
+        load_block_file(p1, old_block())
+        check(tag + "0.2.6: round 1 day A finished with feedback and a break chip", old_day(p1, breaks=True))
+        check(tag + "0.2.6: round 1 day B finished with feedback and a moved card", old_day(p1, move=True))
+        # Skip day on round 2 day A (no Day done screen on a skip).
+        p1.click("#day-menu"); p1.wait_for_selector("#day-menu-sheet")
+        p1.click("#day-menu-sheet [data-dayitem='skip']")
+        p1.wait_for_selector("#skipday-sheet")
+        p1.click("#skipday-go")
+        p1.wait_for_selector("#skipday-sheet", state="detached")
+        p1.wait_for_selector("#today[data-day]")
+        settle(p1, 500)
+        check(tag + "0.2.6: Skip day shows no Day done screen", p1.locator("#daydone").count() == 0)
+        # A copied draft on round 2 day B: weight plus twice on set 1 copies down to set 2.
+        sid = open_set(p1)
+        p1.click(q(sid) + " [data-step='load+']"); settle(p1, 400)
+        p1.click(q(sid) + " [data-step='load+']"); settle(p1, 500)
+        before = json.loads(p1.evaluate(DUMP_JS))
+        last_lines = p1.eval_on_selector_all(".ex-card", "els => els.map(e => [e.getAttribute('data-slot'), (e.querySelector('.ex-last') || {}).textContent || null])")
+        day_b2 = p1.get_attribute("#today", "data-day")
+        sets_b = [r_ for r_ in before["sets"] if r_["day_id"] == day_b2]
+        own = next((r_ for r_ in sets_b if r_["id"] == sid), {})
+        dl = (own.get("draft") or {}).get("load")
+        copied = lambda rows_: any(r_.get("draft") and r_["draft"].get("from_copy") is True and r_["draft"].get("load") == dl for r_ in rows_)
+        moved = lambda days_: any(d.get("slot_order") == [2, 1] for d in days_)
+        check(tag + "0.2.6 rows hold every case: 2 done days with feedback, a break, a draft copied down, a moved card, a skipped day",
+              sum(1 for d in before["days"] if d["status"] == "done") == 2 and sum(1 for d in before["days"] if d["status"] == "skipped") == 1
+              and len(before["feedback"]) >= 4 and any((r_.get("done") or {}).get("breaks") == 1 for r_ in before["sets"])
+              and dl is not None and dl != own["target"]["load"] and copied(sets_b)
+              and moved(before["days"]) and any(x[1] for x in last_lines),
+              {"days": [d["status"] for d in before["days"]], "draft": dl, "lines": last_lines})
+        # 0.3.0 at the same origin, in a second tab of the same browser.
+        SERVE["app"] = NEW
+        p2 = new_page(ctx, audit)
+        p2.set_default_timeout(10000)
+        p2.goto(base)
+        took = wait_new(p2)
+        check(tag + "(2) a new tab takes 0.3.0", took)
+        if not took:
+            ctx.close()
+            return
+        p2.wait_for_selector("#today[data-day]", timeout=15000)
+        settle(p2, 600)
+        # The 0.2.6 tab, still open: its link is closed and never reconnects (0.2.6 db.js _versionClosed),
+        # so its tick writes nothing. Found in this e2e loop: 16 B.5 row 16 and B.12 say the tick "shows
+        # the built Not saved row", but 0.2.6's redraw() reads the store and swallows the closed-link
+        # error, so the screen is never drawn again and the row stays as it was (open, never done).
+        # 0.2.6 is frozen (no change to 0.2.6), so the check holds what 0.2.6 really does: no false
+        # done, the link refused with its closed text, and no row of it in the new db (BUILD_LOG).
+        sid1 = open_set(p1)
+        p1.click(q(sid1) + " [data-tick]")
+        settle(p1, 3000)
+        st1 = state_of(p1, sid1)
+        closed = p1.evaluate("async () => { const { db } = await import('./db.js'); try { await db.ready(); return 'open'; } catch (e) { return String(e && e.message); } }")
+        row_now = next((r_ for r_ in p2.evaluate(DB_ALL, "sets") if r_["id"] == sid1), None)
+        check(tag + "(2) the 0.2.6 tab closed its link and never reconnects: its tick never shows done and no row of it reaches the new db",
+              st1 in ("open", "failed") and closed == "Database closed for a newer version"
+              and row_now and row_now["status"] == "planned" and row_now["done"] is None,
+              {"state": st1, "link": closed, "row": row_now and (row_now["status"], row_now["done"])})
+        check(tag + "(2) the 0.2.6 tab never shows the db.reopen line (0.2.6 has none)", p1.locator("#db-blocked").count() == 0 and reopen_words not in p1.inner_text("body"))
+        # (3) The new boot: a before-upgrade copy, every row counted and migrated, Last time unchanged.
+        snaps = p2.evaluate(DB_ALL, "snapshots")
+        up = [s_ for s_ in snaps if s_["reason"] == "before-upgrade"]
+        old_counts = {s_: len(before[s_]) for s_ in before}
+        check(tag + "(3) one before-upgrade copy, made from the schema 1 rows with every count",
+              len(up) == 1 and up[0]["data"]["schema"] == 1 and {s_: len(up[0]["data"]["stores"].get(s_, [])) for s_ in old_counts} == old_counts,
+              {"snaps": [s_["reason"] for s_ in snaps]})
+        after = {s_: p2.evaluate(DB_ALL, s_) for s_ in ("settings", "exercises", "templates", "blocks", "days", "sets", "feedback")}
+        same_ids = all(ids(after[s_]) == ids(before[s_]) for s_ in ("exercises", "templates", "blocks", "days", "sets", "feedback"))
+        keys_kept = set(ids(before["settings"])) <= set(ids(after["settings"]))
+        migrated = (all("set_type" in r_ and "set_type_by_hand" in r_ for r_ in after["sets"])
+                    and all("muscle_detail" in r_ and "load_kind" in r_ for r_ in after["exercises"])
+                    and all("levels" in r_ and "switch_conditions" in r_ for r_ in after["blocks"])
+                    and all("short_sleep_since_last" in r_ for r_ in after["days"]))
+        kept = (any((r_.get("done") or {}).get("breaks") == 1 for r_ in after["sets"])
+                and copied([r_ for r_ in after["sets"] if r_["day_id"] == day_b2])
+                and moved(after["days"]) and sum(1 for d in after["days"] if d["status"] == "skipped") == 1)
+        check(tag + "(3) every row counted and migrated: the same ids, schema 2 fields on every row, the break, draft, order and skip kept",
+              same_ids and keys_kept and migrated and kept, {"ids": same_ids, "settings": keys_kept, "migrated": migrated, "kept": kept})
+        check(tag + "(3) the db is at version 2", p2.evaluate(DB_INFO) == 2, p2.evaluate(DB_INFO))
+        lines_now = p2.eval_on_selector_all(".ex-card", "els => els.map(e => [e.getAttribute('data-slot'), (e.querySelector('.ex-last') || {}).textContent || null])")
+        check(tag + "(3) Last time on Today is unchanged", lines_now == last_lines, {"before": last_lines, "after": lines_now})
+        # (4) Undo on the before-upgrade copy brings the old rows back on schema 2.
+        sid2 = open_set(p2)
+        tick(p2, sid2, fb="later")
+        go_route(p2, "#/settings", "#settings")
+        poll(p2, "() => { const r = document.getElementById('undo-row'); return !!r && !r.hidden; }")
+        p2.click("#undo-row")
+        p2.wait_for_selector("#undo-sheet")
+        snap_btn = p2.locator("#undo-sheet [data-snap='%s']" % up[0]["id"]) if up else None
+        check(tag + "(4) the Undo list names the copy Before upgrade", snap_btn is not None and snap_btn.count() == 1 and "Before upgrade" in snap_btn.inner_text())
+        snap_btn.click()
+        p2.wait_for_selector("#restore-sheet")
+        p2.fill("#restore-sheet .confirm-input", "RESTORE")
+        with p2.expect_navigation():
+            p2.click("#restore-go")
+        p2.wait_for_selector(".tabbar", timeout=15000)
+        settle(p2, 600)
+        undone = {s_: p2.evaluate(DB_ALL, s_) for s_ in ("exercises", "templates", "blocks", "days", "sets", "feedback")}
+        back = next((r_ for r_ in undone["sets"] if r_["id"] == sid2), None)
+        old_sets = {r_["id"]: r_ for r_ in before["sets"]}
+        same = all(ids(undone[s_]) == ids(before[s_]) for s_ in undone)
+        core = all({k: r_[k] for k in ("status", "done", "draft", "target")} == {k: old_sets[r_["id"]].get(k) for k in ("status", "done", "draft", "target")}
+                   for r_ in undone["sets"] if r_["id"] in old_sets)
+        check(tag + "(4) Undo on the before-upgrade copy brings the old rows back on schema 2 (the tick after the upgrade is gone)",
+              same and core and back and back["status"] == "planned" and all("set_type" in r_ for r_ in undone["sets"]) and p2.evaluate(DB_INFO) == 2,
+              {"ids": same, "rows": core, "tick": back and back["status"]})
+        ctx.close()
+
+    # (5) The abort case: the M38 build leaves schema 1 whole and shows db.upgradefail.
+    def case_abort():
+        SERVE["app"] = OLD
+        ctx, page = new_context(browser, audit, standalone=True)
+        page.set_default_timeout(10000)
+        page.goto(base)
+        page.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(page)
+        page.click("#unit-lb")
+        load_block_file(page, old_block())
+        sid = open_set(page)
+        page.click(q(sid) + " [data-step='load+']"); settle(page, 500)   # a draft, so the day stays not started
+        raw_before = json.loads(page.evaluate(RAW_DUMP))
+        page.close()
+        SERVE["app"] = M38
+        p2 = new_page(ctx, audit)
+        p2.set_default_timeout(10000)
+        p2.goto(base)
+        try:
+            end = time.time() + 40
+            while time.time() < end:
+                try:
+                    if p2.locator("#db-blocked").count():
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            text = p2.inner_text("#db-blocked")
+        except Exception as e:
+            text = "none: %r" % e
+        raw_after = json.loads(p2.evaluate(RAW_DUMP))
+        check(tag + "(5) abort: with MIGRATIONS[1] throwing, the open fails with db.upgradefail", fail_words in text, text[:160])
+        check(tag + "(5) abort: the db stays on version 1 with every row deep-equal",
+              raw_before["version"] == 1 and raw_after["version"] == 1 and norm_rows(raw_after["stores"]) == norm_rows(raw_before["stores"]),
+              {"before": raw_before["version"], "after": raw_after["version"],
+               "differ": [s_ for s_ in norm_rows(raw_before["stores"]) if norm_rows(raw_before["stores"])[s_] != norm_rows(raw_after["stores"])[s_]]})
+        ctx.close()
+
+    # (6) Last: two 0.3.0 tabs open; a scratch page of the same origin opens liftlog at version 3.
+    def case_two_tabs():
+        SERVE["app"] = NEW
+        ctx, t1 = new_context(browser, audit, standalone=True)
+        t1.set_default_timeout(10000)
+        t1.goto(base)
+        t1.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(t1)
+        t1.click("#unit-lb")
+        load_block_file(t1, BLOCK_V2)
+        t2 = new_page(ctx, audit)
+        t2.goto(base)
+        t2.wait_for_selector("#today[data-day]", timeout=15000)
+        settle(t2, 500)
+        before = norm_stores(json.loads(t1.evaluate(DUMP_JS)))
+        scratch = new_page(ctx, audit)
+        scratch.goto(origin + BASE_PATH + "robots.txt")
+        res = scratch.evaluate("""() => new Promise((res) => { let blocked = false; const r = indexedDB.open('liftlog', 3);
+            r.onblocked = () => { blocked = true; };
+            r.onsuccess = () => { window.__v3 = r.result; res({ ok: true, blocked, version: r.result.version }); };
+            r.onerror = () => res({ ok: false, error: String(r.error) });
+            setTimeout(() => res({ ok: false, error: 'no answer in 15 s', blocked }), 15000); })""")
+        check(tag + "(6) a scratch page of the same origin opens liftlog at version 3", res.get("ok") and res.get("version") == 3, res)
+        shown = []
+        for t_ in (t1, t2):
+            try:
+                t_.wait_for_selector("#db-blocked", timeout=10000)
+                shown.append(reopen_words in t_.inner_text("#db-blocked"))
+            except Exception:
+                shown.append(False)
+        check(tag + "(6) both 0.3.0 tabs show the db.reopen line", shown == [True, True], shown)
+        check(tag + "(6) the reopen screen leaves nothing to tap that writes", all(t_.locator("[data-tick], #finish-day, #sleep-card").count() == 0 for t_ in (t1, t2)))
+        settle(t1, 1500)
+        after = scratch.evaluate("""() => new Promise((res) => { const c = window.__v3; const names = %s; const out = {}; let left = names.length;
+            const t = c.transaction(names); for (const n of names) { const q = t.objectStore(n).getAll(); q.onsuccess = () => { out[n] = q.result; if (--left === 0) res(JSON.stringify(out)); }; } })""" % STORES7)
+        check(tag + "(6) both tabs wrote nothing after the close", norm_stores(json.loads(after)) == before)
+        ctx.close()
+
+    for name, fn in (("main", case_main), ("abort", case_abort), ("twotabs", case_two_tabs)):
+        section(tag + name, fn)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, "e2e_upgrade_network.json"), "w") as f:
+        json.dump({"origin": origin, "requests": len(audit.requests), "off_origin": audit.off_origin(), "csp_violations": audit.csp, "console": audit.errors[:20]}, f, indent=1)
+    off = audit.off_origin()
+    check(tag + "network audit: zero requests off our origin and zero CSP violations", not off and not audit.csp,
+          "%d requests, %d off origin, %d CSP %s" % (len(audit.requests), len(off), len(audit.csp), (off + audit.csp)[:3]))
+    # A closed link and a failed upgrade may log on purpose here; the lines are kept, not counted.
+    print("  INFO  upgrade console lines: %d %s" % (len(audit.errors), audit.errors[:3]), flush=True)
+
+
 # ---------------- main ----------------
 
 def launch(p, url=None):
@@ -2995,7 +4253,7 @@ def launch(p, url=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", choices=["slice0", "slice1", "update", "twoapp"], default="slice0")
+    ap.add_argument("--suite", choices=["slice0", "slice1", "slice2", "update", "twoapp", "upgrade"], default="slice0")
     ap.add_argument("--part", action="append", default=[])
     ap.add_argument("--url", default=None)
     ap.add_argument("--viewport", choices=["440", "375", "both"], default="both")
@@ -3030,6 +4288,27 @@ def main():
                             local["server"].stop()
                         except Exception:
                             pass
+            elif args.suite == "slice2":
+                for vp in vps:
+                    SERVE["app"] = make_build(cb, "served2-" + vp)
+                    srv = Server()
+                    base = "http://127.0.0.1:%d%s" % (srv.port, BASE_PATH)
+                    print("e2e suite=slice2 viewport=%s base=%s" % (vp, base), flush=True)
+                    try:
+                        suite_slice2(browser, base, vp, args.part)
+                    finally:
+                        try:
+                            srv.stop()
+                        except Exception:
+                            pass
+            elif args.suite == "upgrade":
+                srv = Server()
+                base = "http://127.0.0.1:%d%s" % (srv.port, BASE_PATH)
+                print("e2e suite=upgrade base=%s" % base, flush=True)
+                try:
+                    suite_upgrade(browser, base, cb)
+                finally:
+                    srv.stop()
             elif args.suite == "slice0":
                 for vp in vps:
                     if args.url:

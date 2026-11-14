@@ -4,10 +4,14 @@
 import { APP_VERSION } from './version.js';
 import {
   STORE_NAMES, DEVICE_KEYS, LIMITS, SNAPSHOT_REASONS, validateBackup, validateSnapshotRow, validateBlock, migrate,
-  buildBackup, repPairOk, markerOk, lineOk, textOk, minOf, maxOf, MUSCLES, EQUIPMENT
+  MIGRATIONS, buildBackup, repPairOk, markerOk, lineOk, textOk, minOf, maxOf, MUSCLES, EQUIPMENT, SET_KINDS, exerciseDefaults2
 } from './backup.js';
 import { SEED_EXERCISES, SEED_IDS } from './data/exercises.js';
 import { t } from './ui/strings.js';
+// The rules engine (16 B.4): store.js is the only shipped file that imports engine.js and rules.js;
+// the screens reach the engine through store calls.
+import { RULES, RULES_BY_VERSION } from './rules.js';
+import { planDay, buildBlock, currentPosition, validateRules, applyLiveEdit, resizeBlock, feedbackDue, startingSets, stepFor, retargetOnLoad } from './engine.js';
 
 const ID_RE = /^[A-Za-z0-9:_-]{1,120}$/;
 const STALE_MS = 12 * 3600 * 1000;      // design number: the "Finish it?" card
@@ -15,6 +19,9 @@ const SINCE_MAX_MS = 3 * 3600 * 1000;   // design number: "Since last set" hides
 const KEEP_SNAPSHOTS = 3;
 const NOTE_MS = 60 * 1000;              // a restore note older than this is dropped unseen (A3-R8)
 const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+// The muscle key of an exercise (16 B.3 shared terms): the finer value when there is one. A
+// feedback row carries it from Slice 2 on (B.4.4).
+const muscleKeyOf = (ex) => (ex ? (ex.muscle_detail || ex.muscle) : 'core');
 
 // The exercise as this block uses it (R4-04, R4-06, R4-15, r4.1 Q14, Q18). One function, read by
 // every reader. A block entry screens the exercise (flags_set true) and its guard flags and
@@ -62,7 +69,7 @@ export function capOrder(order, sets) {
 // A block row always holds every r4 lift and check field, so a backup and a restore give
 // back the same rows (R4-04: missing means the Slice 1 behavior).
 function fullTemplates(dts) {
-  return dts.map(d => ({ ...d, lifts: d.lifts.map(l => ({ short_note: '', goal_line: '', ...l, warmups: l.warmups || [] })) }));
+  return dts.map(d => ({ ...d, lifts: d.lifts.map(l => ({ short_note: '', goal_line: '', set_type: 'normal', ...l, warmups: l.warmups || [] })) }));
 }
 const fullChecks = (cks) => (cks || []).map(c => ({ ...c, lifts: c.lifts === undefined ? null : c.lifts }));
 
@@ -115,7 +122,7 @@ export function dayTotalsOf(sets) {
   for (const sl of slots) {
     const rows = sets.filter(s => s.slot === sl);
     if (rows.some(s => s.status === 'done')) exDone++;
-    else if (!rows.some(s => s.status === 'skipped' && s.why === 'Swapped by you')) exSkipped++;
+    else if (!rows.some(s => s.status === 'skipped' && s.why === 'why.swapped')) exSkipped++;
   }
   return { workDone: sets.filter(s => s.kind === 'work' && s.status === 'done').length, exDone, exSkipped };
 }
@@ -135,10 +142,39 @@ export function localDate(ms) {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
 
+// The profile a block plans on now (16 B.2 note 1, review R11): its frozen profile, read as
+// 'fixed' while the local date is before 2026-12-01 or the switch time is still ahead, so a
+// restored file can never plan Adjust each round early. A rule table that fails validateRules
+// plans every block as Fixed (B.2 note 5).
+const ADJUST_FIRST_DATE = '2026-12-01';
+const RULES_OK = validateRules(RULES).ok;
+export function profileFor(block, nowMs, rulesOk = RULES_OK) {
+  const rf = block && block.rules_frozen;
+  if (!rf || rf.profile !== 'adaptive' || !rulesOk) return 'fixed';
+  if (localDate(nowMs) < ADJUST_FIRST_DATE) return 'fixed';
+  const ps = block.profile_switch;
+  if (!ps || ps.back_at !== null || !(ps.switched_at <= nowMs)) return 'fixed';
+  return 'adaptive';
+}
+// The profile table every engine function takes. 'none' and 'signed-1' both read the signed-1
+// table: a block freezes a version name, never a copy of the table (B.2 note 1).
+export function rulesFor(block, nowMs, rulesOk = RULES_OK) {
+  return RULES_BY_VERSION['signed-1'].profiles[profileFor(block, nowMs, rulesOk)];
+}
+
+// The day's card order from its template (16 B.3.13 move with Rest of block): the template's
+// lift order when it is not slot number order, else null (slot number order).
+function templateOrder(tpl, slots) {
+  const order = tpl.lifts.map(l => l.slot).filter(sl => !slots || slots.has(sl));
+  return order.every((sl, i) => i === 0 || order[i - 1] < sl) ? null : order;
+}
+
 const dayId = (blockId, pass, day) => blockId + ':p' + pass + ':d' + day;
-const newDay = (id, blockId, pass, day, label) => ({
+const newDay = (id, blockId, pass, day, label, profile) => ({
   id, block_id: blockId, pass, day, label, status: 'planned', started_at: null, done_at: null, done_date: null,
-  scores: {}, notes: '', saved_at: null, slot_order: null
+  scores: {}, notes: '', saved_at: null, slot_order: null,
+  // Schema 2 (16 B.6.1): no sleep answer yet, the profile that planned the day, no body weight.
+  short_sleep_since_last: null, profile: profile || 'fixed', body_weight: null
 });
 const sideOrder = { L: 0, R: 1, none: 2 };
 export function setOrder(a, b) {
@@ -169,6 +205,10 @@ export function createStore(opts) {
   const clearTimer = opts.clearTimer || ((h) => clearTimeout(h));
   const uuid = opts.uuid || (() => globalThis.crypto.randomUUID());
   const LIMIT_MS = opts.writeLimitMs || 4000;
+  // validateRules ran at load on both profiles (16 B.2 note 5); a test may say it failed.
+  const RULES_OK_HERE = opts.rulesOk === undefined ? RULES_OK : opts.rulesOk === true;
+  const profileOf = (b, t) => profileFor(b, t, RULES_OK_HERE);
+  const rulesOf = (b, t) => rulesFor(b, t, RULES_OK_HERE);
   // The read and plan part of a whole-database job ends within this, or the job ends as Not saved (SB4).
   const READ_LIMIT_MS = opts.readLimitMs || 2 * LIMIT_MS;
   const listeners = new Set();
@@ -178,6 +218,20 @@ export function createStore(opts) {
   let gate = Promise.resolve();
   let pending = 0;                 // writes started and not yet settled (store.busy)
   const idleWaiters = [];
+
+  // The version 2 upgrade hook (16 B.6.2), handed to db.js before the first open: db.js reads the
+  // schema 1 stores inside its upgrade transaction and calls this once. It returns the
+  // before-upgrade safety copy (the same row shape as every other copy; its data is the schema 1
+  // backup object, schema 1) and the stores after MIGRATIONS[1]. A throw aborts the upgrade.
+  function upgradeFrom1(stores) {
+    const t = now();
+    const data = { ...buildBackup(stores, { now: t, appVersion: APP_VERSION }), schema: 1 };
+    delete data.flat_log;
+    const mark = (stores.settings || []).find(r => r && r.key === 'last_backup_at');
+    const snapshot = { id: 's' + t, made_at: t, reason: 'before-upgrade', last_backup_at_then: mark && mark.value !== undefined ? mark.value : null, data };
+    return { snapshot, stores2: MIGRATIONS[1](stores) };
+  }
+  if (typeof db.setUpgradeHook === 'function') db.setUpgradeHook(upgradeFrom1);
 
   const changed = () => { for (const fn of listeners) { try { fn(); } catch (_) { /* a screen error never stops a save */ } } };
 
@@ -342,9 +396,10 @@ export function createStore(opts) {
     if (open) return open;
     const block = await activeBlock();
     if (!block) return null;
-    const days = (await db.byIndex('days', 'block_id', block.id)).filter(d => d.status === 'planned');
-    days.sort((a, b) => a.pass - b.pass || a.day - b.day);
-    return days[0] || null;
+    // The engine picks the day (16 B.3.15): the block's open day, else its first planned day.
+    const days = await db.byIndex('days', 'block_id', block.id);
+    const id = currentPosition(block, days);
+    return days.find(d => d.id === id) || null;
   }
 
   async function dayView(id) {
@@ -353,28 +408,16 @@ export function createStore(opts) {
     const block = await db.get('blocks', day.block_id);
     const sets = (await db.byIndex('sets', 'day_id', id)).sort(setOrder);
     const feedback = await db.byIndex('feedback', 'day_id', id);
-    return { day, block, sets, feedback, exercises: await exercisesMap(), slots: slotsInOrder(day, sets) };
+    // Slice 2 (16 B.5): the profile the day is shown on, its rule table (the steppers read its
+    // default steps, B.1 step 7 a) and whether it is an easy round day (the Easy round pill, row 3).
+    const t0 = now();
+    const profile = block ? profileOf(block, t0) : 'fixed';
+    const rules = block ? rulesOf(block, t0) : null;
+    const easy = !!rules && rules.easy_week.auto === true && typeof block.passes === 'number' && day.pass === block.passes;
+    return { day, block, sets, feedback, exercises: await exercisesMap(), slots: slotsInOrder(day, sets), profile, rules, easy };
   }
 
   // ---------------- planning ----------------
-
-  function planSets(dId, blockId, lift, origin, why) {
-    const sides = lift.sides === 'LR' ? ['L', 'R'] : ['none'];
-    const rows = [];
-    const base = (id, kind, n, side, target) => ({
-      id, day_id: dId, block_id: blockId, exercise_id: lift.exercise_id, slot: lift.slot, set_n: n, side, kind, target,
-      draft: null, done: null, status: 'planned', origin, saved_at: null, first_done_at: null, why
-    });
-    lift.warmups.forEach((w, i) => {
-      for (const s of sides) rows.push(base(dId + ':x' + lift.slot + ':w' + (i + 1) + ':' + s, 'warmup', i + 1, s,
-        { load: w.load, rep_low: w.reps, rep_high: w.reps, load_basis: lift.load_basis, count_label: lift.count_label, reps_left_target: null }));
-    });
-    for (let n = 1; n <= lift.sets; n++) {
-      for (const s of sides) rows.push(base(dId + ':x' + lift.slot + ':s' + n + ':' + s, 'work', n, s,
-        { load: lift.start_load, rep_low: lift.rep_low, rep_high: lift.rep_high, load_basis: lift.load_basis, count_label: lift.count_label, reps_left_target: lift.reps_left_target }));
-    }
-    return rows;
-  }
 
   // The weight a set shows: its draft load, else its target load.
   const shownLoad = (x) => (x.draft && x.draft.load !== null && x.draft.load !== undefined) ? x.draft.load : x.target.load;
@@ -382,17 +425,76 @@ export function createStore(opts) {
   const copiedDraft = (load) => ({ load, reps: null, reps_left: null, reps_left_plus: false, failure: false, from_copy: true, breaks: null });
 
   // The write guard (M16): only a planned set with no done and no draft may be written by planning.
+  // Planning also never writes a row he added and never a kind he picked by hand (16 B.4.2).
   const writable = (s) => s.status === 'planned' && s.done === null && s.draft === null;
 
-  // Ops that (re)plan one day of a block. A day that is not planned is never touched.
+  // Rows this write puts or deletes, laid over what the database holds, so a plan built in the
+  // same batch as a Finish day or a sleep answer reads the rows as that batch leaves them.
+  function overlayOf(ops) {
+    const puts = new Map(), dels = new Set();
+    for (const o of ops || []) {
+      const k = o.store + '\u0000' + ('put' in o ? (o.store === 'settings' ? o.put.key : o.put.id) : o.del);
+      if ('put' in o) { puts.set(k, o.put); dels.delete(k); } else { dels.add(k); puts.delete(k); }
+    }
+    const lay = (store, rows, keep) => {
+      const out = new Map(rows.map(r => [r.id, r]));
+      for (const id of [...out.keys()]) if (dels.has(store + '\u0000' + id)) out.delete(id);
+      for (const [k, r] of puts) if (k.startsWith(store + '\u0000') && keep(r)) out.set(r.id, r);
+      return [...out.values()];
+    };
+    return { lay, get: (store, id) => (puts.has(store + '\u0000' + id) ? puts.get(store + '\u0000' + id) : dels.has(store + '\u0000' + id) ? null : undefined) };
+  }
+
+  // The block's history for planDay (16 B.3.9): its days, sets and feedback, and every exercise
+  // row as it is (the engine applies the block's exercise_flags itself, B.1 step 5).
+  async function historyOf(block, ov) {
+    const days = ov.lay('days', await db.byIndex('days', 'block_id', block.id), r => r.block_id === block.id);
+    const sets = ov.lay('sets', await db.byIndex('sets', 'block_id', block.id), r => r.block_id === block.id);
+    const ids = new Set(days.map(d => d.id));
+    const fb = [];
+    for (const d of days) fb.push(...await db.byIndex('feedback', 'day_id', d.id));
+    const feedback = ov.lay('feedback', fb, r => ids.has(r.day_id));
+    const exercises = new Map(ov.lay('exercises', await db.all('exercises'), () => true).map(r => [r.id, r]));
+    return { days, sets, feedback, exercises };
+  }
+
+  // A row from planDay with the schema 2 fields the store writes (16 B.3.9, r4.1 Q20): the day's
+  // failure set takes set_type 'failure' and target.failure_set true, the ceiling sets
+  // target.effort_only true; planning never picks a kind by hand and never writes an add scope.
+  function plannedRow(row, note) {
+    const work = row.kind === 'work';
+    const fail = work && !!note && note.failure_set_n === row.set_n;
+    const effortOnly = work && !!note && Array.isArray(note.effort_only_set_n) && note.effort_only_set_n.includes(row.set_n);
+    return { ...row, set_type: fail ? 'failure' : 'normal', set_type_by_hand: false, add_scope: null,
+      target: { ...row.target, failure_set: fail, effort_only: effortOnly } };
+  }
+
+  // The id number part of a set id: the letter ('s' work, 'w' warm-up), the number, the side.
+  const ID_PART_RE = /:x\d+:([sw])(\d+):(L|R|none)$/;
+
+  // Ops that (re)plan one day of a block (16 B.4.1): planDay builds the rows from the block's
+  // history read inside the caller's queue or exclusive job; this is the one diff step, so it
+  // writes only what the guard allows. A day that is not planned is never touched. o.overlay:
+  // the ops of the same batch, read as already written.
   async function planDayOps(block, pass, dayN, opts2) {
+    const o = opts2 || {};
     const tpl = block.day_templates.find(d => d.day === dayN);
     if (!tpl) return [];
+    const ov = overlayOf(o.overlay);
     const id = dayId(block.id, pass, dayN);
-    const existing = await db.get('days', id);
+    const laid = ov.get('days', id);
+    const existing = laid === undefined ? ((await db.get('days', id)) || null) : laid;
     if (existing && existing.status !== 'planned') return [];
-    const old = existing ? await db.byIndex('sets', 'day_id', id) : [];
-    if (opts2 && opts2.wholeDayGuard && old.some(s => s.status === 'planned' && s.draft !== null)) return null;
+    const old = existing ? ov.lay('sets', await db.byIndex('sets', 'day_id', id), r => r.day_id === id) : [];
+    if (o.wholeDayGuard && old.some(s => s.status === 'planned' && s.draft !== null)) return null;
+    const t = now();
+    const profile = profileOf(block, t);
+    const history = await historyOf(block, ov);
+    // planDay reads the day row as this batch leaves it (its own sleep answer, review R6).
+    if (existing && !history.days.some(d => d.id === id)) history.days.push(existing);
+    const plan = planDay(RULES_BY_VERSION['signed-1'].profiles[profile], block, history, { pass, day: dayN });
+    // planDay output for a day not planned (or past the block) is dropped before any write.
+    if (!plan.day) return [];
     const ops = [];
     const oldById = new Map(old.map(s => [s.id, s]));
     // A slot that holds only his own rows (a swap) is his; a new plan lift never takes it (C4).
@@ -401,32 +503,73 @@ export function createStore(opts) {
     const want = new Set();
     for (const lift of tpl.lifts) {
       if (swapSlots.has(lift.slot)) continue;
-      for (const row of planSets(id, block.id, lift, 'plan', 'As written on your block')) {
-        want.add(row.id);
-        const was = oldById.get(row.id);
-        if (was && (!writable(was) || was.origin === 'added')) continue;
-        ops.push({ store: 'sets', put: row });
+      const note = plan.notes.find(n => n.slot === lift.slot) || null;
+      const rows = plan.sets.filter(r => r.slot === lift.slot).map(r => plannedRow(r, note));
+      const slotOld = old.filter(s => s.slot === lift.slot);
+      // R15 (r4 review, r4.1 Q26): plan rows take set_n 1 to N by position; a plan row whose
+      // position id is held by a row he added takes another id (an old plan row of the slot
+      // that the new plan no longer holds, else the next free number by the 5.2 id rule), so no
+      // planned set is dropped; his added rows keep their order after the plan rows, set_n N+1
+      // and up, in the same batch.
+      const planIds = new Set(rows.map(r => r.id));
+      const claimed = new Set();
+      for (const r of rows) {
+        const held = oldById.get(r.id);
+        if (held && held.origin === 'added') {
+          const m = ID_PART_RE.exec(r.id);
+          const spare = slotOld.find(x => x.origin === 'plan' && x.kind === r.kind && x.side === r.side && !planIds.has(x.id) && !claimed.has(x.id) && ID_PART_RE.exec(x.id)[1] === m[1]);
+          let nid;
+          if (spare) nid = spare.id;
+          else {
+            const used = [...slotOld, ...rows.map(x => ({ id: x.id })), ...[...claimed].map(x => ({ id: x }))];
+            nid = id + ':x' + lift.slot + ':' + m[1] + nextIdNum(used, m[1]) + ':' + r.side;
+            // The L and R rows of one set share one number.
+            const twin = rows.find(x => x !== r && x.kind === r.kind && x.set_n === r.set_n && x.id !== r.id && claimed.has(x.id));
+            if (twin) nid = twin.id.replace(/:(L|R|none)$/, ':' + r.side);
+          }
+          claimed.add(nid);
+          r.id = nid;
+        }
+      }
+      for (const r of rows) {
+        want.add(r.id);
+        const was = oldById.get(r.id);
+        if (was && (!writable(was) || was.origin === 'added' || was.set_type_by_hand === true)) continue;
+        ops.push({ store: 'sets', put: r });
+      }
+      // His added rows go after the plan rows, in their order (only their set_n changes).
+      for (const kind of ['warmup', 'work']) {
+        const top = maxOf(rows.filter(r => r.kind === kind).map(r => r.set_n));
+        let n = top === null ? 0 : top;
+        const added = slotOld.filter(s => s.origin === 'added' && s.kind === kind).sort(setOrder);
+        const byN = new Map();
+        for (const s of added) {
+          if (!byN.has(s.set_n)) byN.set(s.set_n, ++n);
+          const to = byN.get(s.set_n);
+          if (s.set_n !== to) ops.push({ store: 'sets', put: { ...s, set_n: to } });
+        }
       }
     }
     // A planned set from the old plan that the new plan no longer holds goes away.
-    for (const s of old) if (!want.has(s.id) && s.origin === 'plan' && writable(s)) ops.push({ store: 'sets', del: s.id });
+    for (const s of old) if (!want.has(s.id) && s.origin === 'plan' && writable(s) && s.set_type_by_hand !== true) ops.push({ store: 'sets', del: s.id });
     if (!existing) {
-      ops.unshift({ store: 'days', put: newDay(id, block.id, pass, dayN, tpl.label) });
+      ops.unshift({ store: 'days', put: { ...newDay(id, block.id, pass, dayN, tpl.label, profile), slot_order: templateOrder(tpl) } });
       return ops;
     }
     // The card order keeps only the slots that still hold a set after these ops (review P8):
     // a Move up or down, then a block update that drops that lift, must never leave the day
     // naming a slot with no set, or every later backup and safety copy is refused.
-    const gone = new Set(ops.filter(o => 'del' in o).map(o => o.del));
+    const gone = new Set(ops.filter(x => 'del' in x).map(x => x.del));
     const slots = new Set(old.filter(s => !gone.has(s.id)).map(s => s.slot));
-    for (const o of ops) if ('put' in o) slots.add(o.put.slot);
-    const kept = Array.isArray(existing.slot_order) ? existing.slot_order.filter(sl => slots.has(sl)) : null;
+    for (const x of ops) if ('put' in x) slots.add(x.put.slot);
+    // A Rest of block move gives the day the template's order (o.templateOrder, 16 B.3.13).
+    const kept = o.templateOrder ? templateOrder(tpl, slots) : Array.isArray(existing.slot_order) ? existing.slot_order.filter(sl => slots.has(sl)) : null;
     const order = kept && kept.length ? kept : null;
     const sameOrder = JSON.stringify(order) === JSON.stringify(existing.slot_order === undefined ? null : existing.slot_order);
-    if (existing.label !== tpl.label || !sameOrder) ops.unshift({ store: 'days', put: { ...existing, label: tpl.label, slot_order: order } });
+    if (existing.label !== tpl.label || !sameOrder || existing.profile !== profile) ops.unshift({ store: 'days', put: { ...existing, label: tpl.label, slot_order: order, profile } });
     // A feedback row on a slot that no longer holds a set goes too, in the same ops (SB5): a
     // pending row with no set would hold Finish day on a sheet that has nothing to ask.
-    for (const f of await db.byIndex('feedback', 'day_id', id)) {
+    for (const f of ov.lay('feedback', await db.byIndex('feedback', 'day_id', id), r => r.day_id === id)) {
       if (!slots.has(Number(String(f.id).split(':x').pop()))) ops.push({ store: 'feedback', del: f.id });
     }
     return ops;
@@ -440,14 +583,16 @@ export function createStore(opts) {
     return { pass: pass + 1, day: days[0] };
   }
 
+  // A new block row (16 B.3.11): engine.buildBlock gives the Fixed profile, its frozen rules
+  // name and no switch, whatever the spec says; the store adds the r4 lift and check fields and
+  // the schema 2 words a block file may carry.
   function blockRow(spec, t) {
+    const b = buildBlock(RULES, { ...spec, created_at: t, checks: fullChecks(spec.checks), day_templates: fullTemplates(spec.day_templates) });
+    const fq = spec.flag_questions || {};
     return {
-      id: spec.id, source_id: spec.source_id || null, version: spec.version || null, id_map: spec.id_map || {},
-      name: spec.name || '', created_at: t, unit: spec.unit || 'lb', profile: 'fixed',
-      rules_frozen: { profile: 'fixed', rules_version: 'none' }, passes: spec.passes === undefined ? null : spec.passes,
-      notes: spec.notes || '', checks: fullChecks(spec.checks), scores: spec.scores || [],
-      rule_notes: spec.rule_notes || { one_failure_set: '', failure_on_machine: '' },
-      exercise_flags: spec.exercise_flags || {}, day_templates: fullTemplates(spec.day_templates), status: 'active'
+      ...b, sleep_hint: spec.sleep_hint || '',
+      flag_questions: { machine: fq.machine || '', no_added_sets: fq.no_added_sets || '', left_out_of_builder: fq.left_out_of_builder || '' },
+      template_id: null, copied_from: null, finished_at: null
     };
   }
 
@@ -486,10 +631,15 @@ export function createStore(opts) {
     const block = blockRow(spec, o.t);
     if (!String(block.name).trim()) block.name = defaultBlockName(blocks.filter(b => b.id !== block.id));
     const ops = [...(extraOps || []), { store: 'blocks', put: block }];
+    // Round 1 is planned in full at create (16 B.4.1), through planDay; the history is empty, so
+    // only the exercise rows are read (the caller reads them inside its own queue or job).
+    const profile = profileOf(block, o.t);
+    const history = { days: [], sets: [], feedback: [], exercises: o.exercises };
     for (const d of block.day_templates) {
       const id = dayId(block.id, 1, d.day);
-      ops.push({ store: 'days', put: newDay(id, block.id, 1, d.day, d.label) });
-      for (const lift of d.lifts) for (const r of planSets(id, block.id, lift, 'plan', 'As written on your block')) ops.push({ store: 'sets', put: r });
+      const plan = planDay(RULES_BY_VERSION['signed-1'].profiles[profile], block, history, { pass: 1, day: d.day });
+      ops.push({ store: 'days', put: { ...newDay(id, block.id, 1, d.day, d.label, profile), slot_order: templateOrder(d) } });
+      for (const r of plan.sets) ops.push({ store: 'sets', put: plannedRow(r, plan.notes.find(n => n.slot === r.slot)) });
     }
     if (o.activate) ops.push({ store: 'settings', put: { key: 'active_block_id', value: block.id } });
     return { block, ops };
@@ -504,7 +654,7 @@ export function createStore(opts) {
     let block = null;
     // The blocks read for a blank name runs inside the block write (15 Part 2).
     await queued('block', async () => {
-      const r = newBlockOps(full, extraOps, await db.all('blocks'), { t, activate: true });
+      const r = newBlockOps(full, extraOps, await db.all('blocks'), { t, activate: true, exercises: await exercisesMap() });
       block = r.block;
       return batch(r.ops);
     });
@@ -618,7 +768,7 @@ export function createStore(opts) {
 
   // Skip set: the open row (the first set still planned) becomes skipped.
   async function skipSet(dId, slot) {
-    const ids = await markSkipped(dId, slot, (sets) => { const o = sets.find(s => s.status === 'planned'); return o ? [o] : []; }, 'Skipped by you');
+    const ids = await markSkipped(dId, slot, (sets) => { const o = sets.find(s => s.status === 'planned'); return o ? [o] : []; }, 'why.skipped');
     return ids[0] || null;
   }
 
@@ -627,18 +777,18 @@ export function createStore(opts) {
     await queued(setKey(setId), async () => {
       const s = await getSet(setId);
       if (s.status !== 'skipped') { row = s; return undefined; }
-      row = { ...s, status: 'planned', why: s.origin === 'added' ? 'Added by you' : 'As written on your block', saved_at: now() };
+      row = { ...s, status: 'planned', why: s.origin === 'added' ? 'why.added' : 'why.plan', saved_at: now() };
       return batch([{ store: 'sets', put: row }]);
     });
     return row;
   }
 
   async function skipExercise(dId, slot) {
-    return (await markSkipped(dId, slot, (sets) => sets.filter(s => s.status !== 'done' && s.status !== 'skipped'), 'Skipped by you')).length;
+    return (await markSkipped(dId, slot, (sets) => sets.filter(s => s.status !== 'done' && s.status !== 'skipped'), 'why.skipped')).length;
   }
 
   async function stopExercise(dId, slot) {
-    return (await markSkipped(dId, slot, (sets) => sets.filter(s => s.status === 'planned'), 'Stopped by a block check')).length;
+    return (await markSkipped(dId, slot, (sets) => sets.filter(s => s.status === 'planned'), 'why.stopped')).length;
   }
 
   // An exercise this block marks no_added_sets never gains a set (15 Part 9, same rule as Add set).
@@ -648,32 +798,42 @@ export function createStore(opts) {
   }
 
   // A new set row; its id must not exist yet (R12).
-  function addedRow(sets, base, id, n, side, kind, target, t) {
+  function addedRow(sets, base, id, n, side, kind, target, t, scope) {
     if (sets.some(x => x.id === id)) throw new Refused('id in use');
     return { store: 'sets', put: {
       id, day_id: base.day_id, block_id: base.block_id, exercise_id: base.exercise_id, slot: base.slot, set_n: n, side, kind,
-      target: { ...target }, draft: null, done: null, status: 'planned', origin: 'added', saved_at: t, first_done_at: null, why: 'Added by you'
+      // Schema 2 (16 B.1 step 5 R4 b): a Today only add of the Work kind, never a planned failure
+      // goal and never an effort-only goal of its own.
+      target: { ...target, failure_set: false, effort_only: false }, draft: null, done: null, status: 'planned', origin: 'added', saved_at: t, first_done_at: null, why: 'why.added',
+      set_type: 'normal', set_type_by_hand: false, add_scope: scope || 'today'
     } };
+  }
+
+  // The op builder of Add set (16 B.4.8): every read inside the caller's queue or exclusive job,
+  // no queue of its own, so the Today only path and the Rest of block path share it. prev: the
+  // ids an earlier try of the same tap added; null when they are all there (a late commit, P9).
+  async function addSetOps(dId, slot, scope, prev) {
+    const sets = await slotSets(dId, slot);
+    if (prev.length && prev.every(id => sets.some(x => x.id === id))) return null;
+    const work = sets.filter(s => s.kind === 'work');
+    const last = work[work.length - 1] || sets[sets.length - 1];
+    if (!last) throw new Refused('no slot');
+    await refuseNoAdd(last);
+    const top = maxOf(work.map(s => s.set_n));
+    const n = (top !== null && top > 0 ? top : 0) + 1;
+    // Never a set number the restore would refuse (SR8).
+    if (n > LIMITS.SET_N_MAX) throw new Refused('no set');
+    const k = nextIdNum(sets, 's');
+    const sides = last.side === 'none' ? ['none'] : ['L', 'R'];
+    const t = now();
+    return sides.map(side => addedRow(sets, last, dId + ':x' + slot + ':s' + k + ':' + side, n, side, 'work', last.target, t, scope));
   }
 
   async function addSet(dId, slot) {
     let ids = [];
     await queued(dayKey(dId), async () => {
-      const sets = await slotSets(dId, slot);
-      // A retry after a late first commit: the rows the first try added are there (P9).
-      if (ids.length && ids.every(id => sets.some(x => x.id === id))) return undefined;
-      const work = sets.filter(s => s.kind === 'work');
-      const last = work[work.length - 1] || sets[sets.length - 1];
-      if (!last) throw new Refused('no slot');
-      await refuseNoAdd(last);
-      const top = maxOf(work.map(s => s.set_n));
-      const n = (top !== null && top > 0 ? top : 0) + 1;
-      // Never a set number the restore would refuse (SR8).
-      if (n > LIMITS.SET_N_MAX) throw new Refused('no set');
-      const k = nextIdNum(sets, 's');
-      const sides = last.side === 'none' ? ['none'] : ['L', 'R'];
-      const t = now();
-      const ops = sides.map(side => addedRow(sets, last, dId + ':x' + slot + ':s' + k + ':' + side, n, side, 'work', last.target, t));
+      const ops = await addSetOps(dId, slot, 'today', ids);
+      if (!ops) return undefined;
       ids = ops.map(o => o.put.id);
       return batch(ops);
     });
@@ -738,79 +898,107 @@ export function createStore(opts) {
 
   // Move an exercise today (15 Part 11): writes days.slot_order from a fresh read (null =
   // slot number order). Never changes slots, set ids or the block. Planned or open day only.
+  // The op builder of Move (16 B.4.8): reads inside the caller's queue or job. prev: the order an
+  // earlier try wrote; null when it is already there (a late commit, P9: a second run swaps it back).
+  async function moveOps(dId, slot, dir, prev) {
+    const day = await db.get('days', dId);
+    if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
+    if (prev && JSON.stringify(day.slot_order) === JSON.stringify(prev)) return null;
+    const daySets = await db.byIndex('sets', 'day_id', dId);
+    const cur = slotsInOrder(day, daySets);
+    const i = cur.indexOf(slot);
+    const j = i + (dir < 0 ? -1 : 1);
+    if (i < 0 || j < 0 || j >= cur.length) throw new Refused('cannot move');
+    [cur[i], cur[j]] = [cur[j], cur[i]];
+    const order = capOrder(cur, daySets);
+    return { order, ops: [{ store: 'days', put: { ...day, slot_order: order, saved_at: now() } }] };
+  }
+
   async function moveSlot(dId, slot, dir) {
     let order = null;
     await queued(dayKey(dId), async () => {
-      const day = await db.get('days', dId);
-      if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
-      // A retry after a late first commit: the order is already the one the first try wrote, and
-      // a second run would swap it back (P9).
-      if (order && JSON.stringify(day.slot_order) === JSON.stringify(order)) return undefined;
-      const daySets = await db.byIndex('sets', 'day_id', dId);
-      const cur = slotsInOrder(day, daySets);
-      const i = cur.indexOf(slot);
-      const j = i + (dir < 0 ? -1 : 1);
-      if (i < 0 || j < 0 || j >= cur.length) throw new Refused('cannot move');
-      [cur[i], cur[j]] = [cur[j], cur[i]];
-      order = capOrder(cur, daySets);
-      return batch([{ store: 'days', put: { ...day, slot_order: order, saved_at: now() } }]);
+      const r = await moveOps(dId, slot, dir, order);
+      if (!r) return undefined;
+      order = r.order;
+      return batch(r.ops);
     });
     return order;
   }
 
   // Swap (today only): a NEW slot for the new exercise; the old slot keeps its done sets.
+  // The op builder of Swap (16 B.4.8): reads inside the caller's queue or job. prevSlot: the slot an
+  // earlier try made; null when that card is there already (a late commit, P9).
+  async function swapOps(dId, slot, newExerciseId, prevSlot) {
+    const all = await db.byIndex('sets', 'day_id', dId);
+    // A retry after a late first commit: the new card is there, so a second one is never made (P9).
+    if (prevSlot !== null && all.some(s => s.slot === prevSlot && s.origin === 'added')) return null;
+    const old = all.filter(s => s.slot === slot).sort(setOrder);
+    const fbs = await db.byIndex('feedback', 'day_id', dId);
+    // Only a whole slot number above 0 counts (SR9, belt and braces behind the validator).
+    const used = new Set([...all.map(s => s.slot), ...fbs.map(f => Number(f.id.split(':x').pop())).filter(n => Number.isInteger(n) && n > 0)]);
+    const topSlot = maxOf([...used]);
+    let newSlot = (topSlot !== null && topSlot > 0 ? topSlot : 0) + 1;
+    while (used.has(newSlot)) newSlot++;
+    // Never a slot the restore would refuse (SR8).
+    if (newSlot > LIMITS.SLOT_MAX) throw new Refused('no slot');
+    const left = old.filter(s => s.status === 'planned' && s.kind === 'work');
+    const tmpl = left[0] || old.filter(s => s.kind === 'work').pop() || old[0];
+    if (!tmpl) throw new Refused('no slot');
+    const count = Math.max(1, new Set(left.map(s => s.set_n)).size);
+    const sides = tmpl.side === 'none' ? ['none'] : ['L', 'R'];
+    const t = now();
+    const ops = [];
+    for (let n = 1; n <= count; n++) for (const side of sides) ops.push({ store: 'sets', put: {
+      id: dId + ':x' + newSlot + ':s' + n + ':' + side, day_id: dId, block_id: tmpl.block_id, exercise_id: newExerciseId,
+      slot: newSlot, set_n: n, side, kind: 'work', target: { ...tmpl.target, load: null, failure_set: false, effort_only: false }, draft: null, done: null,
+      status: 'planned', origin: 'added', saved_at: t, first_done_at: null, why: 'why.swapped',
+      set_type: 'normal', set_type_by_hand: false, add_scope: 'today'
+    } });
+    for (const s of old.filter(x => x.status === 'planned')) ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'why.swapped', draft: null, saved_at: t } });
+    // The new exercise takes the old one's place in the card order; the old card goes after
+    // the listed ones (A1-5). Same write as the sets, so the order never lags the swap.
+    const day = await db.get('days', dId);
+    // The cap reads the sets as this write leaves them (the old slot's planned sets now skipped).
+    const after = [...all.map(s => (s.slot === slot && s.status === 'planned' ? { ...s, status: 'skipped' } : s)), ...ops.filter(o => o.store === 'sets' && o.put.slot === newSlot).map(o => o.put)];
+    if (day) ops.push({ store: 'days', put: { ...day, slot_order: capOrder(slotsInOrder(day, all).map(sl => (sl === slot ? newSlot : sl)), after), saved_at: t } });
+    return { newSlot, ops };
+  }
+
   async function swapExercise(dId, slot, newExerciseId) {
     let newSlot = null;
     await queued(dayKey(dId), async () => {
-      const all = await db.byIndex('sets', 'day_id', dId);
-      // A retry after a late first commit: the new card is there, so a second one is never made (P9).
-      if (newSlot !== null && all.some(s => s.slot === newSlot && s.origin === 'added')) return undefined;
-      const old = all.filter(s => s.slot === slot).sort(setOrder);
-      const fbs = await db.byIndex('feedback', 'day_id', dId);
-      // Only a whole slot number above 0 counts (SR9, belt and braces behind the validator).
-      const used = new Set([...all.map(s => s.slot), ...fbs.map(f => Number(f.id.split(':x').pop())).filter(n => Number.isInteger(n) && n > 0)]);
-      const topSlot = maxOf([...used]);
-      newSlot = (topSlot !== null && topSlot > 0 ? topSlot : 0) + 1;
-      while (used.has(newSlot)) newSlot++;
-      // Never a slot the restore would refuse (SR8).
-      if (newSlot > LIMITS.SLOT_MAX) throw new Refused('no slot');
-      const left = old.filter(s => s.status === 'planned' && s.kind === 'work');
-      const tmpl = left[0] || old.filter(s => s.kind === 'work').pop() || old[0];
-      if (!tmpl) throw new Refused('no slot');
-      const count = Math.max(1, new Set(left.map(s => s.set_n)).size);
-      const sides = tmpl.side === 'none' ? ['none'] : ['L', 'R'];
-      const t = now();
-      const ops = [];
-      for (let n = 1; n <= count; n++) for (const side of sides) ops.push({ store: 'sets', put: {
-        id: dId + ':x' + newSlot + ':s' + n + ':' + side, day_id: dId, block_id: tmpl.block_id, exercise_id: newExerciseId,
-        slot: newSlot, set_n: n, side, kind: 'work', target: { ...tmpl.target, load: null }, draft: null, done: null,
-        status: 'planned', origin: 'added', saved_at: t, first_done_at: null, why: 'Swapped by you'
-      } });
-      for (const s of old.filter(x => x.status === 'planned')) ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'Swapped by you', draft: null, saved_at: t } });
-      // The new exercise takes the old one's place in the card order; the old card goes after
-      // the listed ones (A1-5). Same write as the sets, so the order never lags the swap.
-      const day = await db.get('days', dId);
-      // The cap reads the sets as this write leaves them (the old slot's planned sets now skipped).
-      const after = [...all.map(s => (s.slot === slot && s.status === 'planned' ? { ...s, status: 'skipped' } : s)), ...ops.filter(o => o.store === 'sets' && o.put.slot === newSlot).map(o => o.put)];
-      if (day) ops.push({ store: 'days', put: { ...day, slot_order: capOrder(slotsInOrder(day, all).map(sl => (sl === slot ? newSlot : sl)), after), saved_at: t } });
-      return batch(ops);
+      const r = await swapOps(dId, slot, newExerciseId, newSlot);
+      if (!r) return undefined;
+      newSlot = r.newSlot;
+      return batch(r.ops);
     });
     return newSlot;
   }
 
   // Relabel a day (15 Part 1): today only, on a planned or open day. The label is trimmed;
   // an empty label is a real choice and shows the numbered name.
-  async function relabelDay(dId, label) {
+  const labelOf = (label) => {
     const v = String(label === null || label === undefined ? '' : label).trim();
     // The one line rule of backup.js (P.4 item 1, SR5, SR6).
     if (!lineOk(v, LIMITS.LABEL)) throw new Refused('bad label');
+    return v;
+  };
+  // The op builder of Relabel day (16 B.4.8): reads inside the caller's queue or job.
+  async function relabelOps(dId, v) {
+    const day = await db.get('days', dId);
+    if (!day) throw new Refused('no such day');
+    if (day.status !== 'planned' && day.status !== 'open') throw new Refused('day is not open');
+    const row = { ...day, label: v, saved_at: now() };
+    return { row, ops: [{ store: 'days', put: row }] };
+  }
+
+  async function relabelDay(dId, label) {
+    const v = labelOf(label);
     let row = null;
     await queued(dayKey(dId), async () => {
-      const day = await db.get('days', dId);
-      if (!day) throw new Refused('no such day');
-      if (day.status !== 'planned' && day.status !== 'open') throw new Refused('day is not open');
-      row = { ...day, label: v, saved_at: now() };
-      return batch([{ store: 'days', put: row }]);
+      const r = await relabelOps(dId, v);
+      row = r.row;
+      return batch(r.ops);
     });
     return row;
   }
@@ -830,9 +1018,12 @@ export function createStore(opts) {
       const was = await db.get('feedback', dId + ':x' + slot);
       const checks = { ...(pending ? {} : (a.checks || {})) };
       for (const [k, val] of Object.entries((was && was.checks) || {})) if (val === true) checks[k] = true;
+      // A soreness answer from the first tick sheet stays in the row (16 B.4.4): an end sheet that
+      // does not ask it (no soreness key) or Ask me later keeps it.
+      const sore = was ? was.soreness : null;
       row = {
-        id: dId + ':x' + slot, day_id: dId, exercise_id: sets[0].exercise_id, muscle: ex ? ex.muscle : 'core',
-        pump: pending ? null : (a.pump ?? null), soreness: pending ? null : (a.soreness ?? null), workload: pending ? null : (a.workload ?? null),
+        id: dId + ':x' + slot, day_id: dId, exercise_id: sets[0].exercise_id, muscle: muscleKeyOf(ex),
+        pump: pending ? null : (a.pump ?? null), soreness: pending || a.soreness === undefined ? sore : (a.soreness ?? null), workload: pending ? null : (a.workload ?? null),
         checks, note: pending ? '' : (a.note || ''), pending: !!pending, saved_at: now(), label_set: 'w1'
       };
       return batch([{ store: 'feedback', put: row }]);
@@ -862,12 +1053,80 @@ export function createStore(opts) {
         if (checks[k] !== true) checks[k] = v;
       }
       row = was ? { ...was, checks, saved_at: now() } : {
-        id, day_id: dId, exercise_id: sets[0].exercise_id, muscle: ex ? ex.muscle : 'core',
+        id, day_id: dId, exercise_id: sets[0].exercise_id, muscle: muscleKeyOf(ex),
         pump: null, soreness: null, workload: null, checks, note: '', pending: true, saved_at: now(), label_set: 'w1'
       };
       return batch([{ store: 'feedback', put: row }]);
     });
     return row;
+  }
+
+  // The soreness-alone sheet at the first saved tick (16 B.4.4, B.5 row 9): the answer goes into
+  // the slot's feedback row through the same merge, so it never clears a check, pump, workload or
+  // note; the row stays pending until the end sheet. In the day queue, like saveFeedback.
+  async function saveSoreness(dId, slot, value) {
+    if (!(value === null || (Number.isInteger(value) && value >= 1 && value <= 4))) throw new Refused('bad answer');
+    let row = null;
+    await queued(dayKey(dId), async () => {
+      const day = await db.get('days', checkId(dId));
+      if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
+      const sets = await slotSets(dId, slot);
+      if (!sets.length) throw new Refused('no slot');
+      const ex = (await exercisesMap()).get(sets[0].exercise_id);
+      const id = dId + ':x' + slot;
+      const was = await db.get('feedback', id);
+      row = was ? { ...was, soreness: value, saved_at: now() } : {
+        id, day_id: dId, exercise_id: sets[0].exercise_id, muscle: muscleKeyOf(ex),
+        pump: null, soreness: value, workload: null, checks: {}, note: '', pending: true, saved_at: now(), label_set: 'w1'
+      };
+      return batch([{ store: 'feedback', put: row }]);
+    });
+    return row;
+  }
+
+  // The sleep answer on the day card (16 B.4.3, review R6): true, false or null (a tap on the
+  // picked chip clears it), only while the day is planned. One write in the day's queue, every
+  // read inside it: the day row with the answer, and that day planned again by planDay under the
+  // write guard with its own Yes in the sleep window, so a Yes drops an engine add and sets the
+  // failure set's goal to short_sleep_failure_reps_left (2) in both profiles; a No or a clear
+  // plans it back. It can only remove an add, never make one.
+  async function answerSleep(dId, value) {
+    if (!(value === true || value === false || value === null)) throw new Refused('bad answer');
+    checkId(dId);
+    let row = null;
+    await queued(dayKey(dId), async () => {
+      const day = await db.get('days', dId);
+      if (!day) throw new Refused('no such day');
+      if (day.status !== 'planned') throw new Refused('day is not planned');
+      const block = await db.get('blocks', day.block_id);
+      row = { ...day, short_sleep_since_last: value, saved_at: now() };
+      const dayOp = { store: 'days', put: row };
+      const planOps = block ? await planDayOps(block, day.pass, day.day, { overlay: [dayOp] }) : [];
+      // planDayOps may put the day again (label, order, profile): that row carries the answer too.
+      const again = planOps.find(o => o.store === 'days' && 'put' in o && o.put.id === dId);
+      if (again) row = { ...again.put, short_sleep_since_last: value, saved_at: row.saved_at };
+      return batch([{ store: 'days', put: row }, ...planOps.filter(o => o !== again)]);
+    });
+    return row;
+  }
+
+  // His pick of a work set's kind in the set menu (16 B.4.7, R4-12): Work or To failure, on a
+  // planned or open day. It marks the kind as his (set_type_by_hand true), so planning never
+  // writes that set again (B.4.2). On LR both rows of the set take it. One write in the set's queue.
+  async function setSetType(setId, key) {
+    if (typeof key !== 'string' || !SET_KINDS.includes(key)) throw new Refused('bad kind');
+    let rows = [];
+    await queued(setKey(setId), async () => {
+      const s = await getSet(setId);
+      if (s.kind !== 'work') throw new Refused('not a work set');
+      const day = await db.get('days', s.day_id);
+      if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
+      const pair = s.side === 'none' ? [s] : (await slotSets(s.day_id, s.slot)).filter(x => x.kind === 'work' && x.set_n === s.set_n && x.side !== 'none');
+      const t = now();
+      rows = pair.map(x => ({ ...x, set_type: key, set_type_by_hand: true, saved_at: t }));
+      return batch(rows.map(r => ({ store: 'sets', put: r })));
+    });
+    return rows.find(r => r.id === setId) || null;
   }
 
   // Every other write also goes through the queue, so it gets the 4 s limit, the link
@@ -893,11 +1152,12 @@ export function createStore(opts) {
     checkText('name', spec.name);
     // Never a row the restore refuses (SB3): the muscle and the equipment come from the fixed lists.
     if (!MUSCLES.includes(spec.muscle) || !EQUIPMENT.includes(spec.equipment)) throw new Refused('bad text');
-    const row = {
+    // The schema 2 exercise fields by the one shared helper (16 B.1 step 5 R4 b, 17 C.0.2).
+    const row = exerciseDefaults2({
       id: 'c-' + uuid(), name: spec.name, muscle: spec.muscle, equipment: spec.equipment, count_label: 'reps',
       weight_steps: null, step_default: 5, unilateral: false, machine: spec.equipment === 'machine', no_added_sets: false,
       left_out_of_builder: false, flags_set: false, link: '', notes: '', custom: true, edited: false
-    };
+    });
     await queued('ex:' + row.id, () => batch([{ store: 'exercises', put: row }]));
     return row;
   }
@@ -917,7 +1177,7 @@ export function createStore(opts) {
       const block = await db.get('blocks', day.block_id);
       const t = now();
       const ops = [];
-      for (const s of sets) if (s.status === 'planned') ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'Not done', draft: null, saved_at: t } });
+      for (const s of sets) if (s.status === 'planned') ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'why.notdone', draft: null, saved_at: t } });
       let from = day.started_at;
       if (from === null) {
         const done = sets.filter(s => s.status === 'done').map(s => s.saved_at).filter(x => x !== null);
@@ -925,7 +1185,8 @@ export function createStore(opts) {
       }
       ops.push({ store: 'days', put: { ...day, status: 'done', done_at: t, done_date: localDate(from), scores: scores || day.scores || {}, saved_at: t } });
       const next = nextPosition(block, day.pass, day.day);
-      if (next) ops.push(...await planDayOps(block, next.pass, next.day));
+      // The next day is planned from the history as this batch leaves it (16 B.4.1).
+      if (next) ops.push(...await planDayOps(block, next.pass, next.day, { overlay: ops }));
       else ops.push({ store: 'blocks', put: { ...block, status: 'done' } });
       // The same ops put twice give the same rows, so a retry after a late commit is safe (P9).
       await job.write(() => batch(ops));
@@ -934,7 +1195,7 @@ export function createStore(opts) {
   }
 
   // Skip day (15 Part 15, R4-02): a planned or open day with no done set. One write in the day
-  // queue: every planned set is skipped with why 'Day skipped' and its draft cleared, the day
+  // queue: every planned set is skipped with why 'why.dayskipped' and its draft cleared, the day
   // is skipped with no done dates, and the next day is planned under the write guard. With no
   // next position the block is done, as Finish day does (review R21, R45). No undo.
   function skipDay(dId) {
@@ -946,10 +1207,11 @@ export function createStore(opts) {
       const block = await db.get('blocks', day.block_id);
       const t = now();
       const ops = [];
-      for (const s of sets) if (s.status === 'planned') ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'Day skipped', draft: null, saved_at: t } });
+      for (const s of sets) if (s.status === 'planned') ops.push({ store: 'sets', put: { ...s, status: 'skipped', why: 'why.dayskipped', draft: null, saved_at: t } });
       ops.push({ store: 'days', put: { ...day, status: 'skipped', done_at: null, done_date: null, saved_at: t } });
       const next = nextPosition(block, day.pass, day.day);
-      if (next) ops.push(...await planDayOps(block, next.pass, next.day));
+      // The next day is planned from the history as this batch leaves it (16 B.4.1).
+      if (next) ops.push(...await planDayOps(block, next.pass, next.day, { overlay: ops }));
       else ops.push({ store: 'blocks', put: { ...block, status: 'done' } });
       await job.write(() => batch(ops));
       return next;
@@ -1197,7 +1459,7 @@ export function createStore(opts) {
       const ops = [];
       for (const s of await db.byIndex('sets', 'day_id', dId)) {
         if (s.status === 'done') {
-          ops.push({ store: 'sets', put: { ...s, status: 'planned', done: null, draft: null, why: s.origin === 'added' ? 'Added by you' : 'As written on your block', saved_at: t } });
+          ops.push({ store: 'sets', put: { ...s, status: 'planned', done: null, draft: null, why: s.origin === 'added' ? 'why.added' : 'why.plan', saved_at: t } });
         } else if (s.status === 'planned' && s.draft !== null) {
           ops.push({ store: 'sets', put: { ...s, draft: null, saved_at: t } });
         }
@@ -1216,7 +1478,7 @@ export function createStore(opts) {
   // ---------------- block files (5.3 Load a block file) ----------------
 
   async function readBlockFile(text) {
-    const v = validateBlock(text, { now: now(), seedIds: SEED_IDS });
+    const v = validateBlock(text, { now: now(), seedIds: SEED_IDS, seedRows: SEED_EXERCISES });
     if (!v.ok) return v;
     const blocks = await db.all('blocks');
     const same = blocks.find(b => b.source_id === v.source_id);
@@ -1277,12 +1539,17 @@ export function createStore(opts) {
         if (ol && ol.start_load !== l.start_load) changes.push({ kind: 'load', name: nameOf(l.exercise_id), from: ol.start_load, to: l.start_load });
       }
     }
-    const newBlock = { ...same, version: v.version, id_map: idMap, name: String(nb.name).trim() ? nb.name : same.name, notes: nb.notes, passes: nb.passes, day_templates: nb.day_templates, checks: nb.checks, scores: nb.scores, rule_notes: nb.rule_notes, exercise_flags: nb.exercise_flags };
+    // File wins on these fields, the phone on the rest (5.3 Load a block file, r4 review R18):
+    // levels only while the phone's are empty; profile, profile_switch, rules_frozen, the Slice 3
+    // fields and status are never read from a file (16 B.6.4).
+    const phoneLevels = same.levels && Object.keys(same.levels).length ? same.levels : null;
+    const newBlock = { ...same, version: v.version, id_map: idMap, name: String(nb.name).trim() ? nb.name : same.name, notes: nb.notes, passes: nb.passes, day_templates: nb.day_templates, checks: nb.checks, scores: nb.scores, rule_notes: nb.rule_notes, exercise_flags: nb.exercise_flags,
+      switch_conditions: nb.switch_conditions, sleep_hint: nb.sleep_hint, flag_questions: nb.flag_questions, levels: phoneLevels || nb.levels };
     const dayOps = [];
     const keepDraft = [];
     const days = (await db.byIndex('days', 'block_id', same.id)).filter(d => d.status === 'planned');
     for (const d of days) {
-      const ops = await planDayOps(newBlock, d.pass, d.day, { wholeDayGuard: true });
+      const ops = await planDayOps(newBlock, d.pass, d.day, { wholeDayGuard: true, overlay: exOps });
       if (ops === null) keepDraft.push(d.label);
       else dayOps.push(...ops);
     }
@@ -1295,7 +1562,7 @@ export function createStore(opts) {
   // call queued() or exclusive() inside this body.
   function importBlock(text, activate) {
     return exclusive(async (job) => {
-      const v = validateBlock(text, { now: now(), seedIds: SEED_IDS });
+      const v = validateBlock(text, { now: now(), seedIds: SEED_IDS, seedRows: SEED_EXERCISES });
       if (!v.ok) throw new Refused(v.code);
       const blocks = await db.all('blocks');
       const same = blocks.find(b => b.source_id === v.source_id);
@@ -1307,14 +1574,18 @@ export function createStore(opts) {
           idMap[e.id] = nid;
           return { store: 'exercises', put: { ...e, id: nid, custom: true, edited: false } };
         });
-        const nb = rewrite(v.block, (id) => idMap[id] || id);
+        // rules_frozen and profile_switch from the file are never stored: buildBlock writes its own (16 B.6.4).
+        const { rules_frozen: _rf, profile_switch: _ps, profile: _pr, ...body } = rewrite(v.block, (id) => idMap[id] || id);
+        const nb = body;
+        const exercises = await exercisesMap();
+        for (const op of exOps) exercises.set(op.put.id, op.put);
         const activeId = await db.setting('active_block_id', null);
         const otherActive = !!activeId && blocks.some(b => b.id === activeId);
         const unit = nb.unit || await db.setting('unit', 'lb');
         // Not made active while another block is: the active block op is left out, so this
         // is one write and the active block stays (never a second write that puts it back).
         const r = newBlockOps({ ...nb, id: 'b' + uuid(), unit, source_id: v.source_id, version: v.version, id_map: idMap }, exOps, blocks,
-          { t: now(), activate: !otherActive || !!activate });
+          { t: now(), activate: !otherActive || !!activate, exercises });
         ops = r.ops;
         out = r.block;
       } else {
@@ -1330,6 +1601,474 @@ export function createStore(opts) {
     });
   }
 
+  // ---------------- Slice 2 store calls (16 B.4.4 to B.4.8, B.5 rows 7, 8, 12, 13, 14, 17, 18, B.9) ----------------
+
+  const EDIT_TYPES = ['add_set', 'skip_set', 'swap', 'move', 'remove', 'add_exercise', 'relabel'];
+  // The typed word of the switch sheet (16 B.9): exact after trim, case kept.
+  const ADJUST_WORD = 'ADJUST';
+  const usedSlots = (sets, fbs, more) => new Set([...sets.map(s => s.slot), ...(more || []),
+    ...fbs.map(f => Number(String(f.id).split(':x').pop())).filter(n => Number.isInteger(n) && n > 0)]);
+
+  // Remove exercise (16 B.5 row 18), the op builder: every set of the slot not done becomes
+  // skipped (as Skip exercise). The day's last exercise is refused with the code 'last'
+  // (scope.refused.last on screen). prev: the ids an earlier try skipped (a late commit, P9).
+  async function removeOps(dId, slot, prev) {
+    const day = await db.get('days', dId);
+    if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
+    const all = await db.byIndex('sets', 'day_id', dId);
+    if (prev.length && prev.every(id => all.some(x => x.id === id && x.status === 'skipped'))) return null;
+    const rows = all.filter(s => s.slot === slot);
+    if (!rows.length) throw new Refused('no slot');
+    if (new Set(all.filter(s => s.status !== 'skipped').map(s => s.slot)).size <= 1) throw new Refused('last');
+    const t = now();
+    return rows.filter(s => s.status !== 'done' && s.status !== 'skipped')
+      .map(s => ({ store: 'sets', put: { ...s, status: 'skipped', why: 'why.skipped', draft: null, saved_at: t } }));
+  }
+
+  // The set count of Add exercise (16 B.5 row 17, B.3.13): his number (1 to 20, default 1) in
+  // Fixed; startingSets for the muscle's level in Adjust each round, as applyLiveEdit counts it.
+  function addExerciseCount(block, ex, sets, t) {
+    if (sets !== undefined && sets !== null && !(Number.isInteger(sets) && sets >= 1 && sets <= LIMITS.SETS_MAX)) throw new Refused('bad sets');
+    if (profileOf(block, t) === 'fixed') return sets || 1;
+    const k = muscleKeyOf(ex);
+    const level = block.levels && own(block.levels, k) ? block.levels[k] : null;
+    return startingSets(rulesOf(block, t), { sets: sets || undefined }, level);
+  }
+
+  // Add exercise, the op builder: a new card on the next free slot of the day (never a slot the
+  // day template holds), n sets with an effort goal only, origin 'added', scope 'today' (an added
+  // exercise is never a hand add of a set). Refused on a day already holding LIFTS_PER_DAY
+  // exercises ('full'). prevSlot: the card an earlier try made (a late commit, P9).
+  async function addExerciseOps(dId, ex, n, tplSlots, prevSlot) {
+    const day = await db.get('days', dId);
+    if (!day || (day.status !== 'planned' && day.status !== 'open')) throw new Refused('day is not open');
+    const all = await db.byIndex('sets', 'day_id', dId);
+    if (prevSlot !== null && all.some(s => s.slot === prevSlot && s.exercise_id === ex.id)) return null;
+    if (new Set(all.filter(s => s.status !== 'skipped').map(s => s.slot)).size >= LIMITS.LIFTS_PER_DAY) throw new Refused('full');
+    const used = usedSlots(all, await db.byIndex('feedback', 'day_id', dId), tplSlots);
+    const top = maxOf([...used]);
+    let slot = (top !== null && top > 0 ? top : 0) + 1;
+    while (used.has(slot)) slot++;
+    if (slot > LIMITS.SLOT_MAX) throw new Refused('no slot');
+    const t = now();
+    const ops = [];
+    for (let k = 1; k <= n; k++) for (const side of (ex.unilateral === true ? ['L', 'R'] : ['none'])) ops.push({ store: 'sets', put: {
+      id: dId + ':x' + slot + ':s' + k + ':' + side, day_id: dId, block_id: day.block_id, exercise_id: ex.id, slot, set_n: k, side, kind: 'work',
+      target: { load: null, rep_low: null, rep_high: null, load_basis: 'total', count_label: null, reps_left_target: null, failure_set: false, effort_only: false },
+      draft: null, done: null, status: 'planned', origin: 'added', saved_at: t, why: 'why.added', first_done_at: null,
+      set_type: 'normal', set_type_by_hand: false, add_scope: 'today'
+    } });
+    return { slot, ops };
+  }
+
+  // Add set with a scope is refused in both profiles on a lift the block or the row marks
+  // no_added_sets, or that was never screened (flags_set false): code 'flag', scope.refused.flag
+  // on screen (16 B.3.13, B.14 item 8). The Slice 1 Add set keeps its own no_added_sets rule.
+  async function refuseFlag(dId, slot) {
+    const sets = await slotSets(dId, slot);
+    if (!sets.length) throw new Refused('no slot');
+    const eff = effectiveExercise(await db.get('blocks', sets[0].block_id), await db.get('exercises', sets[0].exercise_id));
+    if (!eff || eff.no_added_sets === true || eff.flags_set !== true) throw new Refused('flag');
+  }
+
+  // Every untouched planned day of a block, planned again under the write guard (16 B.4.1).
+  async function replanOps(block, ops, opts2) {
+    const out = [];
+    for (const d of (await db.byIndex('days', 'block_id', block.id)).filter(x => x.status === 'planned')) {
+      out.push(...await planDayOps(block, d.pass, d.day, { ...(opts2 || {}), overlay: [...ops, ...out] }));
+    }
+    return out;
+  }
+
+  // A live edit (16 B.3.13, B.4.8). edit = {type, dayId, slot, exercise_id, dir, label, sets}.
+  // One path for today: Today only runs the built store function of the edit in its day queue;
+  // Rest of block is ONE exclusive job: today's rows from the same op builder, the block's
+  // day_templates from applyLiveEdit, and every later planned day re-planned under the write
+  // guard, in one batch. Refusal codes the screen maps: 'flag', 'last', 'full'.
+  async function liveEdit(edit, scope) {
+    const e = edit || {};
+    if (!EDIT_TYPES.includes(e.type)) throw new Refused('bad edit');
+    if (scope !== 'today' && scope !== 'rest') throw new Refused('bad scope');
+    const dId = checkId(e.dayId);
+    const label = e.type === 'relabel' ? labelOf(e.label) : null;
+    if (e.type === 'swap' || e.type === 'add_exercise') checkId(e.exercise_id);
+    // A swap names an exercise on the phone (the list or his own rows), never a made-up id.
+    if (e.type === 'swap' && !(await db.get('exercises', e.exercise_id))) throw new Refused('no exercise');
+    if (scope === 'rest') {
+      if (e.type === 'skip_set') throw new Refused('today only');
+      return liveRest(e, dId, label);
+    }
+    switch (e.type) {
+      case 'skip_set': return skipSet(dId, e.slot);
+      case 'swap': return swapExercise(dId, e.slot, e.exercise_id);
+      case 'move': return moveSlot(dId, e.slot, e.dir);
+      case 'relabel': return relabelDay(dId, label);
+      default: break;
+    }
+    let ids = [], slot = null;
+    await queued(dayKey(dId), async () => {
+      if (e.type === 'add_set') {
+        await refuseFlag(dId, e.slot);
+        const ops = await addSetOps(dId, e.slot, 'today', ids);
+        if (!ops) return undefined;
+        ids = ops.map(o => o.put.id);
+        return batch(ops);
+      }
+      if (e.type === 'remove') {
+        const ops = await removeOps(dId, e.slot, ids);
+        if (!ops) return undefined;
+        ids = ops.map(o => o.put.id);
+        return ops.length ? batch(ops) : undefined;
+      }
+      const day = await db.get('days', dId);
+      const block = day ? await db.get('blocks', day.block_id) : null;
+      const ex = await db.get('exercises', e.exercise_id);
+      if (!day || !block) throw new Refused('no such day');
+      if (!ex) throw new Refused('no exercise');
+      const tpl = block.day_templates.find(d => d.day === day.day);
+      const r = await addExerciseOps(dId, ex, addExerciseCount(block, ex, e.sets, now()), tpl ? tpl.lifts.map(l => l.slot) : [], slot);
+      if (!r) return undefined;
+      slot = r.slot;
+      return batch(r.ops);
+    });
+    return e.type === 'add_exercise' ? slot : e.type === 'remove' ? ids.length : ids;
+  }
+
+  function liveRest(e, dId, label) {
+    return exclusive(async (job) => {
+      const day = await db.get('days', dId);
+      if (!day) throw new Refused('no such day');
+      const block = await db.get('blocks', day.block_id);
+      if (!block) throw new Refused('no such day');
+      const t = now();
+      const sets = await db.byIndex('sets', 'day_id', dId);
+      const exercises = await exercisesMap();
+      const tpl = block.day_templates.find(d => d.day === day.day);
+      const ex = e.type === 'add_exercise' ? exercises.get(e.exercise_id) : null;
+      if (e.type === 'add_exercise' && !ex) throw new Refused('no exercise');
+      const n = ex ? addExerciseCount(block, ex, e.sets, t) : undefined;
+      if (e.type === 'add_exercise' && tpl && tpl.lifts.length >= LIMITS.LIFTS_PER_DAY) throw new Refused('full');
+      // The engine reads today's order as Today shows it, so a partial order can still move.
+      const eng = applyLiveEdit({ rules: rulesOf(block, t), block, today: { day: { ...day, slot_order: slotsInOrder(day, sets) }, sets },
+        later: await db.byIndex('days', 'block_id', block.id), exercises },
+      { type: e.type, slot: e.slot, exercise_id: e.exercise_id, dir: e.dir, label, sets: n, sides: ex && ex.unilateral === true ? 'LR' : 'none' }, 'rest');
+      if (!eng.ok) throw new Refused(eng.error);
+      // Today's rows from the op builder the Today only path calls (B.4.8); the engine's today_ops are never written.
+      let today, out;
+      if (e.type === 'add_set') { today = await addSetOps(dId, e.slot, 'rest', []); out = today.map(o => o.put.id); }
+      else if (e.type === 'swap') { const r = await swapOps(dId, e.slot, e.exercise_id, null); today = r.ops; out = r.newSlot; }
+      else if (e.type === 'move') { const r = await moveOps(dId, e.slot, e.dir, null); today = r.ops; out = r.order; }
+      else if (e.type === 'remove') { today = await removeOps(dId, e.slot, []); out = today.length; }
+      else if (e.type === 'relabel') { const r = await relabelOps(dId, label); today = r.ops; out = r.row; }
+      else { const r = await addExerciseOps(dId, ex, n, tpl ? tpl.lifts.map(l => l.slot) : [], null); today = r.ops; out = r.slot; }
+      const ops = [...today];
+      if (eng.block !== block) {
+        const nb = { ...eng.block, day_templates: fullTemplates(eng.block.day_templates) };
+        // The template lift of an added exercise takes the slot its card got today.
+        if (e.type === 'add_exercise') { const td = nb.day_templates.find(d => d.day === day.day); if (td) td.lifts[td.lifts.length - 1].slot = out; }
+        ops.push({ store: 'blocks', put: nb });
+        for (const ref of eng.replan) ops.push(...await planDayOps(nb, ref.pass, ref.day, { overlay: [...ops], templateOrder: e.type === 'move' }));
+      }
+      if (ops.length) await job.write(() => batch(ops));
+      return out;
+    });
+  }
+
+  // Resize a block by one round (16 B.3.10, B.4.7): one exclusive job, the block and its planned
+  // days re-planned. No write ever deletes a day row (contract E16), so a resize that would leave
+  // a planned day past the new length is refused ('day past the end'); Slice 3's typed confirm
+  // (Part C round grid) is where that case is ruled.
+  function resize(blockId, delta) {
+    if (delta !== 1 && delta !== -1) return Promise.reject(new Refused('bad request'));
+    checkId(blockId);
+    return exclusive(async (job) => {
+      const block = await db.get('blocks', blockId);
+      if (!block) throw new Refused('no block');
+      if (block.status === 'done') throw new Refused('block is done');
+      const days = await db.byIndex('days', 'block_id', blockId);
+      const r = resizeBlock(rulesOf(block, now()), block, delta, days);
+      if (!r.ok) throw new Refused(r.error);
+      if (r.remove.length) throw new Refused('day past the end');
+      const nb = r.block;
+      const ops = [{ store: 'blocks', put: nb }];
+      for (const ref of r.replan) ops.push(...await planDayOps(nb, ref.pass, ref.day, { overlay: [...ops] }));
+      await job.write(() => batch(ops));
+      return nb;
+    });
+  }
+
+  // The switch to Adjust each round (16 B.9, B.4.6). His word is checked again here, so a screen
+  // bypass is refused: three ticks, ADJUST typed exactly after trim (M39), the local date from the
+  // store's own clock on or after 2026-12-01 (M27), the rules table valid, a block not done, on
+  // Fixed, with its three condition lines. One exclusive job: the block and its untouched planned
+  // days re-planned. The block keeps the set counts it has.
+  function switchProfile(blockId, ticks, typed) {
+    checkId(blockId);
+    if (!Array.isArray(ticks) || ticks.length !== 3 || !ticks.every(x => x === true)) return Promise.reject(new Refused('ticks'));
+    if (typeof typed !== 'string' || typed.trim() !== ADJUST_WORD) return Promise.reject(new Refused('word'));
+    return exclusive(async (job) => {
+      const t = now();
+      if (localDate(t) < ADJUST_FIRST_DATE) throw new Refused('too early');
+      if (!RULES_OK_HERE) throw new Refused('rules');
+      const block = await db.get('blocks', blockId);
+      if (!block || block.status === 'done') throw new Refused('no block');
+      if (block.profile !== 'fixed') throw new Refused('already');
+      if (!Array.isArray(block.switch_conditions) || block.switch_conditions.length !== 3) throw new Refused('no conditions');
+      const nb = { ...block, profile: 'adaptive', rules_frozen: { profile: 'adaptive', rules_version: 'signed-1' },
+        profile_switch: { switched_at: t, ticks: [true, true, true], back_at: null } };
+      const ops = [{ store: 'blocks', put: nb }];
+      ops.push(...await replanOps(nb, ops));
+      await job.write(() => batch(ops));
+      return nb;
+    });
+  }
+
+  // Back to Fixed (16 B.9): one confirm, no typed word. Untouched planned days plan as written.
+  function switchBack(blockId) {
+    checkId(blockId);
+    return exclusive(async (job) => {
+      const t = now();
+      const block = await db.get('blocks', blockId);
+      if (!block || block.status === 'done') throw new Refused('no block');
+      const ps = block.profile_switch;
+      if (block.profile !== 'adaptive' || !ps || ps.back_at !== null) throw new Refused('not adaptive');
+      if (!(t > ps.switched_at)) throw new Refused('too soon');
+      const nb = { ...block, profile: 'fixed', rules_frozen: { ...block.rules_frozen, profile: 'fixed' }, profile_switch: { ...ps, back_at: t } };
+      const ops = [{ store: 'blocks', put: nb }];
+      ops.push(...await replanOps(nb, ops));
+      await job.write(() => batch(ops));
+      return nb;
+    });
+  }
+
+  // Change answers (16 B.4.5, B.5 row 8): the same rules as the feedback sheet, a true check never
+  // goes back to false (review R20, M88), a new saved_at; the next day of the block, while still
+  // planned, is planned again from the new answers. Two days' rows: one exclusive job, one batch.
+  function changeAnswers(feedbackId, answers) {
+    const a = answers || {};
+    checkText('note', a.note);
+    checkId(feedbackId);
+    for (const k of ['pump', 'soreness', 'workload']) {
+      const v = a[k];
+      if (!(v === undefined || v === null || (Number.isInteger(v) && v >= 1 && v <= 4))) return Promise.reject(new Refused('bad answer'));
+    }
+    return exclusive(async (job) => {
+      const was = await db.get('feedback', feedbackId);
+      if (!was) throw new Refused('no answers');
+      const day = await db.get('days', was.day_id);
+      if (!day || day.status === 'skipped') throw new Refused('day is not open');
+      const block = await db.get('blocks', day.block_id);
+      const keys = new Set(checksFor(block, was.exercise_id).map(c => c.key));
+      const checks = { ...(was.checks || {}) };
+      for (const [k, v] of Object.entries(a.checks || {})) {
+        if (!keys.has(k) || reservedName(k) || !(v === true || v === false || v === null)) throw new Refused('bad check');
+        checks[k] = checks[k] === true ? true : v;
+      }
+      const pick = (k) => (a[k] === undefined ? was[k] : a[k]);
+      const ex = await db.get('exercises', was.exercise_id);
+      const row = { ...was, muscle: ex ? muscleKeyOf(ex) : was.muscle, pump: pick('pump'), soreness: pick('soreness'), workload: pick('workload'),
+        checks, note: a.note === undefined ? was.note : a.note, pending: false, saved_at: now() };
+      const ops = [{ store: 'feedback', put: row }];
+      const next = block ? nextPosition(block, day.pass, day.day) : null;
+      const nd = next ? await db.get('days', dayId(block.id, next.pass, next.day)) : null;
+      if (nd && nd.status === 'planned') ops.push(...await planDayOps(block, next.pass, next.day, { overlay: [...ops] }));
+      await job.write(() => batch(ops));
+      return row;
+    });
+  }
+
+  // Close block (16 B.5 row 7, B.4.7): refused while a day of the block is open (code 'day open',
+  // end.open on screen); planned days stay as they are. One exclusive job.
+  function endBlock(blockId) {
+    checkId(blockId);
+    return exclusive(async (job) => {
+      const block = await db.get('blocks', blockId);
+      if (!block) throw new Refused('no block');
+      if (block.status === 'done') throw new Refused('block is done');
+      if ((await db.byIndex('days', 'block_id', blockId)).some(d => d.status === 'open')) throw new Refused('day open');
+      const nb = { ...block, status: 'done' };
+      await job.write(() => batch([{ store: 'blocks', put: nb }]));
+      return nb;
+    });
+  }
+
+  // ---- reads for the Slice 2 screens (write nothing) ----
+
+  // The Adjust each round row (16 B.9): only on a block not done, on Fixed, from 2026-12-01 local
+  // by the store's clock, and only while the rules table is valid.
+  async function switchAllowed(blockId) {
+    const block = await db.get('blocks', checkId(blockId));
+    return !!block && block.status !== 'done' && block.profile === 'fixed' && RULES_OK_HERE && localDate(now()) >= ADJUST_FIRST_DATE;
+  }
+  // The Back to Fixed row: an adaptive block with its switch in force, not done.
+  async function switchBackAllowed(blockId) {
+    const block = await db.get('blocks', checkId(blockId));
+    return !!block && block.status !== 'done' && block.profile === 'adaptive' && !!block.profile_switch && block.profile_switch.back_at === null;
+  }
+
+  // The feedback moments of one exercise (16 B.4.4, B.3.14): moment 'first_tick', 'tick' or 'end'.
+  // extra.soreness_put_off: he tapped Ask me later on the soreness-alone sheet (the screen holds it).
+  async function feedbackPlan(dId, slot, moment, extra) {
+    const day = await db.get('days', checkId(dId));
+    if (!day) return { ask: [] };
+    const block = await db.get('blocks', day.block_id);
+    const sets = await slotSets(dId, slot);
+    if (!block || !sets.length) return { ask: [] };
+    const exs = await exercisesMap();
+    const key = muscleKeyOf(exs.get(sets[0].exercise_id));
+    const keyOf = (id) => muscleKeyOf(exs.get(id));
+    const earlier = new Set((await db.byIndex('days', 'block_id', block.id)).filter(d => d.pass < day.pass || (d.pass === day.pass && d.day < day.day)).map(d => d.id));
+    const trained = (await db.byIndex('sets', 'block_id', block.id)).some(s => earlier.has(s.day_id) && s.kind === 'work' && s.status === 'done' && keyOf(s.exercise_id) === key);
+    const asked = (await db.byIndex('feedback', 'day_id', dId)).some(f => f.soreness !== null && keyOf(f.exercise_id) === key);
+    const work = sets.filter(s => s.kind === 'work');
+    return feedbackDue(rulesOf(block, now()), day, key, {
+      trained_before: trained, one_set: new Set(work.map(s => s.set_n)).size === 1, soreness_asked_today: asked,
+      soreness_put_off: !!(extra && extra.soreness_put_off), has_planned_set: work.some(s => s.status === 'planned'), moment
+    });
+  }
+
+  // The Why line (16 B.5 row 12): in Adjust each round only, each slot's why from its plan
+  // (the why planning wrote on its sets). Fixed: no line, an empty map.
+  async function slotWhy(dId) {
+    const day = await db.get('days', checkId(dId));
+    const block = day ? await db.get('blocks', day.block_id) : null;
+    if (!block || profileOf(block, now()) !== 'adaptive') return {};
+    const out = {};
+    for (const s of (await db.byIndex('sets', 'day_id', dId)).filter(x => x.kind === 'work' && x.origin === 'plan').sort(setOrder)) {
+      if (!own(out, s.slot)) out[s.slot] = s.why;
+    }
+    return out;
+  }
+
+  // The retarget line (16 B.5 row 13, B.3.7): in Adjust each round only, the rep goal at a typed
+  // weight ({rep_low} or {effort_only: true}); null in Fixed, where the goal shows as written.
+  async function retarget(setId, typedLoad) {
+    const s = await getSet(checkId(setId));
+    const block = await db.get('blocks', s.block_id);
+    if (!block || profileOf(block, now()) !== 'adaptive' || s.kind !== 'work') return null;
+    const ex = await db.get('exercises', s.exercise_id);
+    const rules = rulesOf(block, now());
+    const flags = block.exercise_flags && own(block.exercise_flags, s.exercise_id) ? block.exercise_flags[s.exercise_id] : null;
+    return retargetOnLoad(rules, { load: s.target.load, rep_low: s.target.rep_low, rep_high: s.target.rep_high,
+      step: stepFor(rules, ex, block.unit, flags), unit: block.unit, load_kind: ex ? ex.load_kind : 'external' }, typedLoad);
+  }
+
+  // The sets stepper's first number on the Add exercise sheet (16 B.5 row 17).
+  async function addExerciseDefault(dId, exerciseId) {
+    const day = await db.get('days', checkId(dId));
+    const block = day ? await db.get('blocks', day.block_id) : null;
+    const ex = await db.get('exercises', checkId(exerciseId));
+    if (!block || !ex) return 1;
+    return addExerciseCount(block, ex, undefined, now());
+  }
+
+  // Block overview (16 B.4.7, B.5 row 14): the round strip, this round's day rows, and the work
+  // sets this round by muscle key (each set counted by its kind's counts, skipped sets left out)
+  // with the change from last round. shown: a round of the strip whose day rows the Block tab shows
+  // (a tap on its cell, B.1 step 8); any other value shows this round. Each day row also gives its
+  // place id (ref, the id of a day not planned yet too), its set tally, and hard_left counts the
+  // places of the rounds before the easy round with no done or skipped day (the stop sheet, B.5 row 4).
+  async function blockOverview(blockId, shown) {
+    const block = await db.get('blocks', checkId(blockId));
+    if (!block) return null;
+    const t = now();
+    const rules = rulesOf(block, t);
+    const days = (await db.byIndex('days', 'block_id', block.id)).sort((a, b) => a.pass - b.pass || a.day - b.day);
+    const cur = currentPosition(block, days);
+    const curDay = days.find(d => d.id === cur) || null;
+    const top = maxOf(days.map(d => d.pass));
+    const round = curDay ? curDay.pass : (top === null ? 1 : top);
+    const last = block.passes === null ? Math.max(round, top === null ? 1 : top) : block.passes;
+    const nDays = block.day_templates.length;
+    const easy = rules.easy_week.auto === true && block.passes !== null;
+    const rounds = [];
+    for (let p = 1; p <= last; p++) {
+      const mine = days.filter(d => d.pass === p);
+      const finished = mine.length === nDays && mine.every(d => d.status === 'done' || d.status === 'skipped');
+      rounds.push({ pass: p, state: finished ? 'done' : p === round ? 'now' : 'later', easy: easy && p === block.passes });
+    }
+    const view = Number.isInteger(shown) && shown >= 1 && shown <= last ? shown : round;
+    const sets = await db.byIndex('sets', 'block_id', block.id);
+    const dayRows = [...block.day_templates].sort((a, b) => a.day - b.day).map(d => {
+      const row = days.find(x => x.pass === view && x.day === d.day) || null;
+      const mine = row ? sets.filter(s => s.day_id === row.id && s.status !== 'skipped') : [];
+      return { id: row ? row.id : null, ref: row ? row.id : dayId(block.id, view, d.day), pass: view, day: d.day, label: row ? row.label : d.label,
+        status: row ? row.status : 'notplanned', now: !!row && row.id === cur, done: mine.filter(s => s.status === 'done').length, total: mine.length };
+    });
+    let hardLeft = 0;
+    if (easy) {
+      for (let p = 1; p < block.passes; p++) {
+        for (const d of block.day_templates) {
+          const row = days.find(x => x.pass === p && x.day === d.day);
+          if (!row || (row.status !== 'done' && row.status !== 'skipped')) hardLeft++;
+        }
+      }
+    }
+    const exs = await exercisesMap();
+    const counts = Object.fromEntries(RULES.set_kinds.map(k => [k.key, k.counts]));
+    const passOf = new Map(days.map(d => [d.id, d.pass]));
+    const byMuscle = (p) => {
+      const m = new Map(), seen = new Set();
+      for (const s of sets) {
+        if (passOf.get(s.day_id) !== p || s.kind !== 'work' || s.status === 'skipped') continue;
+        const k = s.day_id + '|' + s.slot + '|' + s.set_n;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const key = muscleKeyOf(exs.get(s.exercise_id));
+        m.set(key, (m.get(key) || 0) + (own(counts, s.set_type) ? counts[s.set_type] : 1));
+      }
+      return m;
+    };
+    const now2 = byMuscle(round), before2 = round > 1 ? byMuscle(round - 1) : null;
+    const keys = [...new Set([...now2.keys(), ...(before2 ? before2.keys() : [])])].sort();
+    return {
+      id: block.id, name: block.name, status: block.status, profile: profileOf(block, t), passes: block.passes, round, shown: view, rounds, days: dayRows,
+      hard_left: hardLeft,
+      muscles: keys.map(k => ({ muscle: k, sets: now2.get(k) || 0, change: before2 ? (now2.get(k) || 0) - (before2.get(k) || 0) : null }))
+    };
+  }
+
+  // The read-only day view at #/day/<id> (16 B.5 row 2, B.10 item 9, LOOK 4.11). The id passes
+  // checkId and must name a day of a block on the phone: a day row, or a place the block has with no
+  // row yet (a round in range, a day of its templates), shown as Not planned yet. Anything else is
+  // null. state: 'open', 'current' (the day Today shows), 'later' (planned, not current), 'done',
+  // 'skipped' or 'notplanned'; after is the label of the day before it (day.later.line).
+  async function dayPreview(dId) {
+    checkId(dId);
+    const v = await dayView(dId);
+    if (v) {
+      if (!v.block) return null;
+      const days = await db.byIndex('days', 'block_id', v.block.id);
+      const st = v.day.status;
+      const state = st === 'planned' ? (currentPosition(v.block, days) === v.day.id ? 'current' : 'later') : st;
+      return { ...v, state, after: labelBefore(v.block, days, v.day.pass, v.day.day) };
+    }
+    const m = /^(.+):p([1-9][0-9]{0,3}):d([1-9][0-9]{0,3})$/.exec(dId);
+    if (!m || reservedName(m[1])) return null;
+    const block = await db.get('blocks', m[1]);
+    if (!block) return null;
+    const pass = Number(m[2]), dayN = Number(m[3]);
+    const tpl = block.day_templates.find(d => d.day === dayN);
+    const days = await db.byIndex('days', 'block_id', block.id);
+    const top = maxOf(days.map(d => d.pass));
+    const last = block.passes === null ? (top === null ? 1 : top) + 1 : block.passes;
+    if (!tpl || pass > last || dayId(block.id, pass, dayN) !== dId) return null;
+    const rules = rulesOf(block, now());
+    return { state: 'notplanned', block, after: labelBefore(block, days, pass, dayN), exercises: await exercisesMap(), sets: [], slots: [],
+      day: { id: dId, block_id: block.id, pass, day: dayN, label: tpl.label, status: 'notplanned' }, lifts: tpl.lifts.map(l => ({ ...l })),
+      profile: profileOf(block, now()), rules, easy: rules.easy_week.auto === true && typeof block.passes === 'number' && pass === block.passes };
+  }
+  // The label of the day before a place (the day row's label, else its template's), or null on the first.
+  function labelBefore(block, days, pass, dayN) {
+    const tpls = [...block.day_templates].sort((a, b) => a.day - b.day);
+    const at = tpls.findIndex(d => d.day === dayN);
+    const prev = at > 0 ? { pass, tpl: tpls[at - 1] } : pass > 1 && tpls.length ? { pass: pass - 1, tpl: tpls[tpls.length - 1] } : null;
+    if (!prev) return null;
+    const row = days.find(d => d.pass === prev.pass && d.day === prev.tpl.day);
+    const label = row ? row.label : prev.tpl.label;
+    return label || String(prev.tpl.day);
+  }
+
   return {
     LIMITS, seed, getSetting, setSetting, activeBlock, openDay, isDayOpen, currentDay, dayView, createBlock,
     tick, untick, saveDraft, skipSet, unskip, skipExercise, stopExercise, addSet, swapExercise, saveFeedback,
@@ -1337,7 +2076,14 @@ export function createStore(opts) {
     markBackedUp, saveSnapshot, listSnapshots, readBackupFile, restoreFile, readSnapshot, undoSnapshot, eraseAll,
     clearSnapshots, readBlockFile, importBlock, exercisesMap, busy, idle, takeRestoreNote, probe,
     defaultBlockName: async () => defaultBlockName(await db.all('blocks')), relabelDay, addSetBelow, deleteSet, moveSlot, resetDay, skipDay, saveChecks, dayTotals,
+    answerSleep, setSetType, saveSoreness, liveEdit, resize, switchProfile, switchBack, changeAnswers, endBlock,
+    switchAllowed, switchBackAllowed, feedbackPlan, slotWhy, retarget, addExerciseDefault, blockOverview, dayPreview,
+    rulesOk: () => RULES_OK_HERE,
     effectiveExercise: async (block, exerciseId) => effectiveExercise(block, await db.get('exercises', exerciseId)),
-    onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); }
+    onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    // The two upgrade lines of 16 B.5 row 16: the open failed on the upgrade (db.upgradefail), and
+    // a newer version closed this page's link (db.reopen).
+    upgradeFailed: () => !!(db.upgradeFailed && db.upgradeFailed()),
+    onVersionClosed(fn) { if (db.onVersionClosed) db.onVersionClosed(fn); }
   };
 }

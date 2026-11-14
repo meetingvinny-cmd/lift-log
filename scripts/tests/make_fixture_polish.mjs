@@ -6,6 +6,14 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from '../../store.js';
 import { createFakeDb, fakeClock } from './unit/fake_db.js';
+import { SCHEMA } from '../../version.js';
+
+// The polish fixture is a frozen schema 1 file (16 B.1 step 3 e, B.6.3): from schema 2 on the store
+// writes schema 2 rows, so this script would make a different file. It stops before it writes.
+if (SCHEMA !== 1) {
+  console.log('make_fixture_polish.mjs makes the frozen schema 1 fixture only; SCHEMA is ' + SCHEMA + ', nothing written');
+  process.exit(1);
+}
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIN = 60000;

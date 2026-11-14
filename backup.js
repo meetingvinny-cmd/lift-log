@@ -21,13 +21,17 @@ export const LIMITS = {
   BREAKS_MAX: 3,
   // A day's card order (A1-5): at most this many slot numbers.
   SLOT_ORDER: 50,
+  // Schema 2 (16 B.1 step 3 b, B.6.1a; 17 C.0.2): his Make my own exercise question lines, and a
+  // day's body weight (R4-21). ADJUST_EARLIEST_MS is the first instant it is 2026-12-01 anywhere:
+  // a stored switch to Adjust each round is never older than it (16 B.6.1, B.9).
+  FLAG_Q: 200, BODY_WEIGHT_MIN: 20, BODY_WEIGHT_MAX: 1000, ADJUST_EARLIEST_MS: Date.UTC(2026, 10, 30, 10),
   // Input box lengths for typed numbers (the values are still checked by range).
   LOAD_CHARS: 7, REPS_CHARS: 4, PASSES_CHARS: 3, SETS_CHARS: 2,
-  ROWS: { settings: 50, exercises: 5000, templates: 0, blocks: 500, days: 10000, sets: 100000, feedback: 40000 },
+  ROWS: { settings: 50, exercises: 5000, templates: 200, blocks: 500, days: 10000, sets: 100000, feedback: 40000 },
   FLAT_LOG_ROWS: 100000,
   // Worked out from the row caps by scripts/tests/unit/backup.test.js (it fails if these are lower).
-  MAX_STORES_BYTES: 2729987864,
-  MAX_RAW_BYTES: 4128953402,
+  MAX_STORES_BYTES: 2765511664,
+  MAX_RAW_BYTES: 4205577202,
   // A block file is a few KB; this cap is a set number above the largest block the caps
   // allow (backup.test.js builds that block and fails if it is not below), so a wrong pick
   // (a video) is refused before it is read (A2-5).
@@ -41,21 +45,59 @@ export const LIMITS = {
   FUTURE_SLACK: 2 * 24 * 3600 * 1000
 };
 
-export const SETTING_KEYS = ['unit', 'active_block_id', 'profile', 'last_backup_at', 'persist_answer', 'theme', 'seeded_version', 'carry_down', 'rep_ask'];
+export const SETTING_KEYS = ['unit', 'active_block_id', 'profile', 'last_backup_at', 'persist_answer', 'theme', 'seeded_version', 'carry_down', 'rep_ask',
+  'equipment_saved', 'tips_seen', 'seen_version'];
 // Device keys describe this phone. restore_note (A3-R8) is never read from a file and never
 // written from one: a file row with that key is dropped like any key the app does not know.
-export const DEVICE_KEYS = ['last_backup_at', 'persist_answer', 'theme', 'seeded_version', 'restore_note'];
-// Why a safety copy was made (A2-10). Any other reason is refused.
-export const SNAPSHOT_REASONS = ['before-restore', 'before-erase', 'before-upgrade', 'before-undo', 'before-reset'];
+// tips_seen and seen_version (17 C.0.2) describe this phone too: restore keeps the phone's.
+export const DEVICE_KEYS = ['last_backup_at', 'persist_answer', 'theme', 'seeded_version', 'restore_note', 'tips_seen', 'seen_version'];
+// Why a safety copy was made (A2-10; before-delete, 17 C.0.2). Any other reason is refused.
+export const SNAPSHOT_REASONS = ['before-restore', 'before-erase', 'before-upgrade', 'before-undo', 'before-reset', 'before-delete'];
 export const MUSCLES = ['chest', 'back', 'shoulders', 'arms', 'legs', 'core'];
 export const EQUIPMENT = ['machine', 'cable', 'barbell', 'dumbbell', 'bodyweight', 'other'];
 export const COUNT_LABELS = ['reps', 'seconds', 'laps'];
+// The seven Slice 1 why texts: read in a schema 1 file only. From schema 2 a set stores a key.
 export const WHY = ['As written on your block', 'Added by you', 'Skipped by you', 'Stopped by a block check', 'Swapped by you', 'Not done', 'Day skipped'];
+
+// ---------------- schema 2 lists (16 B.1 step 3 a, B.5.1, B.6.1a; 17 C.0.2, C.2.2) ----------------
+// backup.js keeps its own copies and imports neither rules.js nor data/exercises.js; static tests
+// hold each list equal to its twin there.
+export const SET_KINDS = Object.freeze(['normal', 'failure']);
+// Every why key a set may store (16 B.5.1): the 7 Slice 1 keys, R1 to R11, then the 15 after them.
+export const WHY_KEYS = Object.freeze([
+  'why.plan', 'why.added', 'why.skipped', 'why.stopped', 'why.swapped', 'why.notdone', 'why.dayskipped',
+  'why.R1', 'why.R2', 'why.R3', 'why.R4', 'why.R5', 'why.R6', 'why.R7', 'why.R8', 'why.R9', 'why.R10', 'why.R11',
+  'why.top', 'why.floor', 'why.sleep', 'why.check', 'why.score', 'why.missed', 'why.flag', 'why.hand_add', 'why.easy',
+  'why.load_up', 'why.rep_up', 'why.on_miss', 'why.step_down', 'why.new_set', 'why.swap_hold'
+]);
+// The seven Slice 1 texts to their keys (R4-29), used by MIGRATIONS[1] only.
+export const WHY_KEY_OF = Object.freeze({
+  'As written on your block': 'why.plan', 'Added by you': 'why.added', 'Skipped by you': 'why.skipped',
+  'Stopped by a block check': 'why.stopped', 'Swapped by you': 'why.swapped', 'Not done': 'why.notdone',
+  'Day skipped': 'why.dayskipped'
+});
+// Every rule table name a block can be frozen on (0.3.0).
+export const RULE_VERSIONS = Object.freeze(['none', 'signed-1']);
+export const MUSCLE_DETAILS = Object.freeze(['chest', 'back', 'traps_neck', 'shoulders', 'biceps', 'triceps', 'forearms_grip', 'abs_core', 'quads', 'hamstrings', 'glutes', 'calves']);
+export const MUSCLE_DETAIL_CHIP = Object.freeze({ chest: 'chest', back: 'back', traps_neck: 'back', shoulders: 'shoulders', biceps: 'arms', triceps: 'arms', forearms_grip: 'arms', abs_core: 'core', quads: 'legs', hamstrings: 'legs', glutes: 'legs', calves: 'legs' });
+export const EQUIPMENT_DETAILS = Object.freeze(['machine', 'smith', 'cable', 'barbell', 'landmine', 'dumbbell', 'kettlebell', 'band', 'body', 'other']);
+export const EQUIPMENT_DETAIL_CHIP = Object.freeze({ machine: 'machine', smith: 'machine', cable: 'cable', barbell: 'barbell', landmine: 'barbell', dumbbell: 'dumbbell', kettlebell: 'other', band: 'other', body: 'bodyweight', other: 'other' });
+export const LOAD_KINDS = Object.freeze(['external', 'body', 'body_plus', 'assist']);
+export const TAG_CODES = Object.freeze(['overhead', 'spotter']);
+// The tip and intro ids (17 C.3.16); the twin is ui/tips.js, built in Slice 3.
+export const TIP_IDS = Object.freeze(['tip_warmup', 'tip_rest', 'tip_start', 'intro_board', 'intro_picker', 'intro_builder']);
+const PROFILES = ['fixed', 'adaptive'];
+const LEVELS = ['top', 'middle', 'bottom'];
+const ADD_SCOPES = ['today', 'rest'];
+// 17 C.0.2: equipment_detail from equipment, for a row written before schema 2.
+const DETAIL_OF_EQUIPMENT = Object.freeze({ machine: 'machine', cable: 'cable', barbell: 'barbell', dumbbell: 'dumbbell', bodyweight: 'body', other: 'other' });
 
 const ID_RE = /^[A-Za-z0-9:_-]{1,120}$/;
 const KEY_RE = /^[a-z0-9_]{1,30}$/;
 const LINK_RE = /^https:\/\/[^\s<>"]{1,500}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// One of his own templates (17 C.0.3).
+const TEMPLATE_ID_RE = /^m[A-Za-z0-9-]{1,60}$/;
 // The end of a set id after <dayId>:x<slot>:s or :w: the id number and the side (SR9).
 const SET_TAIL_RE = /^\d+:(L|R|none)$/;
 // No control characters but tab and newline, no lone surrogates: keeps the size math true.
@@ -220,11 +262,14 @@ function makeChecks(now) {
   return c;
 }
 
-function rowSpecs(c) {
+// The allow table. schema 1 is the table as it was before the bump; schema 2 adds the B.6.1a
+// fields (16 B.6.1a, 17 C.0.3), each required unless its row says otherwise.
+function rowSpecs(c, schema = SCHEMA) {
   const L = LIMITS;
+  const two = schema >= 2;
   const load = c.num(0, L.LOAD_MAX), loadN = c.numOrNull(0, L.LOAD_MAX);
   const reps = c.int(0, L.REPS_MAX), repsN = c.intOrNull(0, L.REPS_MAX);
-  const lift = c.shape({
+  const liftSpec = {
     slot: c.int(1, L.SLOT_MAX), exercise_id: c.id, sets: c.int(1, L.SETS_MAX), rep_low: repsN, rep_high: repsN,
     start_load: loadN, failure_set: c.bool, reps_left_target: c.intOrNull(0, 4),
     warmups: c.arr(L.WARMUPS, c.shape({ reps, load: loadN })),
@@ -233,7 +278,9 @@ function rowSpecs(c) {
     // His words from his block file (R4-04): a quiet line on the card, and the goal part of
     // the helper for a lift with no rep range. Missing = '' (the Slice 1 behavior).
     short_note: c.opt(c.line(L.WORDS), () => ''), goal_line: c.opt(c.line(L.WORDS), () => '')
-  });
+  };
+  if (two) liftSpec.set_type = c.oneOf(SET_KINDS);
+  const lift = c.shape(liftSpec);
   const blockBody = {
     name: c.text(L.NAME), unit: c.oneOf(['lb', 'kg']), profile: c.exact('fixed'),
     rules_frozen: c.shape({ profile: c.exact('fixed'), rules_version: c.exact('none') }),
@@ -260,7 +307,8 @@ function rowSpecs(c) {
   // A draft without breaks reads null (15 Part 16).
   const draft = c.shapeOrNull({ load: loadN, reps: repsN, reps_left: c.intOrNull(0, 4), reps_left_plus: c.bool, failure: c.bool,
     from_copy: c.opt(c.bool, () => false), breaks: c.opt(breaks, () => null) });
-  return {
+  const targetSpec = { load: loadN, rep_low: repsN, rep_high: repsN, load_basis: c.oneOf(['total', 'per_side', 'per_hand']), count_label: c.oneOfOrNull(COUNT_LABELS), reps_left_target: c.intOrNull(0, 4) };
+  const specs = {
     exercises: {
       id: c.id, name: c.text(L.NAME, 1), muscle: c.oneOf(MUSCLES), equipment: c.oneOf(EQUIPMENT),
       count_label: c.oneOf(COUNT_LABELS), weight_steps: (v, w) => v === null ? null : c.loads(L.STEPS, load)(v, w), step_default: load,
@@ -283,7 +331,7 @@ function rowSpecs(c) {
     sets: {
       id: c.id, day_id: c.id, block_id: c.id, exercise_id: c.id, slot: c.int(1, L.SLOT_MAX), set_n: c.int(1, L.SET_N_MAX),
       side: c.oneOf(['L', 'R', 'none']), kind: c.oneOf(['warmup', 'work']),
-      target: c.shape({ load: loadN, rep_low: repsN, rep_high: repsN, load_basis: c.oneOf(['total', 'per_side', 'per_hand']), count_label: c.oneOfOrNull(COUNT_LABELS), reps_left_target: c.intOrNull(0, 4) }),
+      target: c.shape(targetSpec),
       draft, done, status: c.oneOf(['planned', 'done', 'skipped']), origin: c.oneOf(['plan', 'added']),
       saved_at: c.timeOrNull, first_done_at: c.timeOrNull, why: c.oneOf(WHY)
     },
@@ -293,12 +341,70 @@ function rowSpecs(c) {
       label_set: c.exact('w1')
     }
   };
+  if (!two) return specs;
+
+  // ---- schema 2 (16 B.6.1a) ----
+  const profile = c.oneOf(PROFILES);
+  // Exactly 0 or 3 lines, each 1 to 120 (his three Adjust each round condition lines).
+  const switchConditions = (v, w) => {
+    const out = c.arr(3, c.line(L.WORDS))(v, w);
+    if ((out.length !== 0 && out.length !== 3) || out.some(x => x.length < 1)) bad(w + ': 0 or 3 lines of 1 or more characters');
+    return out;
+  };
+  const words2 = {
+    levels: c.map(MUSCLE_DETAILS.length, c.oneOf(MUSCLE_DETAILS), c.oneOf(LEVELS)),
+    switch_conditions: switchConditions,
+    sleep_hint: c.line(L.WORDS),
+    flag_questions: c.shape({ machine: c.line(L.FLAG_Q), no_added_sets: c.line(L.FLAG_Q), left_out_of_builder: c.line(L.FLAG_Q) })
+  };
+  const ticks = (v, w) => (Array.isArray(v) && v.length === 3 && v.every(x => x === true)) ? [true, true, true] : bad(w + ': three ticks');
+  // A block file never sets a profile (16 B.6.4): Fixed only, no switch.
+  specs.blockBody = {
+    ...blockBody, profile: c.exact('fixed'),
+    rules_frozen: c.shape({ profile: c.exact('fixed'), rules_version: c.oneOf(RULE_VERSIONS) }),
+    profile_switch: c.opt(c.nullOnly, () => null), ...words2
+  };
+  specs.blocks = {
+    ...specs.blocks, ...words2, profile,
+    rules_frozen: c.shape({ profile, rules_version: c.oneOf(RULE_VERSIONS) }),
+    profile_switch: c.shapeOrNull({ switched_at: c.time, ticks, back_at: c.timeOrNull }),
+    template_id: c.idOrNull,
+    copied_from: c.shapeOrNull({ block_id: c.id, pass: c.int(1, L.PASS_MAX) }),
+    finished_at: c.timeOrNull
+  };
+  specs.exercises = {
+    ...specs.exercises, muscle_detail: c.oneOfOrNull(MUSCLE_DETAILS), equipment_detail: c.oneOf(EQUIPMENT_DETAILS),
+    load_kind: c.oneOf(LOAD_KINDS), tags: c.arrUnique(0, 2, c.oneOf(TAG_CODES))
+  };
+  // A body weight: 20 to 1000 with one decimal at most (R4-21).
+  const bodyWeight = (v, w) => v === null ? null :
+    (typeof v === 'number' && Number.isFinite(v) && v >= L.BODY_WEIGHT_MIN && v <= L.BODY_WEIGHT_MAX && Math.round(v * 10) / 10 === v) ? v : bad(w + ': bad body weight');
+  specs.days = { ...specs.days, short_sleep_since_last: c.boolOrNull, profile, body_weight: bodyWeight };
+  specs.sets = {
+    ...specs.sets,
+    // failure_set: optional (a missing key is read by the engine's position rule); effort_only:
+    // optional, missing = false (16 B.6.1). Neither is written by the migration.
+    target: c.shape({ ...targetSpec, failure_set: c.opt(c.bool, () => ABSENT), effort_only: c.opt(c.bool, () => ABSENT) }),
+    set_type: c.oneOf(SET_KINDS), set_type_by_hand: c.bool, add_scope: c.oneOfOrNull(ADD_SCOPES), why: c.oneOf(WHY_KEYS)
+  };
+  specs.feedback = { ...specs.feedback, muscle: c.oneOf([...MUSCLES, ...MUSCLE_DETAILS]) };
+  // His own templates only (17 C.0.3).
+  const slot = c.shape({ exercise_id: c.id, rep_low: repsN, rep_high: repsN, priority: c.oneOfOrNull(LEVELS), sets: c.intOrNull(1, L.SETS_MAX) });
+  const listOf = (min, max, item) => (v, w) => { const out = c.arr(max, item)(v, w); if (out.length < min) bad(w + ': bad list'); return out; };
+  specs.templates = {
+    id: (v, w) => (typeof v === 'string' && TEMPLATE_ID_RE.test(v)) ? v : bad(w + ': bad template id'),
+    // name: the exercise name rule (1 to NAME characters, textOk('name')).
+    author: c.exact('mine'), name: specs.exercises.name, made_at: c.time, from_block_id: c.idOrNull,
+    days: listOf(1, L.DAYS_PER_BLOCK, c.shape({ label: c.line(L.LABEL), slots: listOf(1, L.LIFTS_PER_DAY, slot) }))
+  };
+  return specs;
 }
 
 // A settings row. A key the app does not know (or restore_note, a device key never read from
 // a file) gives null: the row is dropped and the file still reads, so a newer file never
 // locks out an older copy of the app (15, settings rule). Every known key is checked by type.
 function settingRow(c, v, w) {
+  const tipKey = c.oneOf(TIP_IDS);
   if (!isObj(v) || !own(v, 'key') || !own(v, 'value') || typeof v.key !== 'string') bad(w + ': bad settings row');
   if (!SETTING_KEYS.includes(v.key)) return null;
   const key = v.key;
@@ -307,7 +413,12 @@ function settingRow(c, v, w) {
     unit: c.oneOf(['lb', 'kg']), active_block_id: c.idOrNull, profile: c.exact('fixed'),
     last_backup_at: c.timeOrNull, persist_answer: c.boolOrNull, theme: c.oneOf(['phone', 'light', 'dark']),
     seeded_version: (x, ww) => x === null ? null : c.text(LIMITS.VERSION_STR, 1)(x, ww),
-    carry_down: c.bool, rep_ask: c.bool
+    carry_down: c.bool, rep_ask: c.bool,
+    // 17 C.0.2: 1 to 10 kinds (an empty list refuses the file); the tips he closed; the version
+    // whose what-changed note he saw (the two last are device keys).
+    equipment_saved: c.arrUnique(1, 10, c.oneOf(EQUIPMENT_DETAILS)),
+    tips_seen: c.map(TIP_IDS.length, tipKey, c.exact(true)),
+    seen_version: (x, ww) => versionText(x) === x ? x : bad(ww + ': bad version')
   }[key];
   return { key, value: check(val, w + '.value') };
 }
@@ -324,8 +435,9 @@ export function repPairOk(low, high) {
   return high === null || low <= high;
 }
 
-// Rules that span fields of one row (5.5a).
-function rowRules(store, r, w) {
+// Rules that span fields of one row (5.5a; schema 2, 16 B.6.1a).
+function rowRules(store, r, w, schema = SCHEMA) {
+  if (schema >= 2) rowRules2(store, r, w);
   if (store === 'sets') {
     if (r.status === 'done' && r.done === null) bad(w + ': done set has no done values');
     if (r.status === 'planned' && r.done !== null) bad(w + ': planned set has done values');
@@ -344,6 +456,75 @@ function rowRules(store, r, w) {
     if (new Set(dayNs).size !== dayNs.length) bad(w + ': a day number repeats');
     for (const dt of r.day_templates) { const sl = dt.lifts.map(l => l.slot); if (new Set(sl).size !== sl.length) bad(w + ': a slot number repeats in one day'); }
   }
+}
+
+function rowRules2(store, r, w) {
+  if (store === 'exercises') {
+    if (r.muscle_detail !== null && MUSCLE_DETAIL_CHIP[r.muscle_detail] !== r.muscle) bad(w + ': muscle detail is not in its muscle group');
+    if (EQUIPMENT_DETAIL_CHIP[r.equipment_detail] !== r.equipment) bad(w + ': equipment detail is not in its equipment group');
+  }
+  if (store === 'blocks') {
+    if (r.rules_frozen.profile !== r.profile) bad(w + ': frozen profile differs from the block profile');
+    if (r.profile === 'adaptive' && r.rules_frozen.rules_version !== 'signed-1') bad(w + ': an adaptive block needs the signed rules');
+    const ps = r.profile_switch;
+    if (ps !== null) {
+      if (ps.switched_at < LIMITS.ADJUST_EARLIEST_MS) bad(w + ': switched before the earliest day');
+      if (ps.back_at !== null && !(ps.back_at > ps.switched_at)) bad(w + ': back to Fixed before the switch');
+    }
+    if (r.profile === 'adaptive' && (ps === null || ps.back_at !== null)) bad(w + ': an adaptive block needs a switch in force');
+    if (r.profile === 'fixed' && ps !== null && ps.back_at === null) bad(w + ': a Fixed block holds a switch in force');
+    if (own(r, 'finished_at') && r.finished_at !== null && r.status !== 'done') bad(w + ': finished time on a block that is not done');
+  }
+  if (store === 'sets') {
+    if (r.kind === 'warmup' && (r.set_type !== 'normal' || r.set_type_by_hand !== false)) bad(w + ': a warm-up has a set kind');
+    if (r.origin === 'plan' && r.add_scope !== null) bad(w + ': a planned set has an add scope');
+    if (r.origin === 'added' && r.add_scope === null) bad(w + ': an added set has no add scope');
+    if (r.target.failure_set === true && r.kind !== 'work') bad(w + ': a failure goal on a warm-up');
+  }
+  if (store === 'templates') {
+    for (const d of r.days) for (const sl of d.slots) if (sl.rep_low !== null && sl.rep_high !== null && sl.rep_low > sl.rep_high) bad(w + ': bad rep range');
+  }
+}
+
+// ---------------- schema 2 helpers (16 B.6.2, 17 C.0.2) ----------------
+
+// An exercise row with the schema 2 fields: every field it already holds is kept, a missing one
+// takes the 17 C.0.2 default. Pure; reads no list (r4.4 R10: muscle_detail is null, the seed
+// upsert after the upgrade writes the list values).
+export function exerciseDefaults2(row) {
+  const out = { ...row };
+  if (!own(out, 'muscle_detail')) out.muscle_detail = null;
+  if (!own(out, 'equipment_detail')) out.equipment_detail = own(DETAIL_OF_EQUIPMENT, row.equipment) ? DETAIL_OF_EQUIPMENT[row.equipment] : null;
+  if (!own(out, 'load_kind')) out.load_kind = row.id === 'assisted_pull_up' ? 'assist' : row.equipment === 'bodyweight' ? 'body' : 'external';
+  if (!own(out, 'tags')) out.tags = [];
+  return out;
+}
+
+// A schema 1 block body (a stored block or a block file) with the schema 2 block-file fields
+// (16 B.6.4): lift set_type 'normal', no levels, no condition lines, no hint, no questions.
+function liftBlockBody2(b) {
+  return {
+    ...b, levels: {}, switch_conditions: [], sleep_hint: '',
+    flag_questions: { machine: '', no_added_sets: '', left_out_of_builder: '' },
+    day_templates: b.day_templates.map(dt => ({ ...dt, lifts: dt.lifts.map(l => ({ ...l, set_type: 'normal' })) }))
+  };
+}
+
+// MIGRATIONS[1] (16 B.6.2): the seven stores of schema 1 to schema 2. Pure and never edited after
+// ship: every row of every store is kept (settings rows untouched), ids, texts and times never
+// change, and an unknown why text throws.
+function migrate1(stores) {
+  const s = structuredClone(stores);
+  const list = (n) => Array.isArray(s[n]) ? s[n] : [];
+  const blockProfile = new Map(list('blocks').map(b => [b.id, b.profile]));
+  if (Array.isArray(s.exercises)) s.exercises = s.exercises.map(exerciseDefaults2);
+  if (Array.isArray(s.blocks)) s.blocks = s.blocks.map(b => ({ ...liftBlockBody2(b), profile_switch: null, template_id: null, copied_from: null, finished_at: null }));
+  if (Array.isArray(s.days)) s.days = s.days.map(d => ({ ...d, short_sleep_since_last: null, body_weight: null, profile: blockProfile.get(d.block_id) || 'fixed' }));
+  if (Array.isArray(s.sets)) s.sets = s.sets.map(x => {
+    if (!own(WHY_KEY_OF, x.why)) throw new BadFile('a set holds a why text this version does not know');
+    return { ...x, set_type: 'normal', set_type_by_hand: false, add_scope: x.origin === 'added' ? 'today' : null, why: WHY_KEY_OF[x.why] };
+  });
+  return s;
 }
 
 // ---------------- the backup file ----------------
@@ -391,13 +572,30 @@ export function validateBackupObject(f, opts) {
   for (const s of STORE_NAMES) storeBytes += utf8Length(JSON.stringify(f.stores[s]) || '');
   if (storeBytes > LIMITS.MAX_STORES_BYTES) bad('stores too large');
 
-  const specs = rowSpecs(c);
+  let out = checkStores(f.stores, f.counts, c, f.schema, opts);
+  // An older file is checked by its own table, migrated, then checked again by this version's
+  // table and the whole reference pass (16 B.6.2), so it comes out as a schema SCHEMA object that
+  // passes every check a SCHEMA file must pass. The row counts must not change.
+  if (f.schema < SCHEMA) {
+    const kept = Object.fromEntries(STORE_NAMES.map(s => [s, out[s].length]));
+    out = checkStores(migrate(out, f.schema), kept, c, SCHEMA, opts);
+  }
+  const counts = Object.fromEntries(STORE_NAMES.map(s => [s, out[s].length]));
+  return { stores: out, counts, schema: SCHEMA, exported_at: f.exported_at, exported_ms: Date.parse(f.exported_at), app_version: versionText(f.app_version) };
+}
+
+// Every row of the seven stores through the allow table of one schema, then the references
+// inside the file. Returns the rebuilt stores.
+function checkStores(stores, counts, c, schema, opts) {
+  const specs = rowSpecs(c, schema);
   const out = {};
   for (const s of STORE_NAMES) {
-    const rows = f.stores[s];
+    const rows = stores[s];
     if (!Array.isArray(rows)) bad(s + ': not a list');
-    if (rows.length > LIMITS.ROWS[s]) bad(s + ': too many rows');
-    if (f.counts[s] !== rows.length) bad(s + ': count does not match');
+    // Schema 1 has no templates rows (17 C.0.3 adds them with schema 2).
+    const cap = s === 'templates' && schema < 2 ? 0 : LIMITS.ROWS[s];
+    if (rows.length > cap) bad(s + ': too many rows');
+    if (counts[s] !== rows.length) bad(s + ': count does not match');
     const seen = new Set();
     out[s] = [];
     rows.forEach((v, i) => {
@@ -407,7 +605,7 @@ export function validateBackupObject(f, opts) {
       const k = s === 'settings' ? r.key : r.id;
       if (seen.has(k)) bad(w + ': duplicate id');
       seen.add(k);
-      rowRules(s, r, w);
+      rowRules(s, r, w, schema);
       out[s].push(r);
     });
   }
@@ -465,8 +663,9 @@ export function validateBackupObject(f, opts) {
   for (const r of out.settings) {
     if (r.key === 'active_block_id' && r.value !== null && !blocks.has(r.value)) bad('settings: active block missing');
   }
-  const counts = Object.fromEntries(STORE_NAMES.map(s => [s, out[s].length]));
-  return { stores: out, counts, schema: f.schema, exported_at: f.exported_at, exported_ms: Date.parse(f.exported_at), app_version: versionText(f.app_version) };
+  // A template slot names an exercises row in the same file (17 C.0.3).
+  for (const r of out.templates) for (const d of r.days) for (const sl of d.slots) if (!ex.has(sl.exercise_id)) bad('templates: names a missing exercise');
+  return out;
 }
 
 // The version shown on the restore sheet: only a plain x.y.z version, else nothing (C10).
@@ -485,8 +684,8 @@ export function validateBackup(text, opts) {
   }
 }
 
-// Schema 1 has nothing to migrate. migrate() still returns every store.
-export const MIGRATIONS = {};
+// One pure step per schema (16 B.6.2). migrate() returns every store.
+export const MIGRATIONS = { 1: migrate1 };
 export function migrate(stores, fromSchema) {
   let d = stores;
   for (let v = fromSchema; v < SCHEMA; v++) d = MIGRATIONS[v](d);
@@ -540,6 +739,15 @@ export function backupFileName(now) {
   return 'liftlog-backup-' + iso.slice(0, 10) + '-' + iso.slice(11, 13) + iso.slice(14, 16) + '.json';
 }
 
+// Met or missed (16 B.3 shared terms, B.5 row 5): a done work set with a rep goal met it when
+// done.reps reaches target.rep_low. Null on a warm-up, a skipped set, an effort-only set, the
+// planned failure set and a set with no rep goal.
+function metOf(x) {
+  if (x.kind !== 'work' || x.status !== 'done' || !x.done || x.done.reps === null) return null;
+  if (x.target.rep_low === null || x.target.effort_only === true || x.target.failure_set === true) return null;
+  return x.done.reps >= x.target.rep_low;
+}
+
 // One row per set with status done or skipped, from days with status done only (DESIGN 5.4).
 export function flatLog(s) {
   const ex = new Map(s.exercises.map(r => [r.id, r]));
@@ -576,6 +784,19 @@ export function flatLog(s) {
     row.set_id = x.id;
     row.saved_at = x.saved_at === null ? null : isoLocal(x.saved_at);
     row.first_done_at = isoLocal(x.first_done_at !== null ? x.first_done_at : (x.saved_at !== null ? x.saved_at : day.done_at));
+    // Schema 2 columns (R4-26, 16 B.6.4, 17 C.0.2). A field a row does not hold reads null.
+    row.set_type = own(x, 'set_type') ? x.set_type : null;
+    row.why = x.why;
+    row.goal_load = x.target.load;
+    row.goal_reps_low = x.target.rep_low;
+    row.goal_reps_high = x.target.rep_high;
+    row.goal_failure_set = own(x.target, 'failure_set') ? x.target.failure_set : null;
+    row.met = metOf(x);
+    row.exercise_id = x.exercise_id;
+    row.done_at = day.done_at === null ? null : isoLocal(day.done_at);
+    row.short_sleep_since_last = own(day, 'short_sleep_since_last') ? day.short_sleep_since_last : null;
+    row.body_weight = own(day, 'body_weight') ? day.body_weight : null;
+    row.profile = own(day, 'profile') ? day.profile : null;
     rows.push(row);
   }
   return rows;
@@ -613,12 +834,19 @@ export function validateBlock(text, opts) {
     if (!Number.isInteger(f.schema) || f.schema < 1) bad('bad schema');
     if (!(f.schema <= SCHEMA)) throw new BadFile('newer schema', 'toonew');
     const c = makeChecks(opts.now);
-    const specs = rowSpecs(c);
     const source_id = c.id(f.source_id, 'source_id');
     const version = c.int(1, LIMITS.BLOCK_VERSION_MAX)(f.version, 'version');
-    const block = buildRow(specs.blockBody, f.block, 'block');
-    rowRules('blocks', block, 'block');
-    const exs = c.arr(LIMITS.BLOCK_EXERCISES, (v, w) => buildRow(specs.exercises, v, w))(f.exercises, 'exercises');
+    const read = (body, list, schema) => {
+      const specs = rowSpecs(c, schema);
+      const b = buildRow(specs.blockBody, body, 'block');
+      rowRules('blocks', b, 'block', schema);
+      const e = c.arr(LIMITS.BLOCK_EXERCISES, (v, w) => { const r = buildRow(specs.exercises, v, w); rowRules('exercises', r, w, schema); return r; })(list, 'exercises');
+      return [b, e];
+    };
+    let [block, exs] = read(f.block, f.exercises, f.schema);
+    // An older block file is checked by its own table, lifted with the shared helpers, then checked
+    // again by this version's table (16 B.6.4, B.6.2).
+    if (f.schema < SCHEMA) [block, exs] = read(liftBlockBody2(block), exs.map(exerciseDefaults2), SCHEMA);
     const local = new Set();
     // A local exercise may never take a list id (SB2): a first load and a later update would map
     // the same lift two different ways (a custom copy first, the list row later).
@@ -633,6 +861,14 @@ export function validateBlock(text, opts) {
     for (const dt of block.day_templates) for (const l of dt.lifts) if (!known(l.exercise_id)) throw new BadFile('unknown exercise', 'badref');
     for (const k of Object.keys(block.exercise_flags)) if (!known(k)) throw new BadFile('unknown exercise', 'badref');
     for (const ck of block.checks) for (const id of (ck.lifts || [])) if (!known(id)) throw new BadFile('unknown exercise', 'badref');
+    // A level names only a muscle one of the block's own lifts trains (17 C.0.3, r4 review R18):
+    // the lift's exercise is a row of the file or a list row the caller passes in opts.seedRows.
+    // With no seedRows a list lift trains no known muscle, so a level on it refuses the file.
+    const detail = new Map((opts.seedRows || []).map(r => [r.id, r.muscle_detail]));
+    for (const e of exs) detail.set(e.id, e.muscle_detail);
+    const trained = new Set();
+    for (const dt of block.day_templates) for (const l of dt.lifts) if (detail.get(l.exercise_id)) trained.add(detail.get(l.exercise_id));
+    for (const k of Object.keys(block.levels)) if (!trained.has(k)) bad('block: a level names a muscle no lift of the block trains');
     return { ok: true, source_id, version, block, exercises: exs };
   } catch (e) {
     if (e instanceof BadFile) return { ok: false, code: e.code, why: e.message };

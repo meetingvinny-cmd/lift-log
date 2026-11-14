@@ -4,11 +4,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createStore, localDate, NotSaved } from '../../../store.js';
+import { createStore, localDate, NotSaved, checksFor } from '../../../store.js';
 import { buildBackup, validateBackup, validateSnapshotRow } from '../../../backup.js';
 import { SEED_EXERCISES, SEED_IDS } from '../../../data/exercises.js';
 import { APP_VERSION } from '../../../version.js';
 import { createFakeDb, fakeClock } from './fake_db.js';
+import { planDay, startingSets } from '../../../engine.js';
+import { RULES } from '../../../rules.js';
+import { LIMITS } from '../../../backup.js';
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const blockV1 = () => JSON.parse(readFileSync(join(FIX, 'block_v1.json'), 'utf8'));
@@ -27,7 +30,9 @@ const SPEC = () => ({ name: 'Two day', passes: 3, day_templates: [
 const WRITES = ['seed', 'setSetting', 'createBlock', 'tick', 'untick', 'saveDraft', 'skipSet', 'unskip', 'skipExercise',
   'stopExercise', 'addSet', 'swapExercise', 'saveFeedback', 'saveExerciseText', 'addCustomExercise', 'finishDay',
   'markBackedUp', 'saveSnapshot', 'restoreFile', 'undoSnapshot', 'eraseAll', 'clearSnapshots', 'importBlock',
-  'relabelDay', 'addSetBelow', 'deleteSet', 'moveSlot', 'resetDay', 'skipDay', 'saveChecks', 'takeRestoreNote', 'probe'];
+  'relabelDay', 'addSetBelow', 'deleteSet', 'moveSlot', 'resetDay', 'skipDay', 'saveChecks', 'takeRestoreNote', 'probe',
+  // Slice 2 (16 B.4.8, r4.4 R4 c): every new store write joins the list.
+  'answerSleep', 'setSetType', 'saveSoreness', 'liveEdit', 'resize', 'switchProfile', 'switchBack', 'changeAnswers', 'endBlock'];
 const invariant = { checks: 0 };
 async function assertRestorable(db, store, clock, after) {
   const file = await store.backupObject();
@@ -150,13 +155,13 @@ test('add, skip, swap, undo and skip set', async () => {
   assert.equal(skipped, v.sets[0].id);
   const sk = await db.get('sets', skipped);
   assert.equal(sk.status, 'skipped');
-  assert.equal(sk.why, 'Skipped by you');
+  assert.equal(sk.why, 'why.skipped');
   assert.equal(sk.draft, null);
   const nextOpen = (await store.dayView(day.id)).sets.find(s => s.slot === 1 && s.status === 'planned');
   assert.equal(nextOpen.id, v.sets[1].id);
   await store.unskip(skipped);
   assert.equal((await db.get('sets', skipped)).status, 'planned');
-  assert.equal((await db.get('sets', skipped)).why, 'As written on your block');
+  assert.equal((await db.get('sets', skipped)).why, 'why.plan');
   clock.add(MIN);
   const n = await store.skipExercise(day.id, 2);
   assert.equal(n, 2);
@@ -219,7 +224,7 @@ test('Finish day: leftovers become skipped Not done, the next day is planned', a
   assert.deepEqual(next, { pass: 1, day: 2 });
   const left = (await db.byIndex('sets', 'day_id', day.id)).filter(s => s.status === 'skipped');
   assert.equal(left.length, 3);
-  assert.ok(left.every(s => s.why === 'Not done'));
+  assert.ok(left.every(s => s.why === 'why.notdone'));
   assert.equal((await db.get('days', day.id)).status, 'done');
   assert.equal((await store.currentDay()).id, b.id + ':p1:d2');
   await logDay(store, clock);
@@ -652,7 +657,7 @@ test('re-plan never writes over a set he added or a swap he made on a day not st
   await store.importBlock(JSON.stringify(v2), false);
   const a = await db.get('sets', added);
   assert.equal(a.origin, 'added', 'the added set is still his');
-  assert.equal(a.why, 'Added by you');
+  assert.equal(a.why, 'why.added');
   const sw = (await db.byIndex('sets', 'day_id', dB)).filter(s => s.slot === newSlot);
   assert.ok(sw.length > 0 && sw.every(s => s.exercise_id === 'cable_row' && s.origin === 'added'), 'the swap is still his');
 });
@@ -1122,7 +1127,7 @@ test('add set below moves later set numbers', async () => {
   assert.equal(n.origin, 'added');
   assert.equal(n.status, 'planned');
   assert.deepEqual(n.target, s1.target);
-  assert.equal(n.why, 'Added by you');
+  assert.equal(n.why, 'why.added');
   // flat_log set_number follows set_n.
   for (const s of ns(await sets(), 1)) if (s.status === 'planned') { clock.add(MIN); await store.tick(s.id, V(100, 10)); }
   for (const s of (await sets()).filter(x => x.slot !== 1 && x.status === 'planned')) { clock.add(MIN); await store.tick(s.id, V(50, 10)); }
@@ -1290,7 +1295,7 @@ test('reset an open day: done sets go back to planned, first_done_at kept, skipp
     assert.equal(s.done, null);
     assert.equal(s.draft, null);
     assert.equal(s.first_done_at, first, 'first_done_at kept');
-    assert.ok(['As written on your block', 'Added by you'].includes(s.why));
+    assert.ok(['why.plan', 'why.added'].includes(s.why));
   }
   assert.equal(after.filter(s => s.status === 'skipped').length, 1, 'the skipped set stays skipped');
   const d = await db.get('days', day.id);
@@ -1350,7 +1355,7 @@ test('Skip day skips every planned set', async () => {
   assert.equal(sets.length, 4);
   for (const s of sets) {
     assert.equal(s.status, 'skipped');
-    assert.equal(s.why, 'Day skipped');
+    assert.equal(s.why, 'why.dayskipped');
     assert.equal(s.draft, null, 'the draft is cleared');
   }
   const d = await db.get('days', day.id);
@@ -2220,4 +2225,986 @@ test('SB5: a check answer on a planned day, then a block update that drops the l
   assert.equal((await db.byIndex('sets', 'day_id', dId)).filter(s => s.slot === 3).length, 0, 'the slot holds no set');
   assert.equal(await db.get('feedback', dId + ':x3'), undefined, 'its feedback row is gone');
   assert.ok(await db.get('feedback', dId + ':x1'), 'a slot that still holds sets keeps its row');
+});
+
+// ---------------- Slice 2, B.1 step 4: the version 2 upgrade on the fake db (16 B.6.2, B.12, M38) ----------------
+
+const fileV1 = () => JSON.parse(readFileSync(join(FIX, 'backup_v1.json'), 'utf8'));
+const fileV1as2 = () => JSON.parse(readFileSync(join(FIX, 'backup_v1_as_v2.json'), 'utf8'));
+const KEYS_OF = { settings: 'key' };
+const byKey = (s, rows) => [...rows].sort((a, b) => String(a[KEYS_OF[s] || 'id']) < String(b[KEYS_OF[s] || 'id']) ? -1 : 1);
+const UPGRADE_AT = '2026-11-14T09:00:00-05:00';
+
+async function upgradeSetup(rows, version = 1) {
+  const db = createFakeDb({ version, rows });
+  const clock = fakeClock(UPGRADE_AT);
+  const store = guarded(db, createStore({ db, now: clock.now, writeLimitMs: 50 }), clock);
+  return { db, clock, store };
+}
+
+test('upgrade: a schema 1 db opened at version 2 has a before-upgrade copy, every row migrated, counts equal', async () => {
+  const f = fileV1();
+  const { db, clock } = await upgradeSetup(f.stores);
+  await db.ready();
+  assert.equal(db.upgradeFailed(), false);
+  assert.equal(db.version(), 2);
+  assert.equal(db.upgradeSpy.hookCalls, 1);
+  const want = fileV1as2().stores;
+  for (const s of Object.keys(want)) {
+    const rows = await db.all(s);
+    assert.equal(rows.length, f.counts[s], 'count of ' + s);
+    assert.deepEqual(byKey(s, rows), byKey(s, want[s]), 'rows of ' + s + ' are the MIGRATIONS[1] rows');
+  }
+  const snaps = await db.all('snapshots');
+  assert.equal(snaps.length, 1);
+  const c = snaps[0];
+  assert.deepEqual(Object.keys(c).sort(), ['data', 'id', 'last_backup_at_then', 'made_at', 'reason']);
+  assert.equal(c.reason, 'before-upgrade');
+  assert.equal(c.made_at, clock.now());
+  assert.equal(c.id, 's' + clock.now());
+  assert.equal(c.last_backup_at_then, 1793661269000);
+  assert.equal(c.data.schema, 1);
+  assert.ok(!('flat_log' in c.data));
+  for (const s of Object.keys(f.stores)) assert.deepEqual(byKey(s, c.data.stores[s]), byKey(s, f.stores[s]), 'the copy holds the schema 1 rows of ' + s);
+  // The copy reads back through the same allow table as any file, as a schema 2 object.
+  const v = validateSnapshotRow(c, { now: clock.now(), seedIds: SEED_IDS });
+  assert.equal(v.schema, 2);
+});
+
+test('upgrade: the copy trim keeps the newest 3 safety copies', async () => {
+  const f = fileV1();
+  const old = [1, 2, 3].map(i => ({ id: 's' + (1793000000000 + i), made_at: 1793000000000 + i, reason: 'before-erase', last_backup_at_then: null, data: f }));
+  const { db } = await upgradeSetup({ ...f.stores, snapshots: old });
+  await db.ready();
+  const ids = (await db.all('snapshots')).map(s => s.id).sort();
+  assert.equal(ids.length, 3);
+  assert.ok(!ids.includes('s1793000000001'), 'the oldest copy is trimmed');
+  assert.ok((await db.all('snapshots')).some(s => s.reason === 'before-upgrade'));
+});
+
+test('upgrade: a migration that throws leaves schema 1 rows deep-equal (M38)', async () => {
+  const f = fileV1();
+  // A why text MIGRATIONS[1] does not know, on a set: the step throws half way (after exercises,
+  // blocks and days are already migrated in its own copy).
+  f.stores.sets[10] = { ...f.stores.sets[10], why: 'A why text no version knows' };
+  const { db, store } = await upgradeSetup(f.stores);
+  const before = db.dump();
+  await assert.rejects(db.ready());
+  assert.equal(db.upgradeFailed(), true);
+  assert.equal(store.upgradeFailed(), true);
+  assert.equal(db.version(), 1, 'the phone stays on version 1');
+  assert.equal(db.dump(), before, 'every schema 1 row is as it was');
+  assert.equal(db._data.snapshots.size, 0, 'no copy is left behind');
+  // Every later call fails too, and writes nothing.
+  await assert.rejects(db.all('sets'));
+  await assert.rejects(store.setSetting('theme', 'dark'));
+  assert.equal(db.dump(), before);
+});
+
+test('upgrade: a version 0 open makes the stores fresh and no safety copy', async () => {
+  const db = createFakeDb({ version: 0 });
+  const clock = fakeClock(UPGRADE_AT);
+  const store = createStore({ db, now: clock.now, writeLimitMs: 50 });
+  await db.ready();
+  assert.equal(db.upgradeSpy.hookCalls, 0, 'the hook is never called on a new phone');
+  assert.equal(db.version(), 2);
+  assert.equal(db._data.snapshots.size, 0);
+  assert.equal(store.upgradeFailed(), false);
+});
+
+test('upgrade: Undo of the before-upgrade copy runs migrate on it and ends on schema 2 with the old rows', async () => {
+  const f = fileV1();
+  const { db, clock, store } = await upgradeSetup(f.stores);
+  await db.ready();
+  const up = (await store.listSnapshots()).find(s => s.reason === 'before-upgrade');
+  assert.ok(up);
+  clock.add(MIN);
+  await store.eraseAll();
+  assert.equal((await db.all('sets')).length, 0);
+  clock.add(MIN);
+  await store.undoSnapshot(up.id);
+  // The old rows as any restore reads them: the frozen MIGRATIONS[1] fixture through the allow table.
+  const read2 = validateBackup(JSON.stringify(fileV1as2()), { now: clock.now(), seedIds: SEED_IDS });
+  assert.ok(read2.ok, read2.why);
+  const want = read2.stores;
+  for (const s of ['exercises', 'templates', 'blocks', 'days', 'sets', 'feedback']) {
+    assert.deepEqual(byKey(s, await db.all(s)), byKey(s, want[s]), s + ' back as schema 2 rows');
+  }
+  assert.ok((await db.all('sets')).every(x => x.set_type === 'normal' && x.why.startsWith('why.')));
+  assert.equal(await db.setting('last_backup_at'), 1793661269000, 'the marker goes back to the copy\'s');
+  const file = await store.backupObject();
+  assert.equal(file.schema, 2);
+  assert.ok(validateBackup(JSON.stringify(file), { now: clock.now(), seedIds: SEED_IDS }).ok);
+});
+
+// ---------------- Slice 2, B.1 step 5 core: planDay takes over, the write guard, sleep, set kind ----------------
+
+const blockV2 = () => JSON.parse(readFileSync(join(FIX, 'block_v2.json'), 'utf8'));
+const workOf = (rows, slot) => rows.filter(x => x.slot === slot && x.kind === 'work').sort((a, b) => a.set_n - b.set_n || (a.side < b.side ? -1 : 1));
+// An adaptive block as a switch leaves it (16 B.6.1a). The switch call is built later (B.1 step 9),
+// so the test writes the block row straight into the fake db.
+async function makeAdaptive(db, blockId, switchedAt, more) {
+  const b = await db.get('blocks', blockId);
+  await db.put('blocks', { ...b, profile: 'adaptive', rules_frozen: { profile: 'adaptive', rules_version: 'signed-1' },
+    profile_switch: { switched_at: switchedAt, ticks: [true, true, true], back_at: null }, ...(more || {}) });
+}
+const ONE_DAY = (lifts, passes) => ({ name: 'One day', passes: passes === undefined ? 4 : passes, day_templates: [{ day: 1, label: 'A', lifts }] });
+// Play a planned day: tick every set at its target with reps, then the end answers, then Finish day.
+async function playDay(store, clock, dId, reps, answers) {
+  const v = await store.dayView(dId);
+  for (const x of v.sets) { clock.add(MIN); await store.tick(x.id, V(x.target.load === null ? 50 : x.target.load, reps)); }
+  for (const sl of v.slots) { clock.add(MIN); await store.saveFeedback(dId, sl, answers || {}, false); }
+  clock.add(MIN);
+  await store.finishDay(dId);
+  clock.add(2 * 24 * HOUR);
+}
+
+test('B.4.1: createBlock plans round 1 through planDay, rows with the schema 2 fields (CW3, FW1)', async () => {
+  const { db, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  assert.equal(b.profile, 'fixed');
+  assert.deepEqual(b.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.equal(b.profile_switch, null);
+  const ex = await store.exercisesMap();
+  for (const d of b.day_templates) {
+    const dId = b.id + ':p1:d' + d.day;
+    const day = await db.get('days', dId);
+    assert.equal(day.profile, 'fixed');
+    assert.equal(day.short_sleep_since_last, null);
+    assert.equal(day.body_weight, null);
+    const want = planDay(RULES.profiles.fixed, b, { exercises: ex }, { pass: 1, day: d.day });
+    const have = (await db.byIndex('sets', 'day_id', dId)).sort((x, y) => x.id < y.id ? -1 : 1);
+    assert.deepEqual(have.map(x => x.id), want.sets.map(x => x.id).sort());
+    for (const x of have) {
+      const w = want.sets.find(y => y.id === x.id);
+      const note = want.notes.find(n => n.slot === x.slot);
+      const fail = x.kind === 'work' && note.failure_set_n === x.set_n;
+      assert.deepEqual(x, { ...w, set_type: fail ? 'failure' : 'normal', set_type_by_hand: false, add_scope: null, target: { ...w.target, failure_set: fail, effort_only: false } });
+      assert.equal(x.why, 'why.plan');
+    }
+  }
+  // The machine failure lift (seated_leg_curl, failure_set true) carries the one failure set.
+  const curl = workOf(await db.byIndex('sets', 'day_id', b.id + ':p1:d1'), 3);
+  assert.deepEqual(curl.map(x => [x.set_n, x.set_type, x.target.failure_set]), [[1, 'normal', false], [2, 'failure', true]]);
+  // The builder path (createBlock) plans round 1 the same way.
+  const c = await store.createBlock(SPEC());
+  for (const d of c.day_templates) {
+    const want = planDay(RULES.profiles.fixed, c, { exercises: ex }, { pass: 1, day: d.day }).sets.map(x => x.id).sort();
+    const have = (await db.byIndex('sets', 'day_id', c.id + ':p1:d' + d.day));
+    assert.deepEqual(have.map(x => x.id).sort(), want);
+    assert.ok(have.every(x => x.why === 'why.plan' && x.set_type === 'normal' && x.set_type_by_hand === false && x.add_scope === null && x.target.failure_set === false && x.target.effort_only === false));
+  }
+});
+
+test('B.4.1: Finish day and Skip day plan the next day through planDay', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  await playDay(store, clock, b.id + ':p1:d1', 10);
+  const d2 = await db.byIndex('sets', 'day_id', b.id + ':p1:d2');
+  assert.ok(d2.length && d2.every(x => x.why === 'why.plan' && x.set_type === 'normal' && x.add_scope === null));
+  clock.add(MIN);
+  await store.skipDay(b.id + ':p1:d2');
+  const r2 = await db.get('days', b.id + ':p2:d1');
+  assert.ok(r2 && r2.status === 'planned' && r2.profile === 'fixed');
+  assert.equal((await db.byIndex('sets', 'day_id', r2.id)).length, 4);
+  assert.equal((await store.currentDay()).id, r2.id, 'currentDay reads the engine position');
+});
+
+test('B.4.2: the write guard keeps drafts, done, skipped, added, swapped and hand-picked rows (M16 kept)', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  const d1 = b.id + ':p1:d1', d2 = b.id + ':p1:d2';
+  // Day A: done and finished (round 1 day A), so it is never re-planned.
+  await playDay(store, clock, d1, 10);
+  const doneRows = await db.byIndex('sets', 'day_id', d1);
+  // Day B (planned): a set he added, a swap, a skipped set, a hand-picked kind.
+  const [addedId] = await store.addSet(d2, 1);
+  await store.swapExercise(d2, 3, 'leg_press');
+  const skipped = await store.skipSet(d2, 2);
+  const s1 = d2 + ':x1:s1:none';
+  await store.setSetType(s1, 'failure');
+  const keep = Object.fromEntries((await db.byIndex('sets', 'day_id', d2)).filter(x => [addedId, skipped, s1].includes(x.id) || x.origin === 'added').map(x => [x.id, x]));
+  const v2 = blockV1();
+  v2.version = 2;
+  for (const dt of v2.block.day_templates) for (const l of dt.lifts) if (l.start_load !== null) l.start_load += 10;
+  clock.add(MIN);
+  await store.importBlock(JSON.stringify(v2), false);
+  const after = await db.byIndex('sets', 'day_id', d2);
+  for (const [id, row] of Object.entries(keep)) assert.deepEqual(after.find(x => x.id === id), row, id + ' is never written by planning');
+  // The plan rows that pass the guard took the new loads.
+  assert.equal(after.find(x => x.id === d2 + ':x1:s2:none').target.load, 110);
+  assert.deepEqual(await db.byIndex('sets', 'day_id', d1), doneRows, 'a done day is never touched');
+});
+
+test('B.4.2: a planned day with a typed draft keeps its whole old plan on a block file update', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  const r1 = b.id + ':p1:d1';
+  await store.saveDraft(r1 + ':x1:s1:none', { load: 151 });
+  const before = await db.byIndex('sets', 'day_id', r1);
+  const v3 = blockV1();
+  v3.version = 3;
+  v3.block.day_templates[0].lifts[0].start_load = 175;
+  clock.add(MIN);
+  const preview = await store.readBlockFile(JSON.stringify(v3));
+  assert.equal(preview.keepDraft.length, 1);
+  await store.importBlock(JSON.stringify(v3), false);
+  assert.deepEqual(await db.byIndex('sets', 'day_id', r1), before, 'a day with a draft keeps its old targets');
+});
+
+test('setSetType: his kind on a work set is his; a re-plan keeps it; a warm-up and a bad kind are refused', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  const dId = b.id + ':p1:d1';
+  const row = await store.setSetType(dId + ':x3:s2:none', 'normal');
+  assert.equal(row.set_type, 'normal');
+  assert.equal(row.set_type_by_hand, true);
+  await assert.rejects(store.setSetType(dId + ':x1:w1:none', 'failure'), /not a work set/);
+  await assert.rejects(store.setSetType(dId + ':x1:s1:none', 'drop'), /bad kind/);
+  // LR: both rows of the set take the kind.
+  await store.setSetType(dId + ':x2:s1:L', 'failure');
+  assert.equal((await db.get('sets', dId + ':x2:s1:R')).set_type, 'failure');
+  clock.add(MIN);
+  await store.answerSleep(dId, true);
+  const kept = await db.get('sets', dId + ':x3:s2:none');
+  assert.equal(kept.set_type, 'normal', 'the re-plan never writes his kind back');
+  assert.equal(kept.target.reps_left_target, 0, 'and never writes the set');
+});
+
+// ---- sleep (16 B.4.3, T43, R4-13; r4 review R6, R8, R31) ----
+
+const FAIL_LIFT = () => [lift(1, 'leg_press', 2, 150, { failure_set: true, reps_left_target: 1 }), lift(2, 'lat_pulldown', 2, 100)];
+
+test('sleep: answer, clear, then a first tick keeps the answer; the card is gone once the day is open', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(ONE_DAY(FAIL_LIFT(), 4));
+  const dId = b.id + ':p1:d1';
+  assert.equal((await store.answerSleep(dId, true)).short_sleep_since_last, true);
+  assert.equal((await store.answerSleep(dId, null)).short_sleep_since_last, null, 'a tap on the picked chip clears it');
+  await store.answerSleep(dId, false);
+  clock.add(MIN);
+  await store.tick(dId + ':x1:s1:none', V(150, 10));
+  const d = await db.get('days', dId);
+  assert.equal(d.status, 'open');
+  assert.equal(d.short_sleep_since_last, false, 'the first tick keeps the answer');
+  await assert.rejects(store.answerSleep(dId, true), /day is not planned/);
+  await assert.rejects(store.answerSleep(dId, 'yes'), /bad answer/);
+});
+
+test('sleep: no answer, then a first tick stores null', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(ONE_DAY(FAIL_LIFT(), 4));
+  const dId = b.id + ':p1:d1';
+  clock.add(MIN);
+  await store.tick(dId + ':x1:s1:none', V(150, 10));
+  const d = await db.get('days', dId);
+  assert.equal(d.status, 'open');
+  assert.equal(d.short_sleep_since_last, null);
+});
+
+test('sleep: in Fixed a Yes sets the failure set goal to 2; a No or a clear puts back the written goal (M77)', async () => {
+  const { db, store } = await setup();
+  const b = await store.createBlock(ONE_DAY(FAIL_LIFT(), 4));
+  const dId = b.id + ':p1:d1';
+  const goal = async () => workOf(await db.byIndex('sets', 'day_id', dId), 1).map(x => [x.set_type, x.target.reps_left_target]);
+  assert.deepEqual(await goal(), [['normal', 1], ['failure', 1]]);
+  await store.answerSleep(dId, true);
+  assert.deepEqual(await goal(), [['normal', 1], ['failure', 2]], 'a Yes stops the failure set 2 short');
+  await store.answerSleep(dId, false);
+  assert.deepEqual(await goal(), [['normal', 1], ['failure', 1]], 'a No puts back the written goal');
+  await store.answerSleep(dId, true);
+  await store.answerSleep(dId, null);
+  assert.deepEqual(await goal(), [['normal', 1], ['failure', 1]], 'a clear puts back the written goal');
+});
+
+test('sleep: in Adjust each round a Yes sets the failure set goal to 2; a No or a clear puts back 0 (M77)', async () => {
+  const { db, clock, store } = await setup('2026-12-02T18:00:00-05:00');
+  const b = await store.createBlock(ONE_DAY(FAIL_LIFT(), 4));
+  await makeAdaptive(db, b.id, clock.now());
+  await playDay(store, clock, b.id + ':p1:d1', 10);
+  const dId = b.id + ':p2:d1';
+  assert.equal((await db.get('days', dId)).profile, 'adaptive');
+  const fail = async () => workOf(await db.byIndex('sets', 'day_id', dId), 1).filter(x => x.set_type === 'failure').map(x => x.target.reps_left_target);
+  assert.deepEqual(await fail(), [0]);
+  await store.answerSleep(dId, true);
+  assert.deepEqual(await fail(), [2]);
+  await store.answerSleep(dId, false);
+  assert.deepEqual(await fail(), [0]);
+  await store.answerSleep(dId, true);
+  await store.answerSleep(dId, null);
+  assert.deepEqual(await fail(), [0]);
+});
+
+test('sleep: R8 day, a Yes on the card brings the planned count back; a No plans the add again (R6, M80)', async () => {
+  const { db, clock, store } = await setup('2026-12-02T18:00:00-05:00');
+  const b = await store.createBlock(ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4));
+  await makeAdaptive(db, b.id, clock.now(), { levels: { quads: 'top', back: 'top' } });
+  await store.answerSleep(b.id + ':p1:d1', false);
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  const dId = b.id + ':p2:d1';
+  const count = async () => workOf(await db.byIndex('sets', 'day_id', dId), 1).length;
+  assert.equal(await count(), 3, 'row R8 adds a set');
+  assert.equal(workOf(await db.byIndex('sets', 'day_id', dId), 1)[0].why, 'why.R8');
+  await store.answerSleep(dId, true);
+  assert.equal(await count(), 2, 'a Yes on the day drops the add');
+  assert.ok(workOf(await db.byIndex('sets', 'day_id', dId), 1).every(x => x.why === 'why.sleep'));
+  await store.answerSleep(dId, false);
+  assert.equal(await count(), 3, 'a No plans it back');
+});
+
+test('rulesFor: a restored adaptive block on 2026-11-30 local plans as Fixed (R11, M83)', async () => {
+  // Built at 2026-11-30 3 PM New York, after a switch at 7 AM New York (12:00 UTC, past the earliest instant).
+  const { db, clock, store } = await setup('2026-11-30T15:00:00-05:00');
+  const b = await store.createBlock(ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4));
+  await makeAdaptive(db, b.id, Date.UTC(2026, 10, 30, 12), { levels: { quads: 'top', back: 'top' } });
+  const text = JSON.stringify(await store.backupObject());
+  const r = await setup('2026-11-30T15:00:00-05:00');
+  await r.store.restoreFile(text);
+  assert.equal((await r.db.get('blocks', b.id)).profile, 'adaptive');
+  await r.store.answerSleep(b.id + ':p1:d1', false);
+  await playDay(r.store, r.clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  // Finish day ran on 2026-11-30, local: the next day is planned as Fixed.
+  r.clock.set('2026-11-30T20:00:00-05:00');
+  const dId = b.id + ':p2:d1';
+  await r.store.answerSleep(dId, false);
+  assert.equal((await r.db.get('days', dId)).profile, 'fixed');
+  assert.equal(workOf(await r.db.byIndex('sets', 'day_id', dId), 1).length, 2, 'no add before 2026-12-01');
+  // From 2026-12-01 00:00 local it plans on its frozen profile.
+  r.clock.set('2026-12-01T00:00:00-05:00');
+  await r.store.answerSleep(dId, false);
+  assert.equal((await r.db.get('days', dId)).profile, 'adaptive');
+  assert.equal(workOf(await r.db.byIndex('sets', 'day_id', dId), 1).length, 3);
+});
+
+test('rulesFor: an adaptive block at a fake clock of 2026-11-20 plans as Fixed (R11, M83)', async () => {
+  // The switch time is ahead of this clock, so no backup of it reads now (the 2-day slack): the
+  // store runs without the restore check and the block row is written straight into the db.
+  const db = createFakeDb();
+  const clock = fakeClock('2026-11-20T18:00:00-05:00');
+  const store = createStore({ db, now: clock.now, writeLimitMs: 50 });
+  await store.seed();
+  const b = await store.createBlock(ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4));
+  await makeAdaptive(db, b.id, LIMITS.ADJUST_EARLIEST_MS, { levels: { quads: 'top', back: 'top' } });
+  await store.answerSleep(b.id + ':p1:d1', false);
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  const dId = b.id + ':p2:d1';
+  assert.equal((await db.get('days', dId)).profile, 'fixed');
+  assert.equal(workOf(await db.byIndex('sets', 'day_id', dId), 1).length, 2);
+});
+
+test('R12: delete set 2, tick set 3, Add set: the done row is unchanged', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(ONE_DAY([lift(1, 'leg_press', 3, 150), lift(2, 'lat_pulldown', 2, 100)], 4));
+  const dId = b.id + ':p1:d1';
+  await store.deleteSet(dId + ':x1:s2:none');
+  clock.add(MIN);
+  await store.tick(dId + ':x1:s3:none', V(150, 10));
+  const done = await db.get('sets', dId + ':x1:s3:none');
+  clock.add(MIN);
+  const [nid] = await store.addSet(dId, 1);
+  assert.equal(nid, dId + ':x1:s4:none');
+  assert.deepEqual(await db.get('sets', dId + ':x1:s3:none'), done, 'the done row is unchanged');
+  assert.deepEqual(workOf(await db.byIndex('sets', 'day_id', dId), 1).map(x => x.set_n), [1, 2, 3]);
+});
+
+test('R15: a re-plan after Add set on a planned day keeps set_n unique and in order (M86)', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  const dId = b.id + ':p1:d1';
+  const [added] = await store.addSet(dId, 1);
+  assert.equal(added, dId + ':x1:s4:none');
+  const v2 = blockV1();
+  v2.version = 2;
+  v2.block.day_templates[0].lifts[0].sets = 4;
+  clock.add(MIN);
+  await store.importBlock(JSON.stringify(v2), false);
+  const rows = workOf(await db.byIndex('sets', 'day_id', dId), 1);
+  assert.deepEqual(rows.map(x => x.set_n), [1, 2, 3, 4, 5], 'no two rows share a set_n');
+  assert.deepEqual(rows.map(x => x.origin), ['plan', 'plan', 'plan', 'plan', 'added'], 'his row stays after the plan rows');
+  assert.equal(rows[4].id, added, 'his row keeps its id');
+  assert.equal(new Set(rows.map(x => x.id)).size, 5);
+});
+
+test('R14: a block file update that changes the failure lift\'s load reaches the planned failure set (M85)', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const b = await store.importBlock(JSON.stringify(blockV1()), true);
+  const dId = b.id + ':p1:d1';
+  const v2 = blockV1();
+  v2.version = 2;
+  v2.block.day_templates[0].lifts[2].start_load = 80;
+  clock.add(MIN);
+  await store.importBlock(JSON.stringify(v2), false);
+  const curl = workOf(await db.byIndex('sets', 'day_id', dId), 3);
+  assert.deepEqual(curl.map(x => [x.set_type, x.target.failure_set, x.target.load]), [['normal', false, 80], ['failure', true, 80]]);
+});
+
+// ---- block file update, the fields the file wins (5.3, r4 review R18, M92) ----
+
+async function v2Case(edit) {
+  const ctx = await setup(null, { uuid: fixedIds() });
+  const b = await ctx.store.importBlock(JSON.stringify(blockV2()), true);
+  const f = blockV2();
+  f.version = 2;
+  edit(f.block);
+  ctx.clock.add(MIN);
+  await ctx.store.importBlock(JSON.stringify(f), false);
+  return { ...ctx, b, after: await ctx.db.get('blocks', b.id) };
+}
+test('M92: a block file update changes sleep_hint', async () => {
+  const { after } = await v2Case((x) => { x.sleep_hint = 'Made-up new sleep hint.'; });
+  assert.equal(after.sleep_hint, 'Made-up new sleep hint.');
+});
+test('M92: a block file update changes switch_conditions', async () => {
+  const lines = ['Made-up new line one.', 'Made-up new line two.', 'Made-up new line three.'];
+  const { after } = await v2Case((x) => { x.switch_conditions = lines; });
+  assert.deepEqual(after.switch_conditions, lines);
+});
+test('M92: a block file update changes flag_questions', async () => {
+  const { after } = await v2Case((x) => { x.flag_questions = { ...x.flag_questions, machine: 'Made-up new machine question?' }; });
+  assert.equal(after.flag_questions.machine, 'Made-up new machine question?');
+});
+test('M92: a block file update keeps edited levels, and fills empty ones from the file', async () => {
+  const ctx = await setup(null, { uuid: fixedIds() });
+  const b = await ctx.store.importBlock(JSON.stringify(blockV2()), true);
+  assert.deepEqual(b.levels, blockV2().block.levels, 'a new block takes the file levels');
+  await ctx.db.put('blocks', { ...(await ctx.db.get('blocks', b.id)), levels: { quads: 'middle' } });
+  const f = blockV2();
+  f.version = 2;
+  ctx.clock.add(MIN);
+  await ctx.store.importBlock(JSON.stringify(f), false);
+  assert.deepEqual((await ctx.db.get('blocks', b.id)).levels, { quads: 'middle' }, 'his edited levels stay');
+  await ctx.db.put('blocks', { ...(await ctx.db.get('blocks', b.id)), levels: {} });
+  f.version = 3;
+  ctx.clock.add(MIN);
+  await ctx.store.importBlock(JSON.stringify(f), false);
+  assert.deepEqual((await ctx.db.get('blocks', b.id)).levels, blockV2().block.levels, 'empty levels take the file\'s');
+});
+
+test('a new block and an imported block are always Fixed; a block file with profile adaptive is refused with every store unchanged', async () => {
+  const { db, store } = await setup(null, { uuid: fixedIds() });
+  const c = await store.createBlock({ ...SPEC(), profile: 'adaptive', rules_frozen: { profile: 'adaptive', rules_version: 'signed-1' }, profile_switch: { switched_at: 1, ticks: [true, true, true], back_at: null } });
+  assert.equal(c.profile, 'fixed');
+  assert.deepEqual(c.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.equal(c.profile_switch, null);
+  const i = await store.importBlock(JSON.stringify(blockV2()), false);
+  assert.equal(i.profile, 'fixed');
+  assert.deepEqual(i.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.equal(i.profile_switch, null);
+  const before = db.dump();
+  const bad = blockV2();
+  bad.source_id = 'made-up-other';
+  bad.block.profile = 'adaptive';
+  bad.block.rules_frozen = { profile: 'adaptive', rules_version: 'signed-1' };
+  assert.equal((await store.readBlockFile(JSON.stringify(bad))).ok, false);
+  await assert.rejects(store.importBlock(JSON.stringify(bad), true));
+  const bad2 = blockV2();
+  bad2.source_id = 'made-up-other';
+  bad2.block.profile_switch = { switched_at: LIMITS.ADJUST_EARLIEST_MS, ticks: [true, true, true], back_at: null };
+  await assert.rejects(store.importBlock(JSON.stringify(bad2), true));
+  assert.deepEqual(db.dump(), before, 'every store unchanged');
+});
+
+test('R15b: a sleep answer and a first tick on one day land in tap order', async () => {
+  const { db, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  const dId = b.id + ':p1:d1';
+  const id = dId + ':x1:s1:none';
+  await whileHeld(db, () => store.answerSleep(dId, true), () => store.tick(id, V(150, 9)));
+  const d = await db.get('days', dId);
+  assert.equal(d.status, 'open', 'the tick opened the day after the answer landed');
+  assert.equal(d.short_sleep_since_last, true, 'the answer is kept');
+  const s = await db.get('sets', id);
+  assert.equal(s.status, 'done', 'the tick is kept');
+  assert.equal(s.done.reps, 9);
+});
+
+// ---- the schema 2 fixture (16 B.6.3, r4.4 R12): made by the store, read back to the same rows ----
+
+test('backup_v2.json (made by the store) passes the schema 2 checks and round trips through restore', async () => {
+  const text = readFileSync(join(FIX, 'backup_v2.json'), 'utf8');
+  const f = JSON.parse(text);
+  assert.equal(f.schema, 2);
+  const { db, store } = await setup('2026-12-03T12:00:00-05:00');
+  const v = validateBackup(text, { now: Date.parse('2026-12-03T12:00:00-05:00'), seedIds: SEED_IDS });
+  assert.ok(v.ok, v.why);
+  assert.equal(v.schema, 2);
+  // What the fixture must hold (B.6.3): a sleep answer, a set kind he picked, a hand Add set,
+  // the planned failure set, the schema 2 block words, a custom exercise.
+  const st = f.stores;
+  assert.ok(st.days.some(d => d.short_sleep_since_last === true) && st.days.some(d => d.short_sleep_since_last === false));
+  assert.ok(st.sets.some(x => x.set_type === 'failure' && x.set_type_by_hand === true));
+  assert.ok(st.sets.some(x => x.origin === 'added' && x.add_scope === 'today'));
+  assert.ok(st.sets.some(x => x.set_type === 'failure' && x.target.failure_set === true && x.set_type_by_hand === false));
+  assert.ok(st.blocks[0].switch_conditions.length === 3 && st.blocks[0].sleep_hint && Object.keys(st.blocks[0].levels).length === 3);
+  assert.ok(st.exercises.some(e => e.custom && e.muscle_detail === null));
+  // From B.1 step 5 rest: the switch, a Rest of block add, a Change answers save.
+  assert.equal(st.blocks[0].profile, 'adaptive');
+  assert.deepEqual(st.blocks[0].profile_switch.ticks, [true, true, true]);
+  assert.equal(st.blocks[0].profile_switch.back_at, null);
+  assert.ok(st.sets.some(x => x.origin === 'added' && x.add_scope === 'rest'));
+  const changed = st.feedback.find(x => x.id.endsWith(':p1:d1:x1'));
+  assert.ok(changed && changed.pump === 3 && changed.checks.check_a === true && changed.saved_at > Math.max(...st.feedback.filter(x => x.day_id === changed.day_id && x.id !== changed.id).map(x => x.saved_at)));
+  await store.restoreFile(text);
+  const back = (await store.backupObject()).stores;
+  for (const s of ['exercises', 'templates', 'blocks', 'days', 'sets', 'feedback']) {
+    assert.deepEqual(byKey(s, back[s]), byKey(s, v.stores[s]), s + ' round trips');
+  }
+  assert.ok(db);
+});
+
+// ---------------- Slice 2, B.1 step 5 rest: live edits, the switch, Change answers, End block, resize, the reads ----------------
+
+const COND = ['Made-up condition one.', 'Made-up condition two.', 'Made-up condition three.'];
+const ADJ = '2026-12-02T18:00:00-05:00';
+const T3 = [true, true, true];
+const isRefused = (code) => (e) => e.name === 'Refused' && (code === undefined || e.message === code);
+// A two-day block he can switch: three condition lines, the leg press screened for added sets.
+const SWITCHABLE = (more) => ({ ...SPEC(), switch_conditions: COND, levels: { quads: 'top', back: 'top', chest: 'top' },
+  exercise_flags: { leg_press: { no_added_sets: false, left_out_of_builder: false }, chest_press_machine: { no_added_sets: false, left_out_of_builder: false } }, ...(more || {}) });
+const slotCount = async (db, dId, slot) => new Set(workOf(await db.byIndex('sets', 'day_id', dId), slot).map(x => x.set_n)).size;
+
+test('switch: refused at 2026-11-30 23:59 local, accepted at 2026-12-01 00:00 local with a stored profile_switch (M27)', async () => {
+  const { db, clock, store } = await setup('2026-11-30T23:59:00-05:00');
+  const b = await store.createBlock(SWITCHABLE());
+  assert.equal(await store.switchAllowed(b.id), false, 'the row is not offered before 2026-12-01');
+  const before = db.dump();
+  await assert.rejects(store.switchProfile(b.id, T3, 'ADJUST'), isRefused('too early'));
+  assert.equal(db.dump(), before, 'nothing written');
+  clock.set('2026-12-01T00:00:00-05:00');
+  assert.equal(await store.switchAllowed(b.id), true);
+  const nb = await store.switchProfile(b.id, T3, 'ADJUST');
+  const row = await db.get('blocks', b.id);
+  assert.deepEqual(row, nb);
+  assert.equal(row.profile, 'adaptive');
+  assert.deepEqual(row.rules_frozen, { profile: 'adaptive', rules_version: 'signed-1' });
+  assert.deepEqual(row.profile_switch, { switched_at: clock.now(), ticks: [true, true, true], back_at: null });
+  for (const d of await db.byIndex('days', 'block_id', b.id)) assert.equal(d.profile, 'adaptive', 'the untouched planned days are planned again');
+  assert.equal(await store.switchAllowed(b.id), false, 'an adaptive block shows Back to Fixed instead');
+  assert.equal(await store.switchBackAllowed(b.id), true);
+});
+
+test('switch: refused with 2 ticks or the word "adjust"; the typed word is exact after trim (M39)', async () => {
+  const { db, store } = await setup(ADJ);
+  const b = await store.createBlock(SWITCHABLE());
+  const before = db.dump();
+  for (const [ticks, word] of [[[true, true], 'ADJUST'], [[true, true, false], 'ADJUST'], [[true, true, true, true], 'ADJUST'], [T3, 'adjust'], [T3, 'Adjust'], [T3, 'ADJUST!'], [T3, ''], [T3, null], [null, 'ADJUST']]) {
+    await assert.rejects(store.switchProfile(b.id, ticks, word), isRefused(), JSON.stringify([ticks, word]));
+  }
+  assert.equal(db.dump(), before, 'nothing written');
+  await store.switchProfile(b.id, T3, '  ADJUST  ');
+  assert.equal((await db.get('blocks', b.id)).profile, 'adaptive');
+});
+
+test('switch: no condition lines, a bad rules table or a done block is refused; the switch re-plans and Back to Fixed plans as written', async () => {
+  const { db, clock, store } = await setup(ADJ);
+  const plain = await store.createBlock(SPEC());
+  await assert.rejects(store.switchProfile(plain.id, T3, 'ADJUST'), isRefused('no conditions'));
+  const bad = await setup(ADJ, { rulesOk: false });
+  const bb = await bad.store.createBlock(SWITCHABLE());
+  assert.equal(await bad.store.switchAllowed(bb.id), false, 'a bad table hides the row');
+  assert.equal(bad.store.rulesOk(), false);
+  await assert.rejects(bad.store.switchProfile(bb.id, T3, 'ADJUST'), isRefused('rules'));
+  assert.equal(store.rulesOk(), true);
+  // Round 1 day A on Fixed with R8 answers: round 2 day A plans 2 sets, the switch makes it 3.
+  const b = await store.createBlock(ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4));
+  await db.put('blocks', { ...(await db.get('blocks', b.id)), switch_conditions: COND, levels: { quads: 'top', back: 'top' } });
+  await store.answerSleep(b.id + ':p1:d1', false);
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  const dId = b.id + ':p2:d1';
+  await store.answerSleep(dId, false);
+  assert.equal(await slotCount(db, dId, 1), 2, 'Fixed plans as written');
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  assert.equal(await slotCount(db, dId, 1), 3, 'the switch re-plans the planned day (row R8)');
+  clock.add(MIN);
+  await store.switchBack(b.id);
+  const row = await db.get('blocks', b.id);
+  assert.equal(row.profile, 'fixed');
+  assert.equal(row.rules_frozen.profile, 'fixed');
+  assert.equal(row.profile_switch.back_at, clock.now());
+  assert.equal((await db.get('days', dId)).profile, 'fixed');
+  assert.equal(await slotCount(db, dId, 1), 2, 'Back to Fixed plans as written again');
+  await assert.rejects(store.switchBack(b.id), isRefused('not adaptive'));
+  // Switching on again needs the full sheet.
+  await assert.rejects(store.switchProfile(b.id, T3, 'adjust'), isRefused('word'));
+  clock.add(MIN);
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  assert.deepEqual((await db.get('blocks', b.id)).profile_switch, { switched_at: clock.now(), ticks: [true, true, true], back_at: null });
+  // A done block: no switch.
+  clock.add(MIN);
+  await store.endBlock(plain.id);
+  assert.equal(await store.switchAllowed(plain.id), false);
+});
+
+test('Change answers never turns a true check into false (M88)', async () => {
+  const { db, clock, store, day, slot } = await checkDay();
+  const fid = day.id + ':x' + slot;
+  await store.saveChecks(day.id, slot, { check_a: true });
+  clock.add(MIN);
+  await store.saveFeedback(day.id, slot, { pump: 2, soreness: 2, workload: 2, checks: { check_a: true }, note: '' }, false);
+  clock.add(MIN);
+  const row = await store.changeAnswers(fid, { pump: 3, checks: { check_a: false } });
+  assert.equal(row.checks.check_a, true, 'a No never clears a Yes');
+  assert.equal((await db.get('feedback', fid)).checks.check_a, true);
+  await store.changeAnswers(fid, { checks: { check_a: null } });
+  assert.equal((await db.get('feedback', fid)).checks.check_a, true, 'nor does a clear');
+  assert.equal((await db.get('feedback', fid)).pump, 3);
+  await assert.rejects(store.changeAnswers(fid, { checks: { check_z: true } }), isRefused('bad check'));
+  await assert.rejects(store.changeAnswers(fid, { pump: 5 }), isRefused('bad answer'));
+  await assert.rejects(store.changeAnswers(fid, { note: 'a' + String.fromCharCode(0x0b) + 'b' }), isRefused('bad text'));
+});
+
+test('Change answers writes a new saved_at and re-plans the next untouched day', async () => {
+  const { db, clock, store } = await setup(ADJ);
+  const b = await store.createBlock({ ...ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4), switch_conditions: COND, levels: { quads: 'top', back: 'top' } });
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  clock.add(MIN);
+  await store.answerSleep(b.id + ':p1:d1', false);
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  const dId = b.id + ':p2:d1';
+  assert.equal(await slotCount(db, dId, 1), 3, 'row R8 adds a set');
+  const fid = b.id + ':p1:d1:x1';
+  const was = await db.get('feedback', fid);
+  clock.add(MIN);
+  const row = await store.changeAnswers(fid, { soreness: 4 });
+  assert.equal(row.saved_at, clock.now());
+  assert.ok(row.saved_at > was.saved_at, 'a new saved_at');
+  assert.equal(row.soreness, 4);
+  assert.equal(row.muscle, 'quads', 'feedback.muscle is the muscle key');
+  assert.ok(await slotCount(db, dId, 1) < 3, 'the next day is planned from the new answers');
+  assert.equal(await slotCount(db, dId, 2), 3, 'the other lift keeps its plan');
+  // Once the next day has a tick, Change answers changes the answers only.
+  const s = workOf(await db.byIndex('sets', 'day_id', dId), 2)[0];
+  await store.tick(s.id, V(100, 10));
+  const plan = JSON.stringify(await db.byIndex('sets', 'day_id', dId));
+  clock.add(MIN);
+  await store.changeAnswers(fid, { soreness: 2 });
+  assert.equal(JSON.stringify(await db.byIndex('sets', 'day_id', dId)), plan, 'a started day is never planned again');
+});
+
+test('End block refused with a day open; planned days stay as they are', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  const d1 = b.id + ':p1:d1';
+  await store.tick(d1 + ':x1:s1:none', V(150, 10));
+  const before = db.dump();
+  await assert.rejects(store.endBlock(b.id), isRefused('day open'));
+  assert.equal(db.dump(), before, 'nothing written');
+  clock.add(MIN);
+  await store.finishDay(d1);
+  const planned = await db.get('days', b.id + ':p1:d2');
+  const nb = await store.endBlock(b.id);
+  assert.equal(nb.status, 'done');
+  assert.equal((await db.get('blocks', b.id)).status, 'done');
+  assert.deepEqual(await db.get('days', b.id + ':p1:d2'), planned, 'a planned day stays as it is');
+  await assert.rejects(store.endBlock(b.id), isRefused('block is done'));
+});
+
+test("liveEdit: a 'rest' swap after a move keeps the card's place; the template takes the new exercise with no weight", async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC_3SLOTS());
+  const day = await store.currentDay();
+  await store.moveSlot(day.id, 3, -1);
+  const ns = await store.liveEdit({ type: 'swap', dayId: day.id, slot: 3, exercise_id: 'cable_row' }, 'rest');
+  assert.deepEqual((await store.dayView(day.id)).slots, [1, ns, 2, 3]);
+  const l = (await db.get('blocks', b.id)).day_templates[0].lifts.find(x => x.slot === 3);
+  assert.deepEqual([l.exercise_id, l.start_load, l.rep_low, l.rep_high, l.sets], ['cable_row', null, null, null, 2]);
+  // Round 2 day A plans the new exercise with no weight.
+  const v = await store.dayView(day.id);
+  for (const s of v.sets.filter(x => x.status === 'planned')) { clock.add(MIN); await store.tick(s.id, V(s.target.load === null ? 40 : s.target.load, 10)); }
+  clock.add(MIN);
+  await store.finishDay(day.id);
+  await playDay(store, clock, b.id + ':p1:d2', 10);
+  const r2 = workOf(await db.byIndex('sets', 'day_id', b.id + ':p2:d1'), 3);
+  assert.ok(r2.length === 2 && r2.every(x => x.exercise_id === 'cable_row' && x.target.load === null));
+});
+
+test("liveEdit: a 'rest' swap on a 51-slot day keeps the card order capped", async () => {
+  const { db, store, clock, day, spare } = await longDay();
+  let target = 1;
+  for (let k = 0; k < 21; k++) { clock.add(MIN); target = await store.swapExercise(day.id, target, spare[k % spare.length]); }
+  clock.add(MIN);
+  const ns = await store.liveEdit({ type: 'swap', dayId: day.id, slot: 2, exercise_id: spare[0] }, 'rest');
+  const written = (await db.get('days', day.id)).slot_order;
+  assert.ok(written.length <= 50, 'the order holds ' + written.length + ' entries');
+  assert.ok(written.includes(ns));
+});
+
+test("liveEdit: a done day is deep-equal before and after every 'rest' edit (M37 store half)", async () => {
+  const { db, clock, store } = await setup(ADJ);
+  const b = await store.createBlock(SWITCHABLE());
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  const d1 = b.id + ':p1:d1', d2 = b.id + ':p1:d2';
+  const doneRows = async () => JSON.stringify([await db.get('days', d1), ...(await db.byIndex('sets', 'day_id', d1)).sort(setOrderOf), ...(await db.byIndex('feedback', 'day_id', d1))]);
+  const before = await doneRows();
+  const edits = [
+    { type: 'add_set', slot: 1 }, { type: 'swap', slot: 2, exercise_id: 'seated_leg_curl' }, { type: 'move', slot: 1, dir: 1 },
+    { type: 'relabel', label: 'Z' }, { type: 'add_exercise', exercise_id: 'cable_row', sets: 2 }, { type: 'remove', slot: 1 }];
+  for (const e of edits) {
+    clock.add(MIN);
+    await store.liveEdit({ ...e, dayId: d2 }, 'rest');
+    assert.equal(await doneRows(), before, e.type + ' leaves the done day as it was');
+  }
+  const tpl = (await db.get('blocks', b.id)).day_templates.find(d => d.day === 2);
+  assert.equal(tpl.label, 'Z');
+  assert.ok(tpl.lifts.some(l => l.exercise_id === 'cable_row' && l.rep_low === null && l.start_load === null), 'Add exercise with Rest of block adds the template lift');
+  assert.ok(!tpl.lifts.some(l => l.slot === 1), 'Remove with Rest of block drops the template lift');
+  assert.ok((await db.byIndex('sets', 'day_id', d2)).some(x => x.origin === 'added' && x.add_scope === 'rest'), 'Add set with Rest of block is the round hand add');
+  await assert.rejects(store.liveEdit({ type: 'add_set', dayId: d1, slot: 1 }, 'rest'), isRefused(), 'a done day refuses');
+  assert.equal(await doneRows(), before);
+});
+
+test('liveEdit: Add exercise takes 1 set in Fixed (his number when given), startingSets in Adjust each round, refused at LIFTS_PER_DAY', async () => {
+  const { db, store } = await setup(ADJ);
+  const b = await store.createBlock(SWITCHABLE());
+  const d1 = b.id + ':p1:d1';
+  assert.equal(await store.addExerciseDefault(d1, 'cable_row'), 1);
+  const s1 = await store.liveEdit({ type: 'add_exercise', dayId: d1, exercise_id: 'cable_row' }, 'today');
+  assert.equal(await slotCount(db, d1, s1), 1);
+  const rows = workOf(await db.byIndex('sets', 'day_id', d1), s1);
+  assert.ok(rows.every(x => x.origin === 'added' && x.add_scope === 'today' && x.target.load === null && x.target.rep_low === null && x.why === 'why.added'));
+  const s2 = await store.liveEdit({ type: 'add_exercise', dayId: d1, exercise_id: 'cable_row', sets: 4 }, 'today');
+  assert.equal(await slotCount(db, d1, s2), 4, 'his number in Fixed');
+  assert.equal((await db.get('blocks', b.id)).day_templates[0].lifts.length, 2, 'Today only leaves the template');
+  await assert.rejects(store.liveEdit({ type: 'add_exercise', dayId: d1, exercise_id: 'cable_row', sets: 21 }, 'today'), isRefused('bad sets'));
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  const want = startingSetsOf('top');
+  assert.equal(await store.addExerciseDefault(d1, 'cable_row'), want);
+  const s3 = await store.liveEdit({ type: 'add_exercise', dayId: d1, exercise_id: 'cable_row', sets: 20 }, 'rest');
+  assert.equal(await slotCount(db, d1, s3), want, 'startingSets in Adjust each round');
+  const l = (await db.get('blocks', b.id)).day_templates[0].lifts.find(x => x.slot === s3);
+  assert.equal(l.sets, want);
+  // A full day: LIFTS_PER_DAY exercises.
+  const { store: st2, day } = await longDay();
+  const before = JSON.stringify(await db.all('sets'));
+  await assert.rejects(st2.liveEdit({ type: 'add_exercise', dayId: day.id, exercise_id: 'cable_row' }, 'today'), isRefused('full'));
+  await assert.rejects(st2.liveEdit({ type: 'add_exercise', dayId: day.id, exercise_id: 'cable_row' }, 'rest'), isRefused('full'));
+  assert.equal(JSON.stringify(await db.all('sets')), before);
+});
+
+test('liveEdit: Remove skips every set not done Today only, Rest of block also drops the template lift; the last exercise is refused in both (code last)', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC_3SLOTS());
+  const d1 = b.id + ':p1:d1';
+  await store.tick(d1 + ':x1:s1:none', V(100, 10));
+  clock.add(MIN);
+  assert.equal(await store.liveEdit({ type: 'remove', dayId: d1, slot: 1 }, 'today'), 1);
+  const s1 = workOf(await db.byIndex('sets', 'day_id', d1), 1);
+  assert.deepEqual(s1.map(x => [x.status, x.why]), [['done', 'why.plan'], ['skipped', 'why.skipped']]);
+  assert.equal((await db.get('blocks', b.id)).day_templates[0].lifts.length, 3, 'Today only keeps the template');
+  await store.liveEdit({ type: 'remove', dayId: d1, slot: 2 }, 'rest');
+  assert.deepEqual((await db.get('blocks', b.id)).day_templates[0].lifts.map(l => l.slot), [1, 3]);
+  // Day B holds one exercise: Remove is refused in both scopes, nothing written.
+  const d2 = b.id + ':p1:d2';
+  const before = db.dump();
+  await assert.rejects(store.liveEdit({ type: 'remove', dayId: d2, slot: 1 }, 'today'), isRefused('last'));
+  await assert.rejects(store.liveEdit({ type: 'remove', dayId: d2, slot: 1 }, 'rest'), isRefused('last'));
+  assert.equal(db.dump(), before);
+});
+
+test('liveEdit: Add set is refused on no_added_sets or flags_set false in both profiles (code flag)', async () => {
+  const { db, store } = await setup(ADJ, { uuid: fixedIds() });
+  const nb = await store.importBlock(JSON.stringify(blockV1()), true);
+  await db.put('blocks', { ...(await db.get('blocks', nb.id)), switch_conditions: COND });
+  const d1 = nb.id + ':p1:d1';
+  // Slot 2: ex_p, no_added_sets on the block. A new card of his own lift: flags_set false, no block entry.
+  const own = await store.addCustomExercise({ name: 'My made-up lift', muscle: 'legs', equipment: 'cable' });
+  const s3 = await store.liveEdit({ type: 'add_exercise', dayId: d1, exercise_id: own.id }, 'today');
+  const before = db.dump();
+  for (const slot of [2, s3]) await assert.rejects(store.liveEdit({ type: 'add_set', dayId: d1, slot }, 'today'), isRefused('flag'), 'Fixed slot ' + slot);
+  assert.equal(db.dump(), before);
+  await store.switchProfile(nb.id, T3, 'ADJUST');
+  for (const slot of [2, s3]) for (const sc of ['today', 'rest']) await assert.rejects(store.liveEdit({ type: 'add_set', dayId: d1, slot }, sc), isRefused('flag'), 'Adjust ' + sc + ' slot ' + slot);
+  const ids = await store.liveEdit({ type: 'add_set', dayId: d1, slot: 1 }, 'rest');
+  assert.equal((await db.get('sets', ids[0])).add_scope, 'rest');
+});
+
+test('R13: a check scoped to a custom lift survives a Rest of block swap and a remove, each through back up and restore (M84, store half)', async () => {
+  const { db, clock, store } = await setup(null, { uuid: fixedIds() });
+  const f = blockV1();
+  f.block.checks[0].lifts = ['ex_p'];
+  const nb = await store.importBlock(JSON.stringify(f), true);
+  const exP = nb.id_map.ex_p;
+  const d1 = nb.id + ':p1:d1';
+  const roundTrip = async () => { clock.add(MIN); await store.restoreFile(JSON.stringify(await store.backupObject())); return db.get('blocks', nb.id); };
+  let b = await roundTrip();
+  assert.equal(checksFor(b, exP).length, 1, 'the check reads the phone id after import');
+  clock.add(MIN);
+  await store.liveEdit({ type: 'swap', dayId: d1, slot: 2, exercise_id: 'cable_row' }, 'rest');
+  b = await roundTrip();
+  assert.deepEqual(b.checks[0].lifts, ['cable_row'], 'the swap maps the check to the new lift');
+  assert.equal(checksFor(b, 'cable_row').length, 1);
+  clock.add(MIN);
+  await store.liveEdit({ type: 'remove', dayId: d1, slot: 2 }, 'rest');
+  b = await roundTrip();
+  assert.deepEqual(b.checks[0].lifts, ['cable_row'], 'a remove leaves the check list as it is');
+  assert.equal(checksFor(b, 'cable_row').length, 1);
+});
+
+test('R15a: a tick queued right after a Rest of block edit starts lands after it and is kept', async () => {
+  const { db, store } = await setup();
+  const b = await store.createBlock(SPEC_3SLOTS());
+  const dId = b.id + ':p1:d1';
+  const id = dId + ':x2:s1:none';
+  await whileHeld(db, () => store.liveEdit({ type: 'swap', dayId: dId, slot: 1, exercise_id: 'cable_row' }, 'rest'), () => store.tick(id, V(50, 9)));
+  const s = await db.get('sets', id);
+  assert.equal(s.status, 'done', 'the tick is kept');
+  assert.equal(s.done.reps, 9);
+  assert.equal((await db.get('days', dId)).status, 'open', 'the day the tick opened stays open');
+  assert.equal((await db.get('blocks', b.id)).day_templates[0].lifts[0].exercise_id, 'cable_row');
+});
+
+test('R15c: a tick on the next day queued right after Change answers starts lands after its re-plan and is kept', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  await playDay(store, clock, b.id + ':p1:d1', 10, { pump: 2, soreness: 2, workload: 2 });
+  const nextId = b.id + ':p1:d2:x1:s1:none';
+  await whileHeld(db, () => store.changeAnswers(b.id + ':p1:d1:x1', { pump: 3 }), () => store.tick(nextId, V(85, 8)));
+  const s = await db.get('sets', nextId);
+  assert.equal(s.status, 'done', 'the tick on the next day is kept');
+  assert.equal(s.done.load, 85);
+  assert.equal((await db.get('feedback', b.id + ':p1:d1:x1')).pump, 3);
+});
+
+test('R15d: a Move queued right after a switch to Adjust each round starts is kept', async () => {
+  const { db, store } = await setup(ADJ);
+  const b = await store.createBlock(SWITCHABLE());
+  const dId = b.id + ':p1:d1';
+  await whileHeld(db, () => store.switchProfile(b.id, T3, 'ADJUST'), () => store.moveSlot(dId, 2, -1));
+  const d = await db.get('days', dId);
+  assert.equal(d.profile, 'adaptive', 'the switch planned the day');
+  assert.deepEqual(d.slot_order, [2, 1], 'the Move is kept');
+});
+
+test('feedbackPlan: Adjust each round asks soreness alone at the first tick on a muscle trained before; Fixed asks nothing then; the sheet merges', async () => {
+  const { db, clock, store } = await setup(ADJ);
+  const b = await store.createBlock({ ...ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4), switch_conditions: COND });
+  const d1 = b.id + ':p1:d1';
+  assert.deepEqual(await store.feedbackPlan(d1, 1, 'first_tick'), { ask: [] }, 'Fixed: no first tick sheet');
+  assert.deepEqual(await store.feedbackPlan(d1, 1, 'tick'), { ask: ['checks'] });
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  assert.deepEqual(await store.feedbackPlan(d1, 1, 'first_tick'), { ask: [] }, "never on the muscle's first day of the block");
+  await playDay(store, clock, d1, 10, { pump: 2, soreness: 2, workload: 2 });
+  const d2 = b.id + ':p2:d1';
+  assert.deepEqual(await store.feedbackPlan(d2, 1, 'first_tick'), { ask: ['soreness'] });
+  await store.saveChecks(d2, 1, { check_a: true }).catch(() => {});
+  await store.saveSoreness(d2, 1, 3);
+  const row = await db.get('feedback', d2 + ':x1');
+  assert.deepEqual([row.soreness, row.pending, row.muscle], [3, true, 'quads']);
+  assert.deepEqual(await store.feedbackPlan(d2, 1, 'first_tick'), { ask: [] }, 'asked once that day');
+  assert.deepEqual(await store.feedbackPlan(d2, 1, 'end'), { ask: ['pump', 'workload', 'checks'] });
+  assert.deepEqual(await store.feedbackPlan(d2, 1, 'end', { soreness_put_off: true }), { ask: ['pump', 'soreness', 'workload', 'checks'] });
+  // The end sheet with no soreness key keeps the first tick answer.
+  await store.saveFeedback(d2, 1, { pump: 2, workload: 2, checks: {}, note: '' }, false);
+  assert.deepEqual([(await db.get('feedback', d2 + ':x1')).soreness, (await db.get('feedback', d2 + ':x1')).pending], [3, false]);
+  await assert.rejects(store.saveSoreness(d2, 1, 5), isRefused('bad answer'));
+});
+
+test('slotWhy, retarget and blockOverview: the Why line and the retarget line in Adjust each round only; the overview counts sets by muscle', async () => {
+  const { db, clock, store } = await setup(ADJ);
+  const b = await store.createBlock({ ...ONE_DAY([lift(1, 'leg_press', 2, 150), lift(2, 'lat_pulldown', 2, 100)], 4), switch_conditions: COND, levels: { quads: 'top', back: 'top' } });
+  const d1 = b.id + ':p1:d1';
+  assert.deepEqual(await store.slotWhy(d1), {}, 'Fixed: no Why line');
+  assert.equal(await store.retarget(d1 + ':x1:s1:none', 160), null, 'Fixed: the goal as written');
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  await store.answerSleep(d1, false);
+  await playDay(store, clock, d1, 10, { pump: 2, soreness: 2, workload: 2 });
+  const d2 = b.id + ':p2:d1';
+  await store.answerSleep(d2, false);
+  assert.equal((await store.slotWhy(d2))[1], 'why.R8');
+  const s = (await db.get('sets', d2 + ':x1:s1:none'));
+  assert.deepEqual(await store.retarget(s.id, s.target.load), { rep_low: s.target.rep_low });
+  assert.deepEqual(await store.retarget(s.id, s.target.load + 1000), { effort_only: true });
+  const o = await store.blockOverview(b.id);
+  assert.equal(o.round, 2);
+  assert.deepEqual(o.rounds.map(r => [r.pass, r.state, r.easy]), [[1, 'done', false], [2, 'now', false], [3, 'later', false], [4, 'later', true]]);
+  assert.deepEqual(o.days.map(d => [d.id, d.status, d.now]), [[d2, 'planned', true]]);
+  const quads = o.muscles.find(m => m.muscle === 'quads');
+  assert.deepEqual([quads.sets, quads.change], [3, 1], 'three sets this round, one more than last round');
+});
+
+test('resize: Fixed adds and removes a round through engine.resizeBlock; below the current round and a done block are refused', async () => {
+  const { db, clock, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  assert.equal((await store.resize(b.id, 1)).passes, 4);
+  assert.equal((await db.get('blocks', b.id)).passes, 4);
+  await store.resize(b.id, -1);
+  assert.equal((await db.get('blocks', b.id)).passes, 3);
+  await assert.rejects(store.resize(b.id, 2), isRefused('bad request'));
+  await playDay(store, clock, b.id + ':p1:d1', 10);
+  await playDay(store, clock, b.id + ':p1:d2', 10);
+  // Round 1 done, round 2 day A planned: down to 1 round would leave that planned day past the
+  // end, and no write deletes a day row (E16), so it is refused with every store unchanged.
+  await store.resize(b.id, -1);
+  const before = db.dump();
+  await assert.rejects(store.resize(b.id, -1), isRefused('day past the end'));
+  assert.equal(db.dump(), before);
+  await store.endBlock(b.id);
+  await assert.rejects(store.resize(b.id, 1), isRefused('block is done'));
+});
+
+test('every Slice 2 write of B.4.8 is in the guarded write list (LN1 pattern)', () => {
+  for (const name of ['answerSleep', 'setSetType', 'saveSoreness', 'liveEdit', 'resize', 'switchProfile', 'switchBack', 'changeAnswers', 'endBlock']) assert.ok(WRITES.includes(name), name);
+});
+const setOrderOf = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+const startingSetsOf = (level) => startingSets(RULES.profiles.adaptive, {}, level);
+
+// 16 B.1 step 8: the Block tab reads. A shown round gives that round's day rows (each with its
+// place id and tally); hard_left counts the places of the rounds before the easy round with no done
+// or skipped day (the Easy round stop sheet, B.5 row 4).
+test('blockOverview: a shown round gives its day rows with place ids and tallies; hard_left counts the unfinished hard places, a skipped day counts as finished', async () => {
+  const { clock, store } = await setup(ADJ);
+  const b = await store.createBlock({ ...SPEC(), switch_conditions: COND, levels: { quads: 'top', back: 'top', chest: 'top' } });
+  await store.switchProfile(b.id, T3, 'ADJUST');
+  const p = (pass, day) => b.id + ':p' + pass + ':d' + day;
+  let o = await store.blockOverview(b.id);
+  assert.deepEqual(o.rounds.map(r => [r.pass, r.easy]), [[1, false], [2, false], [3, true]]);
+  assert.equal(o.hard_left, 4, 'rounds 1 and 2 of a 2-day block');
+  assert.equal(o.shown, 1);
+  assert.deepEqual(o.days.map(d => [d.ref, d.pass, d.status, d.now, d.done]), [[p(1, 1), 1, 'planned', true, 0], [p(1, 2), 1, 'planned', false, 0]]);
+  assert.ok(o.days.every(d => d.total > 0), 'a planned day has its set tally');
+  const o3 = await store.blockOverview(b.id, 3);
+  assert.equal(o3.shown, 3);
+  assert.equal(o3.round, 1, 'the current round stays round 1');
+  assert.deepEqual(o3.days.map(d => [d.id, d.ref, d.status, d.total]), [[null, p(3, 1), 'notplanned', 0], [null, p(3, 2), 'notplanned', 0]]);
+  assert.equal((await store.blockOverview(b.id, 9)).shown, 1, 'a round past the strip shows this round');
+  assert.equal((await store.blockOverview(b.id, '2')).shown, 1, 'only a whole number picks a round');
+  await playDay(store, clock, p(1, 1), 10);
+  o = await store.blockOverview(b.id);
+  assert.equal(o.hard_left, 3);
+  assert.equal(o.days[0].done, o.days[0].total, 'a done day shows every set done');
+  await store.skipDay(p(1, 2));
+  assert.equal((await store.blockOverview(b.id)).hard_left, 2, 'a skipped day is finished');
+  const { store: s2 } = await setup();
+  const f = await s2.createBlock(SPEC());
+  assert.equal((await s2.blockOverview(f.id)).hard_left, 0, 'a Fixed block has no easy round');
+});
+
+// 16 B.5 row 2, B.10 item 9: the read-only day view takes an id that passes checkId and names a day
+// of a block on the phone (a day row, or a place of the block with no row yet), else null.
+test('dayPreview: a day row gives its state; a place with no row is Not planned yet; a bad id is refused and a place past the end or of no block is null', async () => {
+  const { clock, store } = await setup();
+  const b = await store.createBlock(SPEC());
+  const p = (pass, day) => b.id + ':p' + pass + ':d' + day;
+  assert.equal((await store.dayPreview(p(1, 1))).state, 'current');
+  const later = await store.dayPreview(p(1, 2));
+  assert.deepEqual([later.state, later.after], ['later', 'A']);
+  const np = await store.dayPreview(p(2, 1));
+  assert.deepEqual([np.state, np.after, np.day.status, np.sets.length], ['notplanned', 'B', 'notplanned', 0]);
+  assert.deepEqual(np.lifts.map(l => [l.slot, l.exercise_id, l.sets]), [[1, 'leg_press', 2], [2, 'lat_pulldown', 2]]);
+  assert.equal(await store.dayPreview(p(4, 1)), null, 'past the last round');
+  assert.equal(await store.dayPreview(p(1, 3)), null, 'no such day in the block');
+  assert.equal(await store.dayPreview(b.id + ':p01:d1'), null, 'not the id the block would give');
+  assert.equal(await store.dayPreview('nope:p1:d1'), null, 'no such block');
+  await assert.rejects(store.dayPreview('bad id!'), isRefused('bad id'));
+  await assert.rejects(store.dayPreview('__proto__'), isRefused('bad id'));
+  const v = await store.dayView(p(1, 1));
+  clock.add(MIN);
+  await store.tick(v.sets[0].id, V(v.sets[0].target.load, 10));
+  assert.equal((await store.dayPreview(p(1, 1))).state, 'open');
+  await store.finishDay(p(1, 1));
+  assert.equal((await store.dayPreview(p(1, 1))).state, 'done');
+  assert.equal((await store.dayPreview(p(1, 2))).state, 'current');
+  await store.skipDay(p(1, 2));
+  assert.equal((await store.dayPreview(p(1, 2))).state, 'skipped');
 });

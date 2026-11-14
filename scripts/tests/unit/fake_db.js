@@ -1,12 +1,48 @@
 // fake_db.js - an in-memory stand-in for db.js with the same calls, for node tests.
 // It can be told to fail a write once, to never finish a write, or to throw half way
 // through replaceAll. Rows are deep-copied in and out, like IndexedDB does.
+// Version 2 upgrade (16 B.6.2): createFakeDb({ version: 1, rows }) holds rows at version 1; the
+// first call runs the SAME planUpgrade as db.js with the hook createStore handed in, in one fake
+// transaction: all or nothing, so a throw or a count mismatch leaves every row as it was.
+import { planUpgrade, DB_VERSION } from '../../../db.js';
 const STORES = ['settings', 'exercises', 'templates', 'blocks', 'days', 'sets', 'feedback', 'snapshots'];
 const KEY = { settings: 'key' };
 const copy = (v) => (v === undefined ? undefined : structuredClone(v));
 
-export function createFakeDb() {
+export function createFakeDb(opts = {}) {
   const data = Object.fromEntries(STORES.map(s => [s, new Map()]));
+  for (const [s, rows] of Object.entries(opts.rows || {})) for (const r of rows) data[s].set(r[KEY[s] || 'id'], copy(r));
+  let version = opts.version === undefined ? DB_VERSION : opts.version;
+  let hook = null, opened = false, openError = null, upgradeFailed = false, versionClosed = false;
+  const upgradeSpy = { hookCalls: 0 };
+  // The open, run before every call: the upgrade happens once, in one transaction. A failed
+  // upgrade fails every later call on this page, as db.js does.
+  function ensureOpen() {
+    if (opened) return;
+    if (upgradeFailed) throw openError;
+    if (version === 1) {
+      try {
+        const rows = Object.fromEntries(STORES.map(s => [s, [...data[s].values()].map(copy)]));
+        const { snapshots, ...stores } = rows;
+        upgradeSpy.hookCalls++;
+        const plan = planUpgrade(stores, snapshots, hook ? (x) => hook(x) : null);
+        const staged = Object.fromEntries(STORES.map(s => [s, new Map([...data[s].entries()].map(([k, v]) => [k, copy(v)]))]));
+        for (const o of plan.ops) {
+          if ('put' in o) staged[o.store].set(keyOf(o.store, o.put), copy(o.put));
+          else staged[o.store].delete(o.del);
+        }
+        for (const [n, want] of Object.entries(plan.counts)) if (staged[n].size !== want) throw new Error('upgrade: count mismatch in ' + n);
+        for (const s of STORES) data[s] = staged[s];
+      } catch (e) {
+        upgradeFailed = true;
+        openError = e;
+        throw e;
+      }
+    }
+    version = DB_VERSION;
+    opened = true;
+  }
+  const opening = (fn) => { try { ensureOpen(); } catch (e) { return Promise.reject(e); } return fn(); };
   // spy.batchHeld resolves once a batch is held by faults.holdBatch (r4.3 H1).
   let heldNow = null;
   const spy = { replaceAll: 0, clear: 0, batch: 0, put: 0, resetLink: 0, lateStores: [], batchHeld: new Promise((res) => { heldNow = res; }) };
@@ -23,7 +59,8 @@ export function createFakeDb() {
   const heldReads = [];
   let readHeldNow = null;
   spy.readHeld = new Promise((res) => { readHeldNow = res; });
-  const read = (fn) => {
+  const read = (fn) => opening(() => readNow(fn));
+  const readNow = (fn) => {
     if (faults.holdReads > 0) {
       faults.holdReads--;
       spy.readsHeld = (spy.readsHeld || 0) + 1;
@@ -45,6 +82,7 @@ export function createFakeDb() {
   // Every write goes through here so faults apply the same way.
   // tag names the stores a write touches; a held write records its tag in spy.lateStores.
   function commit(apply, tag = []) {
+    try { ensureOpen(); } catch (e) { return Promise.reject(e); }
     if (faults.passWrites > 0) {
       faults.passWrites--;
       try { apply(); } catch (e) { return Promise.reject(e); }
@@ -67,8 +105,15 @@ export function createFakeDb() {
   }
 
   const db = {
-    _data: data, spy, faults,
-    async ready() { return true; },
+    get _data() { return data; },
+    spy, faults, upgradeSpy,
+    async ready() { ensureOpen(); return true; },
+    setUpgradeHook(fn) { hook = fn; },
+    upgradeFailed: () => upgradeFailed,
+    versionClosed: () => versionClosed,
+    onVersionClosed() {},
+    // The version the fake db is at (1 until an upgrade commits).
+    version: () => version,
     put(store, row) { spy.put++; return commit(() => data[store].set(keyOf(store, row), copy(row)), [store]); },
     get(store, key) { return read(() => copy(data[store].get(key))); },
     all(store) { return read(() => [...data[store].values()].map(copy)); },
