@@ -115,7 +115,42 @@ function validateProfile(name, p, setKinds, errors) {
   if (!(num(ew.reps_factor) && ew.reps_factor > 0 && ew.reps_factor <= 1)) e('easy_week.reps_factor outside 0 to 1');
   if (!(num(ew.set_factor) && ew.set_factor >= 1)) e('easy_week.set_factor below 1');
   if (!Array.isArray(ew.drop)) e('easy_week.drop is not a list');
+  validateBuilder(p.builder, e);
+  validateCopy(p.copy, e);
   void setKinds;
+}
+
+// The builder part (TD-8): its numbers in range, and for the same days top gets strictly more
+// slots than middle and middle at least as many as bottom (contract BW4).
+function validateBuilder(b, e) {
+  if (!isObj(b)) { e('part missing: builder'); return; }
+  const lo = b.days_per_rotation_min, hi = b.days_per_rotation_max;
+  if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < 2 || hi > 6 || lo > hi) { e('builder days per rotation out of range 2 to 6'); return; }
+  const spr = b.slots_per_rotation;
+  if (!isObj(spr)) { e('builder.slots_per_rotation missing'); return; }
+  for (let d = lo; d <= hi; d++) {
+    const v = {};
+    for (const lv of LEVELS) {
+      v[lv] = isObj(spr[lv]) ? spr[lv][d] : undefined;
+      if (!Number.isInteger(v[lv]) || v[lv] < 1) e('builder slots for ' + lv + ' at ' + d + ' days is not a whole number of 1 or more');
+    }
+    if (Number.isInteger(v.top) && Number.isInteger(v.middle) && !(v.top > v.middle)) e('builder: top must get more slots than middle at ' + d + ' days');
+    if (Number.isInteger(v.middle) && Number.isInteger(v.bottom) && !(v.middle >= v.bottom)) e('builder: middle must get at least as many slots as bottom at ' + d + ' days');
+  }
+  for (const k of ['max_lifts_per_day', 'warn_lifts_per_day', 'warn_work_sets_per_day']) {
+    if (!Number.isInteger(b[k]) || b[k] < 1) e('builder.' + k + ' is not a whole number of 1 or more');
+  }
+  if (Number.isInteger(b.warn_lifts_per_day) && Number.isInteger(b.max_lifts_per_day) && b.warn_lifts_per_day > b.max_lifts_per_day) e('builder: the warning is past the hard cap');
+  if (!LEVELS.includes(b.default_level_on_board)) e('builder.default_level_on_board unknown');
+  if (b.default_rep_range !== null && !(isObj(b.default_rep_range) && num(b.default_rep_range.low) && num(b.default_rep_range.high) && b.default_rep_range.low <= b.default_rep_range.high)) e('builder.default_rep_range bad');
+  if (!Number.isInteger(b.default_reps_left_target) || b.default_reps_left_target < 0 || b.default_reps_left_target > 4) e('builder.default_reps_left_target outside 0 to 4');
+}
+
+function validateCopy(c, e) {
+  if (!isObj(c)) { e('part missing: copy'); return; }
+  if (c.sets_from !== 'planned') e('copy.sets_from unknown');
+  if (c.load_from !== 'last_done') e('copy.load_from unknown');
+  if (c.fallback !== 'round_goal') e('copy.fallback unknown');
 }
 
 export function validateRules(rules) {
@@ -679,37 +714,150 @@ export function buildBlock(rules, spec) {
   };
 }
 
-// ---------------- autoBuildDays (first version; a later slice finishes it) ----------------
+// ---------------- the guided builder: autoBuildDays, fillSlots, sizeWarning (C.3.5, C.3.6) ----------------
 
-// priorities = { <muscle key>: 'top'|'middle'|'bottom' }. Out: day templates of muscle slots.
-// Top muscles go on two days of the rotation (every day of a 2 day rotation), the others on one,
-// spread so the days stay even. A later slice picks the exercises (never one left out of the builder).
-export function autoBuildDays(rules, priorities, daysPerRotation) {
+// Is a pool row one the builder may place in this slot? Screened for the block (its own flags_set,
+// or the block's flag entry merged by the caller as `screened`), not left out of the builder,
+// of a picked kind, and of the slot's muscle (a slot with no muscle_detail takes any row of its
+// chip). The one gate every builder pick goes through (C.2.5, C.3.6).
+function builderEligible(row, slot, kinds) {
+  if (!row || !slot) return false;
+  const screened = own(row, 'screened') ? row.screened === true : row.flags_set === true;
+  if (!screened) return false;
+  if (row.left_out_of_builder === true) return false;
+  if (kinds && !kinds.includes(row.equipment_detail)) return false;
+  if (slot.muscle_detail) return row.muscle_detail === slot.muscle_detail;
+  return !!slot.muscle && row.muscle === slot.muscle;
+}
+
+// Most done work sets first, then name, then id (health-coach verdict item R4-18).
+function builderOrder(a, b) {
+  const da = num(a.done_count) ? a.done_count : 0, db = num(b.done_count) ? b.done_count : 0;
+  if (da !== db) return db - da;
+  const na = String(a.name || ''), nb = String(b.name || '');
+  if (na !== nb) return na < nb ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+const copyDays = (days) => (days || []).map(d => ({ ...d, lifts: (d.lifts || []).map(l => ({ ...l })) }));
+
+// days: the board [{day, label, lifts: [{slot, muscle_detail, muscle?, level, exercise_id, hand?}]}].
+// pool: exercise rows, each with screened (or flags_set), left_out_of_builder, equipment_detail,
+// muscle_detail, muscle, name, id and done_count. opts: {emptyOnly, equipment: [kinds] (null: any
+// kind), only: {day, slot} or null, index: the n-th eligible row for `only` (Suggest one again)}.
+// Out { ok, days, filled }. The input is never changed. Never the same exercise twice in a day.
+export function fillSlots(rules, days, pool, opts) {
   void rules;
-  const n = daysPerRotation;
-  if (!Number.isInteger(n) || n < 2 || n > 6) return { ok: false, error: 'days per rotation must be 2 to 6' };
-  const entries = Object.keys(priorities || {}).filter(k => LEVELS.includes(priorities[k]))
-    .sort((a, b) => LEVELS.indexOf(priorities[a]) - LEVELS.indexOf(priorities[b]) || (a < b ? -1 : a > b ? 1 : 0));
-  const days = Array.from({ length: n }, (_, i) => ({ day: i + 1, label: String.fromCharCode(65 + i), slots: [] }));
-  let cursor = 0;
-  for (const m of entries) {
-    const times = priorities[m] === 'top' ? 2 : 1;
-    const used = new Set();
-    for (let t = 0; t < times; t++) {
-      // the emptiest day not used yet for this muscle, ties to the next in turn
-      let best = null;
-      for (let j = 0; j < n; j++) {
-        const d = days[(cursor + j) % n];
-        if (used.has(d.day)) continue;
-        if (!best || d.slots.length < best.slots.length) best = d;
-      }
-      if (!best) break;
-      used.add(best.day);
-      best.slots.push({ muscle: m, level: priorities[m] });
-      cursor = (days.indexOf(best) + 1) % n;
+  const o = opts || {};
+  const emptyOnly = o.emptyOnly !== false;
+  const kinds = Array.isArray(o.equipment) ? o.equipment : null;
+  const rows = (pool || []).slice().sort(builderOrder);
+  const out = copyDays(days);
+  let filled = 0;
+  for (const d of out) {
+    for (const l of d.lifts) {
+      if (o.only) {
+        if (!(o.only.day === d.day && o.only.slot === l.slot)) continue;
+      } else if (emptyOnly ? l.exercise_id !== null && l.exercise_id !== undefined : l.hand === true) continue;
+      const taken = new Set(d.lifts.filter(x => x !== l && x.exercise_id).map(x => x.exercise_id));
+      const fits = rows.filter(r => !taken.has(r.id) && builderEligible(r, l, kinds));
+      if (!o.only) l.exercise_id = null;
+      if (!fits.length) continue;
+      const n = o.only && Number.isInteger(o.index) && o.index > 0 ? o.index % fits.length : 0;
+      l.exercise_id = fits[n].id;
+      if (o.only) l.hand = false;
+      filled++;
     }
   }
-  return { ok: true, days };
+  return { ok: true, days: out, filled };
+}
+
+// levels: {top: [muscle_detail...], middle: [...], bottom: [...]} in his rank order. Out
+// { ok, days: [{day, label, lifts: [{slot, muscle_detail, level, exercise_id}]}], dropped:
+// [{muscle_detail, level}] }. Same input, same output.
+export function autoBuildDays(rules, levels, daysPerRotation, pool) {
+  const b = rules && rules.builder;
+  if (!isObj(b) || !isObj(b.slots_per_rotation)) return { ok: false, error: 'no builder rules' };
+  const n = daysPerRotation;
+  if (!Number.isInteger(n) || n < b.days_per_rotation_min || n > b.days_per_rotation_max) return { ok: false, error: 'days per rotation out of range' };
+  const lv = isObj(levels) ? levels : {};
+  const seen = new Set();
+  const order = [];
+  for (const level of LEVELS) {
+    const list = own(lv, level) ? lv[level] : [];
+    if (!Array.isArray(list)) return { ok: false, error: 'level ' + level + ' is not a list' };
+    for (const m of list) {
+      if (typeof m !== 'string' || !m) return { ok: false, error: 'bad muscle' };
+      if (seen.has(m)) return { ok: false, error: 'a muscle on two levels' };
+      seen.add(m);
+      order.push({ muscle_detail: m, level });
+    }
+  }
+  const days = Array.from({ length: n }, (_, i) => ({ day: i + 1, label: String.fromCharCode(65 + i), lifts: [] }));
+  const dropped = [];
+  const cap = b.max_lifts_per_day;
+  order.forEach((m, rank) => {
+    const count = b.slots_per_rotation[m.level][n];
+    const perDay = Math.ceil(count / n);
+    for (let k = 0; k < count; k++) {
+      const start = Math.floor(k * n / count);
+      let put = null;
+      for (let j = 0; j < n && !put; j++) {
+        const d = days[(start + j) % n];
+        if (d.lifts.length >= cap) continue;
+        if (d.lifts.filter(x => x.muscle_detail === m.muscle_detail).length >= perDay) continue;
+        put = d;
+      }
+      if (!put) { dropped.push({ muscle_detail: m.muscle_detail, level: m.level }); continue; }
+      put.lifts.push({ slot: 0, muscle_detail: m.muscle_detail, level: m.level, exercise_id: null, rank });
+    }
+  });
+  for (const d of days) {
+    d.lifts.sort((x, y) => x.rank - y.rank);
+    d.lifts = d.lifts.map((x, i) => ({ slot: i + 1, muscle_detail: x.muscle_detail, level: x.level, exercise_id: null }));
+  }
+  const filled = fillSlots(rules, days, pool || [], { emptyOnly: true, equipment: null });
+  return { ok: true, days: filled.days, dropped };
+}
+
+// The soft per-day warning (TD-8): more than warn_lifts_per_day exercises, or more than
+// warn_work_sets_per_day planned work sets (a lift with no set count counts its starting sets).
+// Never blocks anything.
+export function sizeWarning(rules, day) {
+  const b = rules && rules.builder;
+  if (!isObj(b) || !day) return false;
+  const lifts = day.lifts || [];
+  let work = 0;
+  for (const l of lifts) work += num(l.sets) ? l.sets : startingSets(rules, l, l.level || null);
+  return lifts.length > b.warn_lifts_per_day || work > b.warn_work_sets_per_day;
+}
+
+// ---------------- copyStartValues (C.3.8) ----------------
+
+// lift: the source day template lift. roundDoneSets: that slot's set rows of the picked round
+// (every status). Out { sets, start_load, rep_low, rep_high }: the planned count of the round
+// (origin 'plan' only, a hand-added set never counts), the load of the last done planned work set
+// by set_n, else the round's target load, else the lift's own start load (TD-8,
+// health-coach verdict item R4-17). Nothing goes up on its own.
+export function copyStartValues(rules, lift, roundDoneSets) {
+  const c = rules && rules.copy;
+  const l = lift || {};
+  const rows = (roundDoneSets || []).filter(s => s && s.kind === 'work' && s.origin === 'plan' && (!l.exercise_id || s.exercise_id === l.exercise_id));
+  const nums = [...new Set(rows.map(s => s.set_n))];
+  const sets = c && c.sets_from === 'planned' && nums.length ? nums.length : (num(l.sets) ? l.sets : null);
+  let load = null;
+  if (c && c.load_from === 'last_done') {
+    const done = rows.filter(s => s.status === 'done' && s.done && num(s.done.load));
+    const top = maxOf(done.map(s => s.set_n));
+    if (top !== null) load = maxOf(done.filter(s => s.set_n === top).map(s => s.done.load));
+  }
+  if (load === null && c && c.fallback === 'round_goal') {
+    const goal = rows.filter(s => s.target && num(s.target.load));
+    const top = maxOf(goal.map(s => s.set_n));
+    if (top !== null) load = maxOf(goal.filter(s => s.set_n === top).map(s => s.target.load));
+  }
+  if (load === null) load = num(l.start_load) ? l.start_load : null;
+  return { sets, start_load: load, rep_low: own(l, 'rep_low') ? l.rep_low : null, rep_high: own(l, 'rep_high') ? l.rep_high : null };
 }
 
 // ---------------- applyLiveEdit ----------------

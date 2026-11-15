@@ -1,0 +1,16 @@
+[
+ "t_lower_full_2_day_lower_lean",
+ "t_upper_full_2_day_upper_lean",
+ "t_whole_body_2_day_even",
+ "t_lower_upper_lower_3_day_lower_lean",
+ "t_push_legs_pull_3_day_upper_lean",
+ "t_whole_body_3_day_even",
+ "t_lower_upper_4_day_lower_lean",
+ "t_upper_lower_4_day_even",
+ "t_upper_legs_arms_4_day_upper_lean",
+ "t_lower_upper_5_day_lower_lean",
+ "t_upper_legs_5_day_upper_lean",
+ "t_upper_lower_push_pull_legs_5_day_even",
+ "t_lower_upper_6_day_lower_lean",
+ "t_push_pull_legs_6_day_even"
+]

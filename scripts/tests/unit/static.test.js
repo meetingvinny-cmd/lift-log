@@ -55,6 +55,13 @@ const MANIFEST_SLICE2 = [...MANIFEST_ENGINE, 'ui/block.js', 'scripts/tests/make_
   'scripts/tests/fixtures/backup_v1_as_v2.json', 'scripts/tests/fixtures/backup_v1_polish_as_v2.json',
   'scripts/tests/fixtures/block_v2.json', 'scripts/tests/fixtures/block_rounds.json',
   'scripts/tests/fixtures/block_rounds_script.json'].sort();
+// MANIFEST_SLICE3 (17 C.0.1, r4.4 R18): MANIFEST_SLICE2 plus the Slice 3 files. Each step adds the
+// files it creates (S1 integration: the templates data, stats.js and their tests and fixtures).
+const MANIFEST_SLICE3 = [...MANIFEST_SLICE2, 'data/templates.js', 'stats.js', 'ui/blocks.js', 'ui/templates.js', 'ui/guided.js', 'scripts/tests/unit/stats.test.js',
+  'scripts/tests/unit/templates.test.js', 'scripts/tests/fixtures/template_ids.json',
+  'scripts/tests/fixtures/templates_sample.js',
+  // Track S3 (C.3.9 to C.3.16): History, the trend line, the library and the tips.
+  'ui/history.js', 'ui/trend.js', 'ui/library.js', 'ui/tips.js'].sort();
 
 const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 const EXPECTED_HEAD = [
@@ -193,7 +200,7 @@ test('manifest icons and index.html links are tracked and in SHELL', () => {
 });
 
 test('git file list equals the engine manifest', () => {
-  assert.deepEqual(gitList(), MANIFEST_SLICE2, 'files in app/ differ from MANIFEST_SLICE2 (the engine manifest plus the Slice 2 files)');
+  assert.deepEqual(gitList(), MANIFEST_SLICE3, 'files in app/ differ from MANIFEST_SLICE3 (the Slice 2 manifest plus the Slice 3 files)');
   // The step chain and the paragraph list name the same files (16 B.1 Slice 2 manifest paragraph).
   assert.deepEqual([...MANIFEST_SLICE2_STEP8, 'scripts/tests/fixtures/block_rounds.json', 'scripts/tests/fixtures/block_rounds_script.json'].sort(), MANIFEST_SLICE2);
 });
@@ -272,8 +279,8 @@ test('styles.css: no raw hex, px or ms after the token block', () => {
 });
 
 test('version.js, package.json and manifest are exact', () => {
-  // The schema commit (16 version ladder, r4.4 R1): 0.3.0, schema 2, the signed-1 rules.
-  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.3.0'; export const SCHEMA = 2; export const RULES_VERSION = 'signed-1';");
+  // Slice 3 (17 C.0, r4.4 R17): 0.4.0, schema 2 kept, the signed-2 rules (builder and copy parts).
+  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.4.0'; export const SCHEMA = 2; export const RULES_VERSION = 'signed-2';");
   assert.equal(read('package.json').trim(), '{"private":true,"type":"module"}');
   const man = JSON.parse(read('manifest.webmanifest'));
   assert.deepEqual(Object.keys(man).sort(), ['background_color', 'display', 'icons', 'id', 'name', 'orientation', 'scope', 'short_name', 'start_url', 'theme_color']);
@@ -606,8 +613,11 @@ test('every builder number field is named by its own column label (C24)', () => 
 
 test('a block whose last day is done shows the Block finished state, not No block (C27)', () => {
   const td = read('ui/today.js');
-  assert.match(td, /block && block\.status === 'done' \? blockDone\(ctx\) : noBlock\(ctx\)/, 'a finished block reads as no block');
-  assert.match(span(td, 'function blockDone(ctx) {', '\n}'), /t\('empty\.done\.title'\)[\s\S]*t\('empty\.done\.line'\)/);
+  assert.match(td, /block && block\.status === 'done' \? blockDone\(ctx, block\) : noBlock\(ctx\)/, 'a finished block reads as no block');
+  // Slice 3 (17 C.3.9): the title with Start a new block and Copy this block, no line.
+  const bd = span(td, 'function blockDone(ctx, block) {', '\n}');
+  assert.match(bd, /t\('empty\.done\.title'\)[\s\S]*t\('fin\.new'\)[\s\S]*t\('fin\.copy'\)/);
+  assert.doesNotMatch(bd, /empty\.done\.line/, 'the Slice 3 row has no line');
 });
 
 test('the No pill is grey with dark text, never the danger color (C28)', () => {
@@ -657,7 +667,7 @@ test('the start weight steps move along the exercise own steps (C41)', async () 
   assert.match(read('ui/builder.js'), /l\.start_load = stepStart\(b, ex, l\.start_load, dir\);/, 'the builder buttons do not use stepStart');
   assert.match(read('ui/builder.js'), /return stepLoad\(ex, load, dir, b && b\.unit === 'kg' \? 'kg' : 'lb'\);/, 'stepStart does not step through stepLoad in the build unit');
   // Stage 4 N3: Save hands createBlock the unit the start weights were stepped in.
-  assert.match(read('ui/builder.js'), /await ctx\.store\.createBlock\(blockSpec\(b\)\);/, 'Save does not build its spec with blockSpec');
+  assert.match(read('ui/builder.js'), /await ctx\.store\.createBlock\(blockSpec\(b\), null, \{ activate \}\);/, 'Save does not build its spec with blockSpec');
   assert.match(read('ui/builder.js'), /day_templates: buildDays\(b\), unit: b\.unit \|\| undefined \}/, 'blockSpec does not carry the build unit');
 });
 
@@ -689,7 +699,7 @@ test('rules.js is data only: frozen, no function value, clean on both profiles',
   assert.throws(() => { copy.top_sets = 4; }, TypeError);
   const { validateRules } = await import('../../../engine.js');
   assert.deepEqual(validateRules(m.RULES), { ok: true, errors: [] });
-  assert.equal(m.RULES.rules_version, 'signed-1');
+  assert.equal(m.RULES.rules_version, 'signed-2');
 });
 
 // 16 B.1 step 3 a, B.10 item 3, B.12 (r4.4 R14): backup.js keeps its own lists and imports neither
@@ -1177,9 +1187,20 @@ test('every planted find text matches its file exactly once', { skip: process.en
 });
 
 // H8 named tests for built contract rows (P.3 r4.3 rows).
+// r4.6 Q1 narrowed E16: no write deletes a day row, except resize on the typed REMOVE (resizeRounds),
+// and then only planned days with untouched sets (untouchedDays, re-checked inside the job).
 test('E16: no write deletes a day row', async () => {
   const { S } = await import('../../../ui/strings.js');
-  for (const f of ['store.js', 'backup.js']) assert.doesNotMatch(read(f), /store:\s*'days',\s*del\b/, f + ' holds a day delete op');
+  assert.doesNotMatch(read('backup.js'), /store:\s*'days',\s*del\b/, 'backup.js holds a day delete op');
+  const st = read('store.js');
+  const hits = [...st.matchAll(/store:\s*'days',\s*del\b/g)].map(m => m.index);
+  const at = st.indexOf('  function resizeRounds(');
+  const end = st.indexOf('\n  }\n', at);
+  assert.equal(hits.length, 1, 'store.js holds one day delete op');
+  assert.ok(at > 0 && hits[0] > at && hits[0] < end, 'the one day delete op sits in resizeRounds');
+  const body = st.slice(at, end);
+  assert.match(body, /if \(delta === -1 && typed !== REMOVE_WORD\) return Promise\.reject/, 'minus needs REMOVE typed');
+  assert.match(body, /const rows = await untouchedDays\(block, days, r\.remove\);\s*if \(!rows\) throw new Refused\('day past the end'\);/, 'only untouched planned days');
   const keys = Object.keys(S);
   assert.deepEqual(keys.filter(k => /^days?\./.test(k) && /(delete|remove|erase)/i.test(k)), [], 'ui/strings.js holds no day delete key');
 });
@@ -1215,7 +1236,7 @@ test('SR3, SR11: the text sheet, the feedback sheet and Make my own exercise cat
   assert.match(today, /try \{\n\s+await ctx\.store\.saveExerciseText\(ex\.id, field, val\);\n\s+\} catch \(e\) \{[\s\S]{0,200}badLine\.hidden = false; \}\n\s+else toast\(t\('today\.notsaved'\)\);\n\s+return;\n\s+\}/);
   assert.match(today, /try \{ await ctx\.store\.saveFeedback\(v\.day\.id, slot, a, false\); \} catch \(e\) \{ toast\(t\('today\.notsaved'\)\); return; \}/);
   assert.match(today, /askedLater\.add\(v\.day\.id \+ ':x' \+ slot\); \}\n\s+\} catch \(e\) \{ toast\(t\('today\.notsaved'\)\); return; \}/);
-  assert.match(read('ui/builder.js'), /try \{ row = await ctx\.store\.addCustomExercise\(\{ name: n, muscle, equipment \}\); \} catch \(e\) \{ toast\(t\('today\.notsaved'\)\); return; \}/);
+  assert.match(read('ui/builder.js'), /try \{ row = await ctx\.store\.addCustomExercise\(\{ name: n, muscle, equipment, flags \}\); \} catch \(e\) \{ toast\(t\('today\.notsaved'\)\); return; \}/);
 });
 
 test('SR15: phone check row 4 goes through the store probe and skips while a write is in flight', () => {
@@ -1628,4 +1649,48 @@ test('r4.5 ruling 1: the Add an exercise sets stepper names its buttons by addex
   assert.ok(src.includes("id: 'addex-more', 'aria-label': t('addex.more')"), 'addex-more is named by addex.more');
   const strings = read('ui/strings.js');
   assert.ok(strings.includes("'addex.less': '1 set less'") && strings.includes("'addex.more': '1 set more'"), 'the two words are the architect words of r4.5');
+});
+
+// 17 C.2.2 (r4 review R16): no machine row is a body-load row (M90).
+test('M90: no row with equipment machine has load_kind body', async () => {
+  const { SEED_EXERCISES } = await import('../../../data/exercises.js');
+  const bad = SEED_EXERCISES.filter(e => e.equipment === 'machine' && e.load_kind === 'body').map(e => e.id);
+  assert.deepEqual(bad, []);
+  assert.ok(SEED_EXERCISES.filter(e => e.equipment === 'machine').length > 40);
+});
+
+
+// ---------------- Slice 3, track S3 (17 C.3.12, C.3.16, C.4) ----------------
+
+test('C.3.16 M70 guard: strings.js holds the what-changed line for the current APP_VERSION', async () => {
+  const { S } = await import('../../../ui/strings.js');
+  const { APP_VERSION } = await import('../../../version.js');
+  const key = 'changed.v' + APP_VERSION.split('.').join('_');
+  assert.ok(typeof S[key] === 'string' && S[key].length > 0, 'no ' + key + ' key: every version ships with its note');
+  assert.ok(typeof S['changed.head'] === 'string');
+});
+
+test('C.3.12: ui/trend.js draws only through svg() (createElementNS) and never writes markup', () => {
+  const src = read('ui/trend.js');
+  assert.match(read('ui/dom.js'), /document\.createElementNS\(SVG_NS, tag\)/, 'svg() builds by createElementNS');
+  assert.doesNotMatch(src, /\bel\(|createElement\(|innerHTML|outerHTML|insertAdjacentHTML/, 'trend.js builds only SVG nodes');
+  assert.match(src, /svg\('title'/, 'a <title>');
+  assert.match(src, /'aria-label': label/, 'an aria-label with the trend in words');
+});
+
+test('C.3.14: the exercise detail link is set only after isLink, with rel noopener noreferrer, and no player tag anywhere', () => {
+  const src = read('ui/library.js');
+  assert.match(src, /if \(ex\.link && isLink\(ex\.link\)\) \{[\s\S]*?a\.setAttribute\('href', ex\.link\);/);
+  assert.match(src, /const LINK_REL = 'noopener noreferrer';/);
+  for (const f of shipped.filter(x => x.startsWith('ui/'))) assert.doesNotMatch(read(f), /'(iframe|video|embed)'/, f + ' builds a player tag');
+});
+
+test('C.0.1: every Slice 3 route id from the hash is checked by ID_RE before any read', () => {
+  const src = read('app.js');
+  for (const r of ['FINISHED', 'SUMMARY', 'EXERCISE']) {
+    const at = src.indexOf('if (route.startsWith(' + r + ')) {');
+    assert.ok(at > 0, r + ' route');
+    const body = src.slice(at, src.indexOf('\n  }\n', at));
+    assert.match(body, /if \(!ID_RE\.test\(id\)/, r + ' checks its id');
+  }
 });

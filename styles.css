@@ -58,6 +58,8 @@
   --tally-h:22px;    --tally-h-lg:32px;  --tally-w-lg:4px;   /* the large tally on the Day done screen (LOOK 3.9) */
   --tally-slash:34px; --tally-group-gap:10px;   /* the fifth-stroke slash and the gap between groups of five (LOOK 3.9) */
   --hist-col:96px;   /* the Day done number column (LOOK 4.10) */
+  --grid-head:96px;  /* the sticky first column of the round grid and the summary table (LOOK 4.12) */
+  --trend-h:120px; --trend-stroke:2px;   /* the trend line (LOOK 4.8) */
 
   /* ---------- shape ---------- */
   --r-sm:8px;  --r-md:12px;  --r-lg:18px;  --r-pill:999px;
@@ -434,6 +436,7 @@ progress::-moz-progress-bar{background:var(--accent)}
 .group-label{position:sticky; top:0; background:var(--bg); padding:var(--s2) 0}
 .chips-row{display:flex; gap:var(--s2); overflow-x:auto}
 .chips-row .chip{width:auto; min-height:var(--tap-min); flex:none}
+.chips-row.chips-wrap{flex-wrap:wrap; overflow-x:visible}
 .file-input{position:absolute; left:0; top:0; width:1px; height:1px; opacity:0; visibility:hidden; pointer-events:none}
 
 /* ---------- polish stage 3: his lift note and the check inset (LOOK 3.2, DESIGN 15 Parts 17, 18) ---------- */
@@ -504,3 +507,85 @@ progress::-moz-progress-bar{background:var(--accent)}
 .set.is-notplanned .set-no{color:var(--ink-2)}
 .val-ro{font-size:var(--fs-num)}
 .set.is-done .val-ro{font-weight:var(--fw-heavy)}
+
+/* Slice 3 (17 C.3.2, C.3.3, LOOK 3.5, 4.12): the Current pill, the block list rows, the chooser. */
+.pill-target{background:var(--target-bg); color:var(--target)}
+.block-list-item{display:flex; align-items:center; gap:var(--s2)}
+.block-list-item + .block-list-item{border-top:var(--bw) solid var(--line)}
+.block-row-name{display:flex; flex-wrap:wrap; align-items:center; gap:var(--s2)}
+.block-row-line{display:block}
+.choice{padding:var(--s3) var(--s4); text-align:left}
+.choice .choice-title{display:block}
+.choice .choice-line{display:block}
+.hairline-top{margin-top:var(--s3)}
+
+/* Slice 3 S2 (LOOK 4.12): templates, guided builder, levels, copy. */
+.row-note{font-size:var(--fs-small); gap:var(--s2); align-items:flex-start}
+.row-note svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none; color:var(--ink)}
+.opt-row{gap:var(--s3); min-height:var(--tap)}
+.opt-row svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none}
+.opt-row:not(.is-on) svg{visibility:hidden}
+.opt-row[disabled]{opacity:.4}
+.size-warn{flex-direction:row; align-items:flex-start; gap:var(--s2); color:var(--ink)}
+.size-warn svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none}
+.level-card.level-empty{border:var(--bw) dashed var(--edge)}
+.level-row{gap:var(--s2); min-height:var(--tap)}
+.level-row.is-dragging{background:var(--surface-2); outline:var(--bw-strong) solid var(--accent)}
+.drag-handle{display:inline-flex; align-items:center; justify-content:center; width:var(--tap-min); height:var(--tap-min); flex:none; color:var(--ink-2); touch-action:none; cursor:grab}
+.slot-row{gap:var(--s2); min-height:var(--tap-big)}
+.slot-row .slot-line{display:block}
+.tpl-row .tpl-name{display:block; font-weight:600}
+.tpl-slot .tpl-slot-line{display:block}
+.stepper{display:flex; align-items:center; gap:var(--s2)}
+.chip-days{min-width:var(--tap-min); justify-content:center}
+/* ---------- Slice 3, track S3 (LOOK 4.8, 4.12, 4.13) ---------- */
+/* Round grid: one 56px column per round, the day label in the sticky head column; the grid
+   scrolls sideways inside its own box only. */
+.grid-scroll{overflow-x:auto; margin:var(--s3) 0}
+.round-grid{display:table; border-spacing:var(--s1)}
+.grid-row{display:table-row}
+.grid-head,.grid-col,.grid-td{display:table-cell; vertical-align:middle}
+.grid-head{position:sticky; left:0; background:var(--bg); min-width:var(--grid-head); font-size:var(--fs-small); color:var(--ink-2); padding-right:var(--s2)}
+.grid-col{text-align:center; min-width:var(--tap); border-top:var(--bw) solid transparent; padding-top:var(--s1)}
+.grid-col.is-now{border-top:var(--bw-strong) solid var(--accent)}
+.grid-col .grid-r{display:block; font-size:var(--fs-body)}
+.grid-col .grid-goal{display:block; font-size:var(--fs-label); color:var(--ink-2)}
+.grid-cell{display:block; appearance:none; width:var(--tap); height:var(--tap); min-width:var(--tap); border:var(--bw) solid var(--edge); border-radius:var(--r-sm); background:var(--surface); color:var(--ink); padding:0; text-align:center}
+.grid-cell svg{width:var(--glyph-md); height:var(--glyph-md); flex:none}
+.grid-cell.is-done{background:var(--done-bg); color:var(--done); border-color:var(--done-bg)}
+.grid-cell.is-skipped{background:var(--skip-bg); color:var(--skip)}
+.grid-cell.is-now{border:var(--bw-strong) solid var(--accent)}
+.grid-stepper{display:flex; align-items:center; gap:var(--s3)}
+.grid-stepper .num{min-width:var(--tap-min); text-align:center; font-size:var(--fs-h2)}
+.grid-reason{color:var(--ink-2); font-size:var(--fs-label); margin:var(--s1) 0}
+/* History and the trend line */
+.hist-day .hist-pos,.hist-day .hist-when{display:block}
+.hist-when{color:var(--ink-2)}
+.hist-bw{margin-left:var(--s2)}
+.hist-table{padding:var(--s3)}
+.hist-round{display:flex; gap:var(--s3); align-items:baseline; padding:var(--s1) 0}
+.hist-r{min-width:var(--tap-min); color:var(--ink-2)}
+.hist-sets{display:flex; flex-wrap:wrap; gap:var(--s1) 0}
+.hist-set{min-width:var(--hist-col); font-size:var(--fs-body)}
+.trend-box{margin:var(--s2) 0}
+.trend{display:block; width:100%; height:var(--trend-h)}
+.trend-line{stroke:var(--accent); stroke-width:var(--trend-stroke)}
+.trend-dot{fill:var(--accent)}
+.trend-base{stroke:var(--line); stroke-width:var(--bw)}
+.trend-x{fill:var(--ink-2); font-size:var(--fs-label)}
+.trend-last{fill:var(--ink); font-size:var(--fs-label); font-family:var(--font-num)}
+/* Block summary */
+.sum-tiles{display:grid; grid-template-columns:repeat(3, 1fr); gap:var(--s2)}
+.sum-tile{display:flex; flex-direction:column; align-items:flex-start; padding:var(--s3)}
+.sum-n{font-size:var(--fs-num)}
+.sum-scroll{overflow-x:auto}
+.sum-table{border-collapse:collapse}
+.sum-table th,.sum-table td{padding:var(--s2); text-align:right}
+.sum-table .sum-head{position:sticky; left:0; background:var(--bg); text-align:left; min-width:var(--grid-head)}
+/* Tip lines and the body weight field */
+.tip{display:flex; align-items:center; gap:var(--s2); background:var(--surface-2); border-radius:var(--r-md); padding:var(--s3); margin:var(--s2) 0}
+.tip > svg{width:var(--glyph); height:var(--glyph); flex:none}
+.tip .grow{margin:0}
+.bw-field{display:flex; align-items:center; gap:var(--s2)}
+#exd-spotter svg{width:var(--glyph); height:var(--glyph); flex:none}
+.check-row svg,.inset svg{width:var(--glyph-sm); height:var(--glyph-sm); flex:none}

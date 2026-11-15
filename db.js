@@ -252,6 +252,17 @@ export const db = {
 
   count(store) { return read(store, 'readonly', (os) => os.count()); },
 
+  // The unique keys of one index, read only (17 C.3.13 loggedExerciseIds): a key cursor that
+  // skips repeats, so no row is read.
+  distinctKeys(store, index) {
+    return withLink((conn) => new Promise((resolve, reject) => {
+      const out = [];
+      const req = conn.transaction([store], 'readonly').objectStore(store).index(index).openKeyCursor(null, 'nextunique');
+      req.onsuccess = () => { const c = req.result; if (!c) { resolve(out); return; } out.push(c.key); c.continue(); };
+      req.onerror = () => reject(req.error);
+    }));
+  },
+
   // Several stores read in ONE readonly transaction, so the rows agree with each other.
   // Resolves on complete with {store: rows}.
   allMany(stores) {
@@ -326,6 +337,47 @@ export const db = {
       };
       try {
         fill();
+      } catch (e) {
+        fail(e);
+      }
+    }));
+  },
+
+  // Delete one block and its rows in ONE transaction (17 C.3.2): the block row, its days and sets
+  // (by the block_id indexes), the feedback rows the store names (the feedback of those days), and
+  // the given settings rows (the Current mark). Each of the four stores is counted inside the
+  // transaction and a count other than counts[store] aborts it all. Resolves on complete only.
+  deleteBlockRows(blockId, feedbackIds, counts, settingsPuts) {
+    const names = ['blocks', 'days', 'sets', 'feedback', 'settings'];
+    return withLink((conn) => new Promise((resolve, reject) => {
+      const t = conn.transaction(names, 'readwrite');
+      let failure = null;
+      const fail = (e) => {
+        if (!failure) failure = e || new Error('deleteBlockRows failed');
+        try { t.abort(); } catch (_) { /* already aborted */ }
+      };
+      t.oncomplete = () => (failure ? reject(failure) : resolve(true));
+      t.onabort = () => reject(failure || t.error || new Error('Transaction aborted'));
+      try {
+        // Every delete is placed before the four counts: the counts run only once the day and set
+        // keys have been read and their deletes placed.
+        let waiting = 2;
+        const finish = () => {
+          if (--waiting > 0) return;
+          for (const n of ['blocks', 'days', 'sets', 'feedback']) {
+            const c = t.objectStore(n).count();
+            c.onsuccess = () => { if (c.result !== counts[n]) fail(new Error('deleteBlockRows: count mismatch in ' + n)); };
+          }
+        };
+        for (const n of ['days', 'sets']) {
+          const os = t.objectStore(n);
+          const keys = os.index('block_id').getAllKeys(blockId);
+          keys.onerror = (ev) => fail(ev.target.error);
+          keys.onsuccess = () => { for (const k of keys.result) os.delete(k).onerror = (ev) => fail(ev.target.error); finish(); };
+        }
+        for (const k of (feedbackIds || [])) t.objectStore('feedback').delete(k).onerror = (ev) => fail(ev.target.error);
+        t.objectStore('blocks').delete(blockId).onerror = (ev) => fail(ev.target.error);
+        for (const r of (settingsPuts || [])) t.objectStore('settings').put(r).onerror = (ev) => fail(ev.target.error);
       } catch (e) {
         fail(e);
       }

@@ -128,6 +128,7 @@ export function createFakeDb(opts = {}) {
     },
     byIndex(store, index, value) { return read(() => [...data[store].values()].filter(r => r[index] === value).map(copy)); },
     count(store) { return read(() => data[store].size); },
+    distinctKeys(store, index) { return read(() => [...new Set([...data[store].values()].map(r => r[index]))].sort()); },
     del(store, key) { return commit(() => data[store].delete(key)); },
     setting(key, fallback) { return read(() => { const r = data.settings.get(key); return r === undefined ? fallback : copy(r.value); }); },
     setSetting(key, value) { return this.put('settings', { key, value }); },
@@ -178,6 +179,21 @@ export function createFakeDb(opts = {}) {
         }
         for (const s of names) data[s] = staged[s];
       });
+    },
+    // db.js deleteBlockRows (17 C.3.2): one all-or-nothing delete of a block, its days and sets by
+    // block id, the named feedback rows and the settings puts; counts checked before anything lands.
+    deleteBlockRows(blockId, feedbackIds, counts, settingsPuts) {
+      spy.deleteBlockRows = (spy.deleteBlockRows || 0) + 1;
+      return commit(() => {
+        const staged = Object.fromEntries(['blocks', 'days', 'sets', 'feedback', 'settings'].map(s => [s, new Map([...data[s].entries()])]));
+        staged.blocks.delete(blockId);
+        for (const [k, r] of data.days) if (r.block_id === blockId) staged.days.delete(k);
+        for (const [k, r] of data.sets) if (r.block_id === blockId) staged.sets.delete(k);
+        for (const k of (feedbackIds || [])) staged.feedback.delete(k);
+        for (const r of (settingsPuts || [])) staged.settings.set(keyOf('settings', r), copy(r));
+        for (const n of ['blocks', 'days', 'sets', 'feedback']) if (staged[n].size !== counts[n]) throw new Error('deleteBlockRows: count mismatch in ' + n);
+        for (const [s, m] of Object.entries(staged)) data[s] = m;
+      }, ['blocks', 'days', 'sets', 'feedback', 'settings']);
     },
     clearSnapshots() { return commit(() => data.snapshots.clear()); },
     resetLink() { spy.resetLink++; for (const land of held.splice(0)) land(); },

@@ -89,11 +89,30 @@ const B2 = (() => {
       caps: CAPS, start_sets: START_SETS, effort: EFFORT_ADAPTIVE, load: LOAD_ADAPTIVE, easy_week: EASY_ADAPTIVE, carry_forward: CARRY, live_edits: LIVE_EDITS, builder: {} } } };
 })();
 
-test('rules.js equals the B.2 literal, key for key and value for value', async () => {
-  assert.deepEqual(clone(RULES), B2);
+// The signed-2 parts (17 C.3.5 BUILDER items 2 to 6, C.3.8 COPY), written out again apart from rules.js.
+const BUILDER2 = { days_per_rotation_min: 2, days_per_rotation_max: 6,
+  slots_per_rotation: { top: { 2: 2, 3: 3, 4: 3, 5: 3, 6: 4 }, middle: { 2: 1, 3: 2, 4: 2, 5: 2, 6: 3 }, bottom: { 2: 1, 3: 1, 4: 1, 5: 1, 6: 2 } },
+  max_lifts_per_day: 8, warn_lifts_per_day: 6, warn_work_sets_per_day: 10, default_level_on_board: 'middle', default_rep_range: null, default_reps_left_target: 2 };
+const COPY2 = { sets_from: 'planned', load_from: 'last_done', fallback: 'round_goal' };
+// signed-1 with its empty builder part swapped for the two signed-2 parts.
+const withParts = (t, version) => {
+  const c = clone(t);
+  c.rules_version = version;
+  for (const n of ['fixed', 'adaptive']) { c.profiles[n].builder = BUILDER2; c.profiles[n].copy = COPY2; }
+  return c;
+};
+const sansParts = (t) => {
+  const c = clone(t);
+  for (const n of Object.keys(c.profiles)) { delete c.profiles[n].builder; delete c.profiles[n].copy; }
+  delete c.rules_version;
+  return c;
+};
+
+test('rules.js equals the B.2 literal plus the signed-2 builder and copy parts (r4.4 R17)', async () => {
+  assert.deepEqual(clone(RULES), withParts(B2, 'signed-2'));
   const m = await import('../../../rules.js');
-  assert.deepEqual(clone(m.RULES_BY_VERSION), { 'signed-1': B2 });
-  assert.deepEqual(clone(m.RULE_VERSIONS), ['none', 'signed-1']);
+  assert.deepEqual(clone(m.RULES_BY_VERSION), { 'signed-1': withParts(B2, 'signed-1'), 'signed-2': withParts(B2, 'signed-2') });
+  assert.deepEqual(clone(m.RULE_VERSIONS), ['none', 'signed-1', 'signed-2']);
   assert.equal(A.effort.short_sleep_failure_reps_left, 2, 'the effort key of record (health-coach verdict item R4-13)');
   assert.equal(F.effort.short_sleep_failure_reps_left, 2);
 });
@@ -675,4 +694,38 @@ test('the Fixed profile never changes a set', () => {
     }
     play(h, p, { reps: () => 6, fb: () => ({ pump: 1, soreness: 1, workload: 1, checks: {} }) });
   }
+});
+
+
+// ---------------- signed-2 (17 C.0, r4.4 R17) ----------------
+
+test('signed-2: the fixed and adaptive profiles are the signed-1 table apart from builder and copy (r4.4 R17)', async () => {
+  const m = await import('../../../rules.js');
+  assert.deepEqual(sansParts(m.RULES_BY_VERSION['signed-2']), sansParts(B2));
+  assert.deepEqual(sansParts(m.RULES_BY_VERSION['signed-1']), sansParts(B2));
+  assert.equal(m.RULES_BY_VERSION['signed-1'].profiles, m.RULES_BY_VERSION['signed-2'].profiles, 'both signed names read the same profile table');
+  assert.equal(validateRules(m.RULES_BY_VERSION['signed-1']).ok, true);
+});
+
+test('validateRules: a builder where top does not get more slots than middle is refused, at each length 2 to 6 (BW4)', () => {
+  for (const d of [2, 3, 4, 5, 6]) {
+    const bad = clone(RULES);
+    bad.profiles.fixed.builder.slots_per_rotation.top[d] = bad.profiles.fixed.builder.slots_per_rotation.middle[d];
+    assert.ok(validateRules(bad).errors.some(e => e.includes('top must get more slots than middle at ' + d + ' days')), String(d));
+  }
+  const low = clone(RULES);
+  low.profiles.adaptive.builder.slots_per_rotation.middle[3] = 0;
+  assert.ok(validateRules(low).errors.some(e => /middle at 3 days is not a whole number/.test(e)));
+  const mb = clone(RULES);
+  mb.profiles.adaptive.builder.slots_per_rotation.bottom[4] = 3;
+  assert.ok(validateRules(mb).errors.some(e => /middle must get at least as many slots as bottom at 4 days/.test(e)));
+  const range = clone(RULES);
+  range.profiles.fixed.builder.days_per_rotation_max = 7;
+  assert.ok(validateRules(range).errors.some(e => /days per rotation out of range/.test(e)));
+  const gone = clone(RULES);
+  delete gone.profiles.fixed.builder;
+  assert.ok(validateRules(gone).errors.some(e => /part missing: builder/.test(e)));
+  const cp = clone(RULES);
+  cp.profiles.fixed.copy.load_from = 'round_goal';
+  assert.ok(validateRules(cp).errors.some(e => /copy.load_from unknown/.test(e)));
 });

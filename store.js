@@ -4,14 +4,18 @@
 import { APP_VERSION } from './version.js';
 import {
   STORE_NAMES, DEVICE_KEYS, LIMITS, SNAPSHOT_REASONS, validateBackup, validateSnapshotRow, validateBlock, migrate,
-  MIGRATIONS, buildBackup, repPairOk, markerOk, lineOk, textOk, minOf, maxOf, MUSCLES, EQUIPMENT, SET_KINDS, exerciseDefaults2
+  MIGRATIONS, buildBackup, repPairOk, markerOk, lineOk, textOk, minOf, maxOf, MUSCLES, EQUIPMENT, SET_KINDS, exerciseDefaults2,
+  EQUIPMENT_DETAILS, MUSCLE_DETAILS, TIP_IDS
 } from './backup.js';
 import { SEED_EXERCISES, SEED_IDS } from './data/exercises.js';
+import { TEMPLATES, FOCUS_NAMES } from './data/templates.js';
 import { t } from './ui/strings.js';
 // The rules engine (16 B.4): store.js is the only shipped file that imports engine.js and rules.js;
 // the screens reach the engine through store calls.
 import { RULES, RULES_BY_VERSION } from './rules.js';
-import { planDay, buildBlock, currentPosition, validateRules, applyLiveEdit, resizeBlock, feedbackDue, startingSets, stepFor, retargetOnLoad } from './engine.js';
+import { planDay, buildBlock, currentPosition, validateRules, applyLiveEdit, resizeBlock, feedbackDue, startingSets, stepFor, retargetOnLoad,
+  autoBuildDays, fillSlots, sizeWarning, copyStartValues , effortTarget } from './engine.js';
+import { dayCounts, setsByMuscle, exerciseRounds, trendPoints } from './stats.js';
 
 const ID_RE = /^[A-Za-z0-9:_-]{1,120}$/;
 const STALE_MS = 12 * 3600 * 1000;      // design number: the "Finish it?" card
@@ -19,6 +23,10 @@ const SINCE_MAX_MS = 3 * 3600 * 1000;   // design number: "Since last set" hides
 const KEEP_SNAPSHOTS = 3;
 const NOTE_MS = 60 * 1000;              // a restore note older than this is dropped unseen (A3-R8)
 const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+const num3 = (v) => typeof v === 'number' && Number.isFinite(v);
+// Slice 3 (17 C.3.4, C.3.5): the three level keys, and a template id (ours t_..., his m...).
+const LEVELS3 = ['top', 'middle', 'bottom'];
+const TEMPLATE_ID_RE3 = /^(t_[a-z0-9_]{1,60}|m[A-Za-z0-9-]{1,60})$/;
 // The muscle key of an exercise (16 B.3 shared terms): the finer value when there is one. A
 // feedback row carries it from Slice 2 on (B.4.4).
 const muscleKeyOf = (ex) => (ex ? (ex.muscle_detail || ex.muscle) : 'core');
@@ -192,10 +200,56 @@ function checkId(id) {
 // Finish day shows on an open day, and on a planned day once every set on it was skipped by
 // him (DESIGN 5.2, C34). finishDay itself also needs one done set (R4-02): a day with none
 // is ended by Skip day, and the button then says so.
+// The exercise library filter (17 C.3.13), pure, so the screen filters the one list it read in
+// memory: q case-blind in the name; muscle and equipment lists of finer values (a row with no
+// finer muscle matches its chip); mine = his own rows only; logged = a Set of ids with a done set.
+// Sorted by name, then id.
+export function filterExercises(rows, f, logged) {
+  const q = f && typeof f.q === 'string' ? f.q.trim().toLowerCase() : '';
+  const mus = f && Array.isArray(f.muscle) && f.muscle.length ? new Set(f.muscle) : null;
+  const eq = f && Array.isArray(f.equipment) && f.equipment.length ? new Set(f.equipment) : null;
+  return (rows || []).filter(e => e && (!q || String(e.name).toLowerCase().includes(q))
+    && (!mus || mus.has(e.muscle_detail) || (!e.muscle_detail && mus.has(e.muscle)))
+    && (!eq || eq.has(e.equipment_detail))
+    && (!(f && f.mine) || e.custom === true)
+    && (!(f && f.logged) || (logged && logged.has(e.id))))
+    .sort((a, b) => { const x = String(a.name).toLowerCase(), y = String(b.name).toLowerCase(); return x < y ? -1 : x > y ? 1 : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); });
+}
+
 export function finishable(day, sets) {
   if (!day) return false;
   if (day.status === 'open') return true;
   return day.status === 'planned' && sets.length > 0 && sets.every(s => s.status !== 'planned');
+}
+
+// The guard flag keys a block file and the Make my own exercise questions share (6.3, C.2.5).
+const FLAG_KEYS = ['machine', 'no_added_sets', 'left_out_of_builder'];
+
+// The block a phone-made block takes its flags from (17 C.2.5 item 2): the named block (Copy a
+// block), else the current block when it came from his block file, else the newest block that did.
+export function flagSource(blocks, current, fromId) {
+  if (fromId) return blocks.find(b => b.id === fromId) || null;
+  if (current && current.source_id) return current;
+  const filed = blocks.filter(b => b.source_id).sort((a, b) => (b.created_at - a.created_at) || (a.id < b.id ? 1 : -1));
+  return filed[0] || null;
+}
+
+// The four parts of his block file a phone-made block copies (C.2.5 item 2), each a deep copy.
+export function flagsOf(b) {
+  return {
+    exercise_flags: structuredClone(b.exercise_flags || {}), checks: structuredClone(b.checks || []),
+    scores: structuredClone(b.scores || []), rule_notes: structuredClone(b.rule_notes || { one_failure_set: '', failure_on_machine: '' })
+  };
+}
+
+// The reason line for a refused round change (r4.6 Q2, Q6): its 5.11 key and values. grid.fewest
+// is the Adjust each round floor (length_min); grid.min only the Fixed 1-round case.
+export function gridReason(error, block, rules) {
+  if (error === 'longer than the most rounds') return { key: 'grid.cap', vals: { n: rules.effort.length_max } };
+  if (error === 'easy round started') return { key: 'grid.easy', vals: {} };
+  if (error === 'shorter than the fewest rounds') return { key: 'grid.fewest', vals: { n: rules.effort.length_min } };
+  if (error === 'below the current round' && block.passes === 1) return { key: 'grid.min', vals: {} };
+  return { key: 'grid.done', vals: { r: block.passes } };
 }
 
 export function createStore(opts) {
@@ -233,7 +287,7 @@ export function createStore(opts) {
   }
   if (typeof db.setUpgradeHook === 'function') db.setUpgradeHook(upgradeFrom1);
 
-  const changed = () => { for (const fn of listeners) { try { fn(); } catch (_) { /* a screen error never stops a save */ } } };
+  const changed = () => { poolCache = null; for (const fn of listeners) { try { fn(); } catch (_) { /* a screen error never stops a save */ } } };
 
   // ---------------- guarded writes (5.3 Writes) ----------------
 
@@ -592,13 +646,15 @@ export function createStore(opts) {
     return {
       ...b, sleep_hint: spec.sleep_hint || '',
       flag_questions: { machine: fq.machine || '', no_added_sets: fq.no_added_sets || '', left_out_of_builder: fq.left_out_of_builder || '' },
-      template_id: null, copied_from: null, finished_at: null
+      // Slice 3: a template Start keeps the template id; a copy names the block and round it came from.
+      template_id: spec.template_id || null, copied_from: spec.copied_from ? { block_id: spec.copied_from.block_id, pass: spec.copied_from.pass } : null, finished_at: null
     };
   }
 
   // The rules a new block must pass before any op is built.
   function checkSpec(spec) {
     checkText('blockname', spec.name);
+    if (spec.template_id !== undefined && spec.template_id !== null && !(typeof spec.template_id === 'string' && TEMPLATE_ID_RE3.test(spec.template_id))) throw new Refused('bad block');
     checkText('note', spec.notes);
     // No repeated day number, and no repeated slot in one day: the validator refuses both (SR12).
     const dayNs = spec.day_templates.map(d => d.day);
@@ -646,15 +702,26 @@ export function createStore(opts) {
   }
 
   // Save a new block: the block, the days and sets of round 1, and make it active.
-  async function createBlock(spec, extraOps) {
+  // Save a new block made on the phone (builder, template, guided, copy). Flags (17 C.2.5 item 2):
+  // exercise_flags, checks, scores and rule_notes come from the current block when it has a
+  // source_id, else from the newest block with a source_id, else they stay empty; opts.flagFrom
+  // names the block to copy them from instead (Copy a block). The Current mark (C.3.2): the new block
+  // takes it only when no block is current, or on his yes (opts.activate true); never on its own (M74).
+  async function createBlock(spec, extraOps, opts) {
     checkSpec(spec);
+    const o = opts || {};
     const t = now();
     const unit = spec.unit || await db.setting('unit', 'lb');
-    const full = { ...spec, id: spec.id || 'b' + uuid(), unit };
     let block = null;
     // The blocks read for a blank name runs inside the block write (15 Part 2).
     await queued('block', async () => {
-      const r = newBlockOps(full, extraOps, await db.all('blocks'), { t, activate: true, exercises: await exercisesMap() });
+      const blocks = await db.all('blocks');
+      const activeId = await db.setting('active_block_id', null);
+      const current = blocks.find(b => b.id === activeId) || null;
+      const src = flagSource(blocks, current, o.flagFrom);
+      const full = { ...spec, id: spec.id || 'b' + uuid(), unit, ...(src ? flagsOf(src) : {}) };
+      const activate = !current || o.activate === true;
+      const r = newBlockOps(full, extraOps, blocks, { t, activate, exercises: await exercisesMap() });
       block = r.block;
       return batch(r.ops);
     });
@@ -681,10 +748,13 @@ export function createStore(opts) {
       if (day.status === 'done') throw new Refused('day is done');
       const t = now();
       const v = values || s.draft || {};
+      // A body-load lift (17 C.2.2 Today change) saves load 0: his own body is the weight.
+      const exRow = await db.get('exercises', s.exercise_id);
+      const bodyOnly = !!exRow && exRow.load_kind === 'body';
       row = {
         ...s,
         done: {
-          load: v.load === undefined ? s.target.load : v.load, reps: v.reps === undefined ? s.target.rep_high : v.reps,
+          load: bodyOnly ? 0 : v.load === undefined ? s.target.load : v.load, reps: v.reps === undefined ? s.target.rep_high : v.reps,
           reps_left: v.reps_left === undefined ? null : v.reps_left, reps_left_plus: !!v.reps_left_plus,
           failure: !!v.failure, unit: block.unit, breaks: breaksOf(v.breaks)
         },
@@ -1148,15 +1218,31 @@ export function createStore(opts) {
     return row;
   }
 
+  // The three yes or no questions of the current block's flag_questions (17 C.2.5 item 4, R4-04):
+  // only the questions the block holds are asked. [] when there is no current block or no question.
+  async function flagQuestions() {
+    const b = await activeBlock();
+    const fq = (b && b.flag_questions) || {};
+    return FLAG_KEYS.filter(k => typeof fq[k] === 'string' && fq[k] !== '').map(k => ({ key: k, ask: fq[k] }));
+  }
+
   async function addCustomExercise(spec) {
     checkText('name', spec.name);
     // Never a row the restore refuses (SB3): the muscle and the equipment come from the fixed lists.
     if (!MUSCLES.includes(spec.muscle) || !EQUIPMENT.includes(spec.equipment)) throw new Refused('bad text');
+    // His answers count only for a question the current block really asks; all of them answered
+    // sets flags_set (C.2.5 item 4). With no question nothing is read and flags_set stays false (M75).
+    const qs = await flagQuestions();
+    const ans = spec.flags || {};
+    const flags = { machine: spec.equipment === 'machine', no_added_sets: false, left_out_of_builder: false };
+    let answered = 0;
+    for (const q of qs) if (typeof ans[q.key] === 'boolean') { flags[q.key] = ans[q.key]; answered++; }
+    const flagsSet = qs.length === FLAG_KEYS.length && answered === FLAG_KEYS.length;
     // The schema 2 exercise fields by the one shared helper (16 B.1 step 5 R4 b, 17 C.0.2).
     const row = exerciseDefaults2({
       id: 'c-' + uuid(), name: spec.name, muscle: spec.muscle, equipment: spec.equipment, count_label: 'reps',
-      weight_steps: null, step_default: 5, unilateral: false, machine: spec.equipment === 'machine', no_added_sets: false,
-      left_out_of_builder: false, flags_set: false, link: '', notes: '', custom: true, edited: false
+      weight_steps: null, step_default: 5, unilateral: false, machine: flags.machine, no_added_sets: flags.no_added_sets,
+      left_out_of_builder: flags.left_out_of_builder, flags_set: flagsSet, link: '', notes: '', custom: true, edited: false
     });
     await queued('ex:' + row.id, () => batch([{ store: 'exercises', put: row }]));
     return row;
@@ -1184,10 +1270,13 @@ export function createStore(opts) {
         from = done.length ? minOf(done) : t;
       }
       ops.push({ store: 'days', put: { ...day, status: 'done', done_at: t, done_date: localDate(from), scores: scores || day.scores || {}, saved_at: t } });
+      // The next Finish day closes a what-changed note still showing (17 C.3.16).
+      const seen = await db.setting('seen_version', null);
+      if (seen !== null && seen !== APP_VERSION) ops.push({ store: 'settings', put: { key: 'seen_version', value: APP_VERSION } });
       const next = nextPosition(block, day.pass, day.day);
       // The next day is planned from the history as this batch leaves it (16 B.4.1).
       if (next) ops.push(...await planDayOps(block, next.pass, next.day, { overlay: ops }));
-      else ops.push({ store: 'blocks', put: { ...block, status: 'done' } });
+      else ops.push(finishBlock(block, t));
       // The same ops put twice give the same rows, so a retry after a late commit is safe (P9).
       await job.write(() => batch(ops));
       return next;
@@ -1212,7 +1301,7 @@ export function createStore(opts) {
       const next = nextPosition(block, day.pass, day.day);
       // The next day is planned from the history as this batch leaves it (16 B.4.1).
       if (next) ops.push(...await planDayOps(block, next.pass, next.day, { overlay: ops }));
-      else ops.push({ store: 'blocks', put: { ...block, status: 'done' } });
+      else ops.push(finishBlock(block, t));
       await job.write(() => batch(ops));
       return next;
     });
@@ -1421,7 +1510,8 @@ export function createStore(opts) {
     return exclusive(async (job) => {
       await snapshotNow('before-erase', job);
       const phone = await db.all('settings');
-      const settings = phone.filter(r => ['theme', 'persist_answer', 'seeded_version'].includes(r.key));
+      // 5.3 Erase list plus C.0.2: the device keys tips_seen and seen_version are kept too.
+      const settings = phone.filter(r => ['theme', 'persist_answer', 'seeded_version', 'tips_seen', 'seen_version'].includes(r.key));
       const data = Object.fromEntries(STORE_NAMES.map(s => [s, []]));
       data.settings = settings;
       await job.write(() => db.replaceAll(data, Object.fromEntries(STORE_NAMES.map(s => [s, data[s].length]))));
@@ -1886,8 +1976,9 @@ export function createStore(opts) {
       if (!block) throw new Refused('no block');
       if (block.status === 'done') throw new Refused('block is done');
       if ((await db.byIndex('days', 'block_id', blockId)).some(d => d.status === 'open')) throw new Refused('day open');
-      const nb = { ...block, status: 'done' };
-      await job.write(() => batch([{ store: 'blocks', put: nb }]));
+      const op = finishBlock(block, now());
+      const nb = op.put;
+      await job.write(() => batch([op]));
       return nb;
     });
   }
@@ -2069,7 +2160,769 @@ export function createStore(opts) {
     return label || String(prev.tpl.day);
   }
 
+  // ---------------- Slice 3 store calls (17 C.3) ----------------
+
+  // Saved equipment (17 C.3.1): the key absent reads as every kind (first run). An empty list,
+  // an unknown kind or a repeated kind is refused; empty is never stored (M66).
+  async function getSavedEquipment() {
+    const v = await db.setting('equipment_saved', null);
+    return Array.isArray(v) && v.length ? v.slice() : EQUIPMENT_DETAILS.slice();
+  }
+  async function setSavedEquipment(list) {
+    if (!Array.isArray(list) || !list.length || list.length > EQUIPMENT_DETAILS.length || new Set(list).size !== list.length ||
+      list.some(k => !EQUIPMENT_DETAILS.includes(k))) throw new Refused('bad equipment');
+    const v = EQUIPMENT_DETAILS.filter(k => list.includes(k));
+    await queued('setting:equipment_saved', () => db.setSetting('equipment_saved', v));
+    return v;
+  }
+
+  // ---------------- block list (17 C.3.2) ----------------
+
+  // Every block, newest first by created_at (ties by id), with the parts the list row shows.
+  async function listBlocks() {
+    const { blocks, days } = await db.allMany(['blocks', 'days']);
+    const activeId = await db.setting('active_block_id', null);
+    return blocks.sort((a, b) => (b.created_at - a.created_at) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0)).map(b => ({
+      id: b.id, name: b.name, passes: b.passes, profile: b.profile, status: b.status, created_at: b.created_at,
+      template_id: b.template_id || null, finished_at: b.finished_at || null, notes: b.notes || '',
+      current: b.id === activeId, days_done: days.filter(d => d.block_id === b.id && d.status === 'done').length
+    }));
+  }
+
+  // Use this block (C.3.2 current rule): only his tap moves the mark; a finished block is never made current.
+  function setCurrentBlock(id) {
+    checkId(id);
+    return queued('block', async () => {
+      const b = await db.get('blocks', id);
+      if (!b) throw new Refused('no block');
+      if (b.status === 'done') throw new Refused('block is done');
+      return batch([{ store: 'settings', put: { key: 'active_block_id', value: id } }]);
+    });
+  }
+
+  // Rename (C.3.2): one text field, a blank name refused (the default name is for create only).
+  function renameBlock(id, name) {
+    checkId(id);
+    checkText('blockname', name);
+    if (!String(name).trim()) return Promise.reject(new Refused('bad text'));
+    return queued('block', async () => {
+      const b = await db.get('blocks', id);
+      if (!b) throw new Refused('no block');
+      return batch([{ store: 'blocks', put: { ...b, name } }]);
+    });
+  }
+
+  // The block note (C.3.2 Note, L10): writes blocks.notes.
+  function setBlockNote(id, text) {
+    checkId(id);
+    checkText('note', text);
+    return queued('block', async () => {
+      const b = await db.get('blocks', id);
+      if (!b) throw new Refused('no block');
+      return batch([{ store: 'blocks', put: { ...b, notes: text } }]);
+    });
+  }
+
+  // Delete a block (C.3.2, r4 review R17, R23): refused unless he typed DELETE. One exclusive job, so
+  // every queued write for the block lands first (M89); then the before-delete safety copy (M51), then
+  // ONE transaction: the block, its days, sets and their feedback (M52), the Current mark moved to the
+  // newest other active block or null (S02, M53), the four stores counted inside it. Exercises,
+  // his own exercises and templates stay.
+  const DELETE_WORD = 'DELETE';
+  function deleteBlock(id, typed) {
+    if (typed !== DELETE_WORD) return Promise.reject(new Refused('word'));
+    checkId(id);
+    return exclusive(async (job) => {
+      const b = await db.get('blocks', id);
+      if (!b) throw new Refused('no block');
+      await snapshotNow('before-delete', job);
+      const { blocks, days, sets, feedback } = await db.allMany(['blocks', 'days', 'sets', 'feedback']);
+      const dayIds = new Set(days.filter(d => d.block_id === id).map(d => d.id));
+      const gone = feedback.filter(f => dayIds.has(f.day_id)).map(f => f.id);
+      const counts = {
+        blocks: blocks.length - 1, days: days.length - dayIds.size,
+        sets: sets.filter(s => s.block_id !== id).length, feedback: feedback.length - gone.length
+      };
+      const activeId = await db.setting('active_block_id', null);
+      const puts = [];
+      if (activeId === id) {
+        const next = blocks.filter(x => x.id !== id && x.status === 'active').sort((a, c) => (c.created_at - a.created_at) || (a.id < c.id ? 1 : -1))[0];
+        puts.push({ key: 'active_block_id', value: next ? next.id : null });
+      }
+      await job.write(() => db.deleteBlockRows(id, gone, counts, puts));
+      return { deleted: id, current: puts.length ? puts[0].value : activeId };
+    });
+  }
+
+  // The overview of any block (C.3.2, R27): the block row and whether it is the current one.
+  async function blockInfo(id) {
+    checkId(id);
+    const b = await db.get('blocks', id);
+    if (!b) return null;
+    return { block: b, current: (await db.setting('active_block_id', null)) === id };
+  }
+
+  // ---------------- tips and intros (17 C.3.16; the minimal part the guided board intro needs) ----------------
+
+  // The tips and intros he closed (a device key). An id not in TIP_IDS is refused.
+  async function tipsSeen() {
+    const v = await db.setting('tips_seen', null);
+    return v && typeof v === 'object' && !Array.isArray(v) ? { ...v } : {};
+  }
+  function markTipSeen(id) {
+    if (!TIP_IDS.includes(id)) return Promise.reject(new Refused('bad tip'));
+    return queued('setting:tips_seen', async () => {
+      const v = await db.setting('tips_seen', null);
+      const was = v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+      return db.setSetting('tips_seen', { ...was, [id]: true });
+    });
+  }
+
+  // ---------------- templates (17 C.3.4) ----------------
+
+  // The Fixed profile table: every block a Slice 3 path makes starts Fixed (C.0), so its starting
+  // sets, the builder values and the copy rule are read from it.
+  const FIXED = () => RULES.profiles.fixed;
+
+  // The block a phone-made block takes its flags from (C.2.5 item 2), read the way createBlock reads it.
+  async function flagBlock(fromId) {
+    const blocks = await db.all('blocks');
+    const activeId = await db.setting('active_block_id', null);
+    return flagSource(blocks, blocks.find(b => b.id === activeId) || null, fromId || null);
+  }
+
+  // The highest level each muscle holds over a template's slots (r4 review R43, health-coach C8).
+  function levelsOfSlots(days, exMap) {
+    const out = {};
+    for (const d of days) for (const s of d.slots) {
+      const ex = exMap.get(s.exercise_id);
+      const m = ex ? muscleKeyOf(ex) : null;
+      if (!m || !MUSCLE_DETAILS.includes(m) || !LEVELS3.includes(s.priority)) continue;
+      if (!own(out, m) || LEVELS3.indexOf(s.priority) < LEVELS3.indexOf(out[m])) out[m] = s.priority;
+    }
+    return out;
+  }
+
+  // One template as the screens read it, ours (data/templates.js, never stored) or his (the store).
+  function oursView(tp) {
+    return {
+      id: tp.id, author: 'ours', name: tp.name, days_per_rotation: tp.days_per_rotation, focus_key: tp.focus_key,
+      equipment: tp.equipment.slice(), why: tp.why, made_at: null, levels: { ...tp.levels },
+      days: tp.days.map(d => ({ label: d.label, slots: d.slots.map(s => ({ exercise_id: s.exercise_id, rep_low: s.rep_low, rep_high: s.rep_high, priority: s.priority || null, sets: null })) }))
+    };
+  }
+  function mineView(row, exMap) {
+    const kinds = new Set();
+    for (const d of row.days) for (const s of d.slots) { const ex = exMap.get(s.exercise_id); if (ex && ex.equipment_detail) kinds.add(ex.equipment_detail); }
+    return {
+      id: row.id, author: 'mine', name: row.name, days_per_rotation: row.days.length, focus_key: null,
+      equipment: EQUIPMENT_DETAILS.filter(k => kinds.has(k)), why: '', made_at: row.made_at, levels: levelsOfSlots(row.days, exMap),
+      days: row.days.map(d => ({ label: d.label, slots: d.slots.map(s => ({ ...s })) }))
+    };
+  }
+
+  // Search and the four filters (C.3.4 Browser): q is case-blind over the name, the focus words
+  // and the why; days and focus are lists of picked values; equipment is 'fits' (his saved
+  // equipment) or a list of kinds (a template fits when every kind it needs is picked); author is
+  // 'ours' or 'mine'. Ours first by days then name, his after by made_at newest first.
+  async function listTemplates(f) {
+    const o = f || {};
+    const exMap = await exercisesMap();
+    const mine = (await db.all('templates')).filter(r => r && r.author === 'mine').sort((a, b) => (b.made_at - a.made_at) || (a.id < b.id ? -1 : 1));
+    const all = [...TEMPLATES.map(oursView), ...mine.map(r => mineView(r, exMap))];
+    const needle = String(o.q || '').trim().toLowerCase();
+    let kinds = null;
+    if (o.equipment === 'fits') kinds = await getSavedEquipment();
+    else if (Array.isArray(o.equipment) && o.equipment.length) kinds = o.equipment;
+    const days = Array.isArray(o.days) && o.days.length ? o.days : null;
+    const focus = Array.isArray(o.focus) && o.focus.length ? o.focus : null;
+    const author = Array.isArray(o.author) && o.author.length ? o.author : null;
+    return all.filter(tp => {
+      if (needle) {
+        const words = [tp.name, tp.focus_key ? FOCUS_NAMES[tp.focus_key] || '' : '', tp.why].join(' ').toLowerCase();
+        if (!words.includes(needle)) return false;
+      }
+      if (days && !days.includes(tp.days_per_rotation)) return false;
+      if (focus && !focus.includes(tp.focus_key)) return false;
+      if (author && !author.includes(tp.author)) return false;
+      if (kinds && !tp.equipment.every(k => kinds.includes(k))) return false;
+      return true;
+    });
+  }
+
+  function checkTemplateId(id) {
+    if (typeof id !== 'string' || !TEMPLATE_ID_RE3.test(id) || reservedName(id)) throw new Refused('bad id');
+    return id;
+  }
+
+  async function getTemplate(id) {
+    checkTemplateId(id);
+    if (id.startsWith('t_')) { const tp = TEMPLATES.find(x => x.id === id); return tp ? oursView(tp) : null; }
+    const row = await db.get('templates', id);
+    return row && row.author === 'mine' ? mineView(row, await exercisesMap()) : null;
+  }
+
+  // The preview (C.3.4): each slot with its exercise, muscle, level and the set count the block
+  // would start with (startingSets under Fixed, or his template's own count).
+  async function templatePreview(id) {
+    const tp = await getTemplate(id);
+    if (!tp) return null;
+    const exMap = await exercisesMap();
+    return {
+      ...tp,
+      days: tp.days.map(d => ({ label: d.label, slots: d.slots.map(s => {
+        const ex = exMap.get(s.exercise_id);
+        const muscle = ex ? muscleKeyOf(ex) : null;
+        const level = muscle && own(tp.levels, muscle) ? tp.levels[muscle] : null;
+        return { ...s, name: ex ? ex.name : s.exercise_id, muscle, level, start_sets: num3(s.sets) ? s.sets : startingSets(FIXED(), { sets: undefined }, level) };
+      }) }))
+    };
+  }
+
+  // The pool the builder picks from (C.3.6): every exercise row as the block in hand screens it
+  // (effectiveExercise: its flags_set is `screened`), with done_count from one pass over the done
+  // work sets. Cached until the next write.
+  let poolCache = null;
+  async function poolFor(block) {
+    const key = block ? block.id : '';
+    if (poolCache && poolCache.key === key) return poolCache.rows;
+    const counts = new Map();
+    for (const s of await db.all('sets')) if (s.kind === 'work' && s.status === 'done') counts.set(s.exercise_id, (counts.get(s.exercise_id) || 0) + 1);
+    const rows = [...(await exercisesMap()).values()].map(ex => {
+      const e = effectiveExercise(block, ex);
+      return { ...e, screened: e.flags_set === true, done_count: counts.get(ex.id) || 0 };
+    });
+    poolCache = { key, rows };
+    return rows;
+  }
+
+  // Start (C.3.4): the builder draft from a template, opened at Rounds. A slot whose exercise the
+  // new block's flags leave out (not screened, or left out of the builder) is refilled by the
+  // recommend rule from his saved equipment; if nothing fits it is dropped and counted (C7).
+  async function templateToDraft(id) {
+    const tp = await getTemplate(id);
+    if (!tp) throw new Refused('no template');
+    const src = await flagBlock(null);
+    const pool = await poolFor(src);
+    const byId = new Map(pool.map(r => [r.id, r]));
+    const kinds = await getSavedEquipment();
+    let dropped = 0;
+    const days = tp.days.map((d) => {
+      const lifts = [];
+      for (const s of d.slots) {
+        const ex = byId.get(s.exercise_id);
+        let exId = s.exercise_id;
+        if (!ex || !ex.screened || ex.left_out_of_builder === true) {
+          const slot = { slot: 1, muscle_detail: ex ? ex.muscle_detail : null, muscle: ex ? ex.muscle : null, exercise_id: null };
+          const taken = new Set(lifts.map(l => l.exercise_id));
+          const r = fillSlots(FIXED(), [{ day: 1, lifts: [slot] }], pool.filter(p => !taken.has(p.id)), { emptyOnly: true, equipment: kinds });
+          exId = r.days[0].lifts[0].exercise_id;
+          if (!exId) { dropped++; continue; }
+        }
+        if (lifts.some(l => l.exercise_id === exId)) { dropped++; continue; }
+        const row = byId.get(exId);
+        const muscle = row ? muscleKeyOf(row) : null;
+        const level = muscle && own(tp.levels, muscle) ? tp.levels[muscle] : null;
+        lifts.push({
+          exercise_id: exId, sets: num3(s.sets) ? s.sets : startingSets(FIXED(), { sets: undefined }, level),
+          rep_low: s.rep_low, rep_high: s.rep_high, start_load: null, failure_set: false,
+          reps_left_target: FIXED().builder.default_reps_left_target, sides: row && row.unilateral ? 'LR' : 'none', note: ''
+        });
+      }
+      return { label: d.label, lifts };
+    }).filter(d => d.lifts.length);
+    return { step: 2, name: tp.name, notes: '', passes: '', unit: null, template_id: tp.id, levels: { ...tp.levels }, dropped, days };
+  }
+
+  // Save as template (C.3.4): one templates row of his, never a load, check, score, rule note or flag.
+  // The id and time are drawn by the caller BEFORE the queue, so a retried write puts the same row.
+  function templateRow(id, name, fromBlockId, days, levels, exMap, t) {
+    return {
+      id, author: 'mine', name, made_at: t, from_block_id: fromBlockId,
+      days: days.map(d => ({ label: d.label || '', slots: d.lifts.map(l => {
+        const ex = exMap.get(l.exercise_id);
+        const m = ex ? muscleKeyOf(ex) : null;
+        return { exercise_id: l.exercise_id, rep_low: num3(l.rep_low) ? l.rep_low : null, rep_high: num3(l.rep_high) ? l.rep_high : null,
+          priority: m && levels && own(levels, m) ? levels[m] : null, sets: num3(l.sets) ? l.sets : null };
+      }) }))
+    };
+  }
+  function saveBlockAsTemplate(blockId, name) {
+    checkId(blockId);
+    checkText('name', name);
+    if (!String(name || '').trim()) return Promise.reject(new Refused('bad text'));
+    const id = 'm' + uuid(), t = now();
+    let row = null;
+    return queued('templates', async () => {
+      const b = await db.get('blocks', blockId);
+      if (!b) throw new Refused('no block');
+      const days = [...b.day_templates].sort((x, y) => x.day - y.day).filter(d => d.lifts.length);
+      row = templateRow(id, String(name).trim(), b.id, days, b.levels || {}, await exercisesMap(), t);
+      return batch([{ store: 'templates', put: row }]);
+    }).then(() => row);
+  }
+  // The guided board's Save as template (C.3.5 board tools): the filled slots of the board.
+  function saveBoardAsTemplate(draft, name) {
+    checkText('name', name);
+    if (!String(name || '').trim()) return Promise.reject(new Refused('bad text'));
+    const days = boardDays(draft).filter(d => d.lifts.length);
+    if (!days.length) return Promise.reject(new Refused('empty day'));
+    const id = 'm' + uuid(), t = now();
+    let row = null;
+    return queued('templates', async () => {
+      row = templateRow(id, String(name).trim(), null, days, levelMap(draft.levels), await exercisesMap(), t);
+      return batch([{ store: 'templates', put: row }]);
+    }).then(() => row);
+  }
+
+  // Delete one of his templates (C.3.4, r4 review R19): ours is refused; a before-delete safety
+  // copy first, so Undo brings it back (M91). One exclusive job.
+  function deleteTemplate(id) {
+    try { checkTemplateId(id); } catch (e) { return Promise.reject(e); }
+    if (!id.startsWith('m')) return Promise.reject(new Refused('ours'));
+    return exclusive(async (job) => {
+      const row = await db.get('templates', id);
+      if (!row || row.author !== 'mine') throw new Refused('no template');
+      await snapshotNow('before-delete', job); // r4 review R19, M91
+      await job.write(() => batch([{ store: 'templates', del: id }]));
+      return id;
+    });
+  }
+
+  // ---------------- guided builder (17 C.3.5, C.3.6) ----------------
+
+  // The builder values the screens need (rules.builder, health-coach C3 to C5).
+  function builderInfo() {
+    const b = FIXED().builder;
+    return { days_min: b.days_per_rotation_min, days_max: b.days_per_rotation_max, max_lifts: b.max_lifts_per_day, default_level: b.default_level_on_board };
+  }
+  // {top: [..], middle: [..], bottom: [..]} to {muscle: level}, and back.
+  function levelMap(levels) {
+    const out = {};
+    for (const lv of LEVELS3) for (const m of (levels && levels[lv]) || []) out[m] = lv;
+    return out;
+  }
+  // The board's days as builder days, in board order, filled slots only (C.3.5 Save).
+  function boardDays(draft) {
+    return (draft.board || []).map((d) => ({ label: d.label, lifts: d.lifts.filter(l => l.exercise_id) }));
+  }
+  async function guidedPool(kinds) {
+    const pool = await poolFor(await flagBlock(null));
+    return Array.isArray(kinds) ? pool.filter(r => kinds.includes(r.equipment_detail)) : pool;
+  }
+  // Next on step 2: autoBuildDays lays out the board from his saved equipment.
+  async function guidedLayout(days, levels) {
+    const r = autoBuildDays(FIXED(), levels, days, await guidedPool(await getSavedEquipment()));
+    if (!r.ok) throw new Refused(r.error);
+    return { board: r.days, dropped: r.dropped };
+  }
+  // Fill for me (C.3.6): emptyOnly and the kinds picked on the sheet for this run.
+  async function autofill(draft, opts) {
+    const o = opts || {};
+    const kinds = Array.isArray(o.equipment) && o.equipment.length ? o.equipment : await getSavedEquipment();
+    const r = fillSlots(FIXED(), draft.board || [], await guidedPool(null), { emptyOnly: o.emptyOnly !== false, equipment: kinds });
+    return { board: r.days, filled: r.filled };
+  }
+  // Suggest one (C.3.6): that slot only; index moves to the next eligible exercise on a second tap.
+  async function recommend(draft, day, slot, index) {
+    const r = fillSlots(FIXED(), draft.board || [], await guidedPool(null), { only: { day, slot }, equipment: await getSavedEquipment(), index: index || 0 });
+    return { board: r.days, filled: r.filled };
+  }
+  function muscleSlotCount(board, day, muscle) {
+    const d = (board || []).find(x => x.day === day);
+    return d ? d.lifts.filter(l => l.muscle_detail === muscle).length : 0;
+  }
+  function dayWarning(day) { return sizeWarning(FIXED(), day); }
+  function startSetsFor(level) { return startingSets(FIXED(), { sets: undefined }, level || null); }
+
+  // Save (C.3.5): a Fixed block with his levels and flags per C.2.5; empty slots are dropped, a
+  // day with no filled slot refuses the save. Every lift starts with no rep range and a reps-left
+  // goal of 2 (health-coach C5).
+  async function guidedSave(draft, opts) {
+    const days = boardDays(draft);
+    if (!days.length || days.some(d => !d.lifts.length)) throw new Refused('empty day');
+    const exMap = await exercisesMap();
+    const lv = levelMap(draft.levels);
+    const b = FIXED().builder;
+    const spec = {
+      name: String(draft.name || '').trim(), notes: draft.notes || '', passes: draft.passes === '' || draft.passes === undefined ? null : draft.passes,
+      unit: draft.unit || undefined, levels: lv,
+      day_templates: days.map((d, i) => ({ day: i + 1, label: d.label, lifts: d.lifts.map((l, j) => {
+        const ex = exMap.get(l.exercise_id);
+        return { slot: j + 1, exercise_id: l.exercise_id, sets: startingSets(FIXED(), { sets: undefined }, lv[l.muscle_detail] || l.level || null),
+          rep_low: b.default_rep_range ? b.default_rep_range[0] : null, rep_high: b.default_rep_range ? b.default_rep_range[1] : null,
+          start_load: null, failure_set: false, reps_left_target: b.default_reps_left_target, warmups: [], sides: ex && ex.unilateral ? 'LR' : 'none',
+          load_basis: 'total', count_label: null, note: '' };
+      }) }))
+    };
+    return createBlock(spec, null, opts);
+  }
+
+  // ---------------- muscle levels mid block (17 C.3.7) ----------------
+
+  // The level board of a block: its saved levels, or every muscle it trains on the middle level
+  // (unsaved) when it has none.
+  async function blockLevels(blockId) {
+    checkId(blockId);
+    const b = await db.get('blocks', blockId);
+    if (!b) return null;
+    const exMap = await exercisesMap();
+    const saved = b.levels && Object.keys(b.levels).length ? b.levels : null;
+    const trained = [];
+    for (const d of b.day_templates) for (const l of d.lifts) {
+      const m = muscleKeyOf(exMap.get(l.exercise_id));
+      if (MUSCLE_DETAILS.includes(m) && !trained.includes(m)) trained.push(m);
+    }
+    const levels = { top: [], middle: [], bottom: [] };
+    if (saved) { for (const m of MUSCLE_DETAILS) if (own(saved, m)) levels[saved[m]].push(m); }
+    else levels[FIXED().builder.default_level_on_board].push(...trained);
+    return { block_id: b.id, name: b.name, saved: !!saved, levels };
+  }
+  // Save levels (C.3.7): writes blocks.levels only; done and open days are never touched (M73).
+  function setPriorities(blockId, levels) {
+    checkId(blockId);
+    const map = Array.isArray(levels && levels.top) ? levelMap(levels) : levels;
+    const seen = new Set();
+    for (const lv of LEVELS3) for (const m of (levels && Array.isArray(levels[lv]) ? levels[lv] : [])) { if (seen.has(m)) return Promise.reject(new Refused('two levels')); seen.add(m); }
+    if (!map || typeof map !== 'object' || Object.keys(map).some(k => !MUSCLE_DETAILS.includes(k) || !LEVELS3.includes(map[k]))) return Promise.reject(new Refused('bad levels'));
+    return queued('block', async () => {
+      const b = await db.get('blocks', blockId);
+      if (!b) throw new Refused('no block');
+      const clean = {};
+      for (const m of MUSCLE_DETAILS) if (own(map, m)) clean[m] = map[m];
+      return batch([{ store: 'blocks', put: { ...b, levels: clean } }]);
+    });
+  }
+
+  // ---------------- copy a block (17 C.3.8) ----------------
+
+  // The rounds a copy may start from: 1 to the last hard round (a block with a length; Adjust each
+  // round keeps its last round easy), or 1 to the newest round with a done day (open ended).
+  async function copyRounds(blockId) {
+    checkId(blockId);
+    const b = await db.get('blocks', blockId);
+    if (!b) return null;
+    const days = await db.byIndex('days', 'block_id', blockId);
+    let last;
+    if (num3(b.passes)) last = profileOf(b, now()) === 'adaptive' ? Math.max(1, b.passes - 1) : b.passes;
+    else last = Math.max(1, maxOf(days.filter(d => d.status === 'done').map(d => d.pass)) || 1);
+    const out = [];
+    for (let r = 1; r <= last; r++) out.push({ pass: r, days_done: days.filter(d => d.pass === r && d.status === 'done').length });
+    return { block_id: b.id, name: b.name, unit: b.unit, rounds: out };
+  }
+  // The start values of every lift for a copy from that round (copyStartValues, R4-17).
+  async function copyLifts(b, pass) {
+    const sets = await db.byIndex('sets', 'block_id', b.id);
+    return [...b.day_templates].sort((x, y) => x.day - y.day).map(d => ({
+      day: d.day, label: d.label,
+      lifts: d.lifts.map(l => {
+        const did = dayId(b.id, pass, d.day);
+        const rows = sets.filter(s => s.day_id === did && s.slot === l.slot);
+        const v = copyStartValues(rulesOf(b, now()), l, rows);
+        return { ...l, sets: num3(v.sets) ? v.sets : l.sets, start_load: v.start_load, rep_low: v.rep_low, rep_high: v.rep_high };
+      })
+    }));
+  }
+  async function copyPreview(blockId, pass) {
+    checkId(blockId);
+    const b = await db.get('blocks', blockId);
+    if (!b || !Number.isInteger(pass) || pass < 1) return null;
+    const exMap = await exercisesMap();
+    const days = await copyLifts(b, pass);
+    return { block_id: b.id, name: b.name, unit: b.unit, pass, days: days.map(d => ({ ...d, lifts: d.lifts.map(l => ({ ...l, name: (exMap.get(l.exercise_id) || { name: l.exercise_id }).name })) })) };
+  }
+  // Copy block (C.3.8): a new Fixed block in the SOURCE unit (B09, M55) with its rounds, note,
+  // levels, checks, scores, rule notes and flags (M56), the day templates as they stand, start
+  // values from copyStartValues; never the source's source_id or version.
+  async function copyBlock(blockId, pass, opts) {
+    checkId(blockId);
+    const b = await db.get('blocks', blockId);
+    if (!b) throw new Refused('no block');
+    const rounds = await copyRounds(blockId);
+    if (!Number.isInteger(pass) || !rounds.rounds.some(r => r.pass === pass)) throw new Refused('bad round');
+    const days = await copyLifts(b, pass);
+    const spec = {
+      name: b.name, notes: b.notes || '', passes: b.passes, unit: b.unit, levels: structuredClone(b.levels || {}),
+      template_id: b.template_id || null, copied_from: { block_id: b.id, pass },
+      day_templates: days.map(d => ({ day: d.day, label: d.label, lifts: d.lifts.map(l => ({ ...structuredClone(l) })) }))
+    };
+    return createBlock(spec, null, { ...(opts || {}), flagFrom: b.id });
+  }
+
+  // ---------------- Slice 3, track S3 (17 C.3.9 to C.3.16) ----------------
+
+  // Block finished (C.3.9): the op that ends a block, added to the same put as the day finish,
+  // the day skip, the End block write or the typed round removal. Never a second write.
+  const finishBlock = (block, t) => ({ store: 'blocks', put: { ...block, status: 'done', finished_at: t } });
+
+  // A done work set counts once per set number: an L and R pair is one set (C.3.9, W03).
+  const doneWorkOnce = (sets) => {
+    const seen = new Set();
+    let n = 0;
+    for (const s of sets) {
+      if (s.kind !== 'work' || s.status !== 'done') continue;
+      const k = s.day_id + '|' + s.slot + '|' + s.set_n;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      n++;
+    }
+    return n;
+  };
+
+  // Every place of rounds 1 to passes has a done or skipped day row.
+  const allOver = (block, days) => {
+    if (!Number.isInteger(block.passes)) return false;
+    for (let p = 1; p <= block.passes; p++) {
+      for (const d of block.day_templates) {
+        const row = days.find(x => x.pass === p && x.day === d.day);
+        if (!row || (row.status !== 'done' && row.status !== 'skipped')) return false;
+      }
+    }
+    return true;
+  };
+
+  // The Block finished screen (C.3.9), read only: a done block only.
+  async function blockFinishedView(blockId) {
+    const block = await db.get('blocks', checkId(blockId));
+    if (!block || block.status !== 'done') return null;
+    const days = await db.byIndex('days', 'block_id', block.id);
+    const sets = await db.byIndex('sets', 'block_id', block.id);
+    const over = days.filter(d => d.status === 'done' || d.status === 'skipped');
+    const last = maxOf(over.map(d => d.pass)) || 1;
+    const lastIds = new Set(days.filter(d => d.pass === last).map(d => d.id));
+    let rounds = 0;
+    const top = maxOf(days.map(d => d.pass)) || 0;
+    for (let p = 1; p <= top; p++) {
+      const mine = days.filter(d => d.pass === p);
+      if (mine.length === block.day_templates.length && mine.every(d => d.status === 'done' || d.status === 'skipped')) rounds++;
+    }
+    return {
+      block, last, tally: doneWorkOnce(sets.filter(s => lastIds.has(s.day_id))), rounds,
+      days: days.filter(d => d.status === 'done').length, skipped: days.filter(d => d.status === 'skipped').length
+    };
+  }
+
+  // The Block summary (C.3.10): the three pages from stats.js. Reads by index only.
+  async function blockSummary(blockId) {
+    const block = await db.get('blocks', checkId(blockId));
+    if (!block) return null;
+    const days = await db.byIndex('days', 'block_id', block.id);
+    const sets = await db.byIndex('sets', 'block_id', block.id);
+    const exs = await exercisesMap();
+    const used = [...new Set(sets.filter(s => s.kind === 'work' && s.status === 'done').map(s => s.exercise_id))];
+    const exercises = used.map(id => { const ex = exs.get(id); return { id, name: ex ? ex.name : id }; })
+      .sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : (a.id < b.id ? -1 : 1)));
+    return { block, counts: dayCounts(block, days), muscles: setsByMuscle(block, days, sets, [...exs.values()]), exercises };
+  }
+
+  // ---- the round grid (C.3.11, r4.6 Q1 and Q2) ----
+
+  const REMOVE_WORD = 'REMOVE';
+
+  // The days a minus would delete, checked as the store checks them inside the write: planned,
+  // every set untouched (planned, no done value, no draft), no answers row (r4.6 Q1 guards).
+  async function untouchedDays(block, days, remove) {
+    const out = [];
+    for (const ref of remove) {
+      const d = days.find(x => x.pass === ref.pass && x.day === ref.day);
+      if (!d || d.status !== 'planned') return null;
+      const sets = await db.byIndex('sets', 'day_id', d.id);
+      if (sets.some(s => s.status !== 'planned' || (s.done !== null && s.done !== undefined) || (s.draft !== null && s.draft !== undefined))) return null;
+      if ((await db.byIndex('feedback', 'day_id', d.id)).length) return null;
+      out.push({ day: d, sets });
+    }
+    return out;
+  }
+
+  async function roundGrid(blockId) {
+    const block = await db.get('blocks', checkId(blockId));
+    if (!block) return null;
+    const t = now();
+    const rules = rulesOf(block, t);
+    const days = await db.byIndex('days', 'block_id', block.id);
+    const cur = currentPosition(block, days);
+    const top = maxOf(days.map(d => d.pass)) || 1;
+    const last = block.passes === null ? top : block.passes;
+    const rounds = [];
+    for (let p = 1; p <= last; p++) {
+      const g = block.passes === null ? null : effortTarget(rules, p, block.passes);
+      rounds.push({ pass: p, goal: typeof g === 'number' ? g : null });
+    }
+    const rows = [...block.day_templates].sort((a, b) => a.day - b.day).map(d => ({
+      day: d.day, label: d.label,
+      cells: rounds.map(r => {
+        const row = days.find(x => x.pass === r.pass && x.day === d.day) || null;
+        const state = row && row.id === cur && block.status !== 'done' ? 'now'
+          : !row ? 'notplanned' : row.status === 'done' ? 'done' : row.status === 'skipped' ? 'skipped' : 'planned';
+        return { pass: r.pass, day: d.day, ref: row ? row.id : dayId(block.id, r.pass, d.day), state, now: state === 'now' };
+      })
+    }));
+    const out = { id: block.id, passes: block.passes, status: block.status, rounds, rows, open: block.passes === null, plus: null, minus: null };
+    if (block.passes !== null && block.status !== 'done') {
+      const p = resizeBlock(rules, block, 1, days);
+      out.plus = p.ok ? { ok: true } : { ok: false, reason: gridReason(p.error, block, rules) };
+      const m = resizeBlock(rules, block, -1, days);
+      if (!m.ok) out.minus = { ok: false, reason: gridReason(m.error, block, rules) };
+      else if (m.remove.length && !(await untouchedDays(block, days, m.remove))) out.minus = { ok: false, reason: gridReason('that round has started', block, rules) };
+      else {
+        const gone = new Set(m.remove.map(x => x.pass + ':' + x.day));
+        out.minus = { ok: true, finishes: !!m.remove.length && allOver(m.block, days.filter(d => !gone.has(d.pass + ':' + d.day))) };
+      }
+    }
+    return out;
+  }
+
+  // The grid plus and minus (C.3.11): plus at once; minus only with REMOVE typed (M59). r4.6 Q1: a
+  // minus may delete planned days whose every set is untouched, re-checked here inside the job,
+  // and when no day is left to do the same batch finishes the block (finishBlock).
+  function resizeRounds(blockId, delta, typed) {
+    if (delta !== 1 && delta !== -1) return Promise.reject(new Refused('bad request'));
+    if (delta === -1 && typed !== REMOVE_WORD) return Promise.reject(new Refused('word'));
+    checkId(blockId);
+    return exclusive(async (job) => {
+      const block = await db.get('blocks', blockId);
+      if (!block) throw new Refused('no block');
+      if (block.status === 'done') throw new Refused('block is done');
+      const days = await db.byIndex('days', 'block_id', blockId);
+      const t = now();
+      const r = resizeBlock(rulesOf(block, t), block, delta, days);
+      if (!r.ok) throw new Refused(r.error);
+      let nb = r.block;
+      const ops = [];
+      const gone = new Set();
+      if (r.remove.length) {
+        const rows = await untouchedDays(block, days, r.remove);
+        if (!rows) throw new Refused('day past the end');
+        for (const x of rows) {
+          for (const s of x.sets) ops.push({ store: 'sets', del: s.id });
+          ops.push({ store: 'days', del: x.day.id });
+          gone.add(x.day.id);
+        }
+      }
+      const finished = !!r.remove.length && allOver(nb, days.filter(d => !gone.has(d.id)));
+      ops.unshift(finished ? finishBlock(nb, t) : { store: 'blocks', put: nb });
+      nb = ops[0].put;
+      for (const ref of r.replan) ops.push(...await planDayOps(nb, ref.pass, ref.day, { overlay: [...ops] }));
+      await job.write(() => batch(ops));
+      return { block: nb, finished };
+    });
+  }
+
+  // ---- History (C.3.12) ----
+
+  const byCreated = (a, b) => (b.created_at - a.created_at) || (a.id < b.id ? 1 : -1);
+  // Finished days by block (newest block first), then newest position first; 30 at a time.
+  async function historyDays(o) {
+    const before = o && Number.isInteger(o.before) && o.before > 0 ? o.before : 0;
+    const limit = o && Number.isInteger(o.limit) && o.limit > 0 ? o.limit : 30;
+    const blocks = (await db.all('blocks')).sort(byCreated);
+    const all = [];
+    for (const b of blocks) {
+      const ds = (await db.byIndex('days', 'block_id', b.id)).filter(d => d.status === 'done').sort((x, y) => (y.pass - x.pass) || (y.day - x.day));
+      for (const d of ds) all.push({ block: b, day: d });
+    }
+    const page = all.slice(before, before + limit);
+    const rows = [];
+    for (const r of page) {
+      const sets = await db.byIndex('sets', 'day_id', r.day.id);
+      const live = sets.filter(s => s.status !== 'skipped');
+      rows.push({ block: { id: r.block.id, name: r.block.name, unit: r.block.unit }, day: r.day,
+        done: live.filter(s => s.status === 'done').length, total: live.length, sets: doneWorkOnce(sets) });
+    }
+    return { rows, more: all.length > before + limit, next: before + page.length };
+  }
+
+  // The exercises with a done set (C.3.13): the unique keys of the sets exercise_id index, then
+  // only those with a done set by that index (a planned or skipped set never counts).
+  async function loggedExerciseIds() {
+    const keys = await db.distinctKeys('sets', 'exercise_id');
+    const out = [];
+    for (const k of keys) if ((await db.byIndex('sets', 'exercise_id', k)).some(s => s.status === 'done')) out.push(k);
+    return out;
+  }
+
+  // Every exercise with a done work set, by name (C.3.12 By exercise).
+  async function historyExercises() {
+    const exs = await exercisesMap();
+    const out = [];
+    for (const id of await loggedExerciseIds()) {
+      const sets = await db.byIndex('sets', 'exercise_id', id);
+      if (!sets.some(s => s.kind === 'work' && s.status === 'done')) continue;
+      const ex = exs.get(id);
+      out.push({ id, name: ex ? ex.name : id });
+    }
+    return out.sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : (a.id < b.id ? -1 : 1)));
+  }
+
+  // One exercise's done work sets by block, newest block first (M61), each block with its rounds
+  // and its own trend points (one series per block, units never mix). blockId: that block only.
+  async function exerciseHistory(exerciseId, blockId) {
+    checkId(exerciseId);
+    if (blockId !== undefined && blockId !== null) checkId(blockId);
+    const ex = await db.get('exercises', exerciseId);
+    if (!ex) return null;
+    const sets = (await db.byIndex('sets', 'exercise_id', exerciseId)).filter(s => !blockId || s.block_id === blockId);
+    const blocks = new Map();
+    for (const g of exerciseRounds(sets, exerciseId)) {
+      const b = await db.get('blocks', g.block_id);
+      if (!b) continue;
+      const kind = (effectiveExercise(b, ex) || ex).load_kind || 'external';
+      blocks.set(g.block_id, { block_id: b.id, name: b.name, unit: b.unit, created_at: b.created_at, rounds: g.rounds, points: trendPoints(g.rounds, kind), load_kind: kind });
+    }
+    return { exercise: ex, blocks: [...blocks.values()].sort((a, b) => (b.created_at - a.created_at) || (a.block_id < b.block_id ? 1 : -1)) };
+  }
+
+  // ---- the exercise library and detail (C.3.13, C.3.14) ----
+
+  async function listExercises(f) {
+    const rows = [...(await exercisesMap()).values()];
+    const logged = f && f.logged ? new Set(await loggedExerciseIds()) : null;
+    return filterExercises(rows, f || {}, logged);
+  }
+
+  async function exerciseDetail(id) {
+    checkId(id);
+    const ex = await db.get('exercises', id);
+    if (!ex) return null;
+    return { exercise: ex, history: await exerciseHistory(id) };
+  }
+
+  // ---- body weight (C.3.15) ----
+
+  // A day of the current block that is open or planned; null clears it. 20 to 1000, one decimal
+  // (R4-21). Through the day queue, the row read inside it.
+  function setBodyWeight(dId, value) {
+    checkId(dId);
+    let v = value;
+    if (v !== null) {
+      if (typeof v !== 'number' || !Number.isFinite(v)) return Promise.reject(new Refused('bad number'));
+      v = Math.round(v * 10) / 10;
+      if (v < LIMITS.BODY_WEIGHT_MIN || v > LIMITS.BODY_WEIGHT_MAX) return Promise.reject(new Refused('bad number'));
+    }
+    return queued(dayKey(dId), async () => {
+      const day = await db.get('days', dId);
+      if (!day || (day.status !== 'open' && day.status !== 'planned')) throw new Refused('day is not open');
+      return batch([{ store: 'days', put: { ...day, body_weight: v } }]);
+    });
+  }
+
+  // ---- the what-changed note (C.3.16; tipsSeen and markTipSeen sit with the guided board intro) ----
+
+  // On boot: a first install writes the version silently and shows no note (M70); a version that
+  // differs gives the note's version; the same version gives null.
+  async function changedDue() {
+    const seen = await db.setting('seen_version', null);
+    if (seen === null) { await queued('setting:seen_version', () => db.setSetting('seen_version', APP_VERSION)); return null; }
+    return seen === APP_VERSION ? null : APP_VERSION;
+  }
+  function markChangedSeen() { return queued('setting:seen_version', () => db.setSetting('seen_version', APP_VERSION)); }
+
   return {
+    listTemplates, getTemplate, templatePreview, templateToDraft, saveBlockAsTemplate, saveBoardAsTemplate, deleteTemplate,
+    builderInfo, guidedLayout, guidedSave, poolFor, autofill, recommend, muscleSlotCount, dayWarning, startSetsFor,
+    blockLevels, setPriorities, copyRounds, copyPreview, copyBlock, tipsSeen, markTipSeen,
+    listBlocks, setCurrentBlock, renameBlock, setBlockNote, deleteBlock, blockInfo,
+    getSavedEquipment, setSavedEquipment, flagQuestions,
     LIMITS, seed, getSetting, setSetting, activeBlock, openDay, isDayOpen, currentDay, dayView, createBlock,
     tick, untick, saveDraft, skipSet, unskip, skipExercise, stopExercise, addSet, swapExercise, saveFeedback,
     saveExerciseText, addCustomExercise, finishDay, lastTime, sinceLastSet, isStale, backupObject, backupDue,
@@ -2078,6 +2931,9 @@ export function createStore(opts) {
     defaultBlockName: async () => defaultBlockName(await db.all('blocks')), relabelDay, addSetBelow, deleteSet, moveSlot, resetDay, skipDay, saveChecks, dayTotals,
     answerSleep, setSetType, saveSoreness, liveEdit, resize, switchProfile, switchBack, changeAnswers, endBlock,
     switchAllowed, switchBackAllowed, feedbackPlan, slotWhy, retarget, addExerciseDefault, blockOverview, dayPreview,
+    // Slice 3, track S3 (17 C.3.9 to C.3.16)
+    blockFinishedView, blockSummary, roundGrid, resizeBlock: resizeRounds, historyDays, historyExercises, exerciseHistory,
+    loggedExerciseIds, listExercises, exerciseDetail, setBodyWeight, changedDue, markChangedSeen,
     rulesOk: () => RULES_OK_HERE,
     effectiveExercise: async (block, exerciseId) => effectiveExercise(block, await db.get('exercises', exerciseId)),
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },

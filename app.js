@@ -11,6 +11,11 @@ import { renderSettings, applyTheme, loadBlockFlow } from './ui/settings.js';
 import { renderToday, renderDayDone } from './ui/today.js';
 import { renderBuilder, renderPicker, hasDraft } from './ui/builder.js';
 import { renderBlock, renderDayView } from './ui/block.js';
+import { renderBlocks, renderChooser, renderCopy } from './ui/blocks.js';
+import { renderTemplates, renderTemplate } from './ui/templates.js';
+import { renderGuided, renderLevels, hasGuidedDraft } from './ui/guided.js';
+import { renderHistory, renderSummary, renderFinished } from './ui/history.js';
+import { renderLibrary, renderExerciseDetail } from './ui/library.js';
 
 const root = document.getElementById('app');
 const store = createStore({ db });
@@ -215,7 +220,9 @@ let held = false;             // an update found while he was busy, waiting for 
 // The builder route term still holds an update while he is on the builder.
 function isBusy() {
   const r = currentRoute();
+  // Slice 3 (17 C.0.1): the guided builder draft and the copy flow count too.
   return hasDraft(ctx.build) || !!ctx.picker || r === '#/builder' || r === '#/picker' ||
+    hasGuidedDraft(ctx.guided) || r === '#/guided' || !!ctx.copy || r.startsWith('#/copy/') ||
     sheetsOpen() > 0 || backup.sharing || store.busy();
 }
 
@@ -336,14 +343,37 @@ function emptyState(titleKey, lineKey) {
 const STANDALONE_ROUTES = {
   '#/today': () => renderToday(ctx),
   '#/block': () => renderBlock(ctx),
-  '#/history': () => emptyState('empty.next.title', 'empty.next.line'),
+  '#/history': () => renderHistory(ctx),
   '#/settings': () => renderSettings(ctx),
   '#/check': () => renderCheck(ctx),
   '#/builder': () => renderBuilder(ctx),
-  '#/picker': () => renderPicker(ctx)
+  '#/picker': () => renderPicker(ctx),
+  // Slice 3 (17 C.0.1 routes)
+  '#/blocks': () => renderBlocks(ctx),
+  '#/new': () => renderChooser(ctx),
+  '#/templates': () => renderTemplates(ctx),
+  '#/guided': () => renderGuided(ctx),
+  '#/exercises': () => renderLibrary(ctx)
 };
-const NO_BAR = new Set(['#/builder', '#/picker']);
+const NO_BAR = new Set(['#/builder', '#/picker', '#/new', '#/guided']);
+// Pushed Slice 3 screens with an id in the address and no bottom bar (17 C.0.1): the id is checked
+// by its pattern before any read; a bad id goes to the parent list screen.
+const TEMPLATE_RE = /^(t_[a-z0-9_]{1,60}|m[A-Za-z0-9-]{1,60})$/;
+const PUSHED = [
+  ['#/template/', TEMPLATE_RE, (id) => renderTemplate(ctx, id), '#/templates'],
+  ['#/copy/', /^[A-Za-z0-9:_-]{1,120}$/, (id) => renderCopy(ctx, id), '#/blocks'],
+  ['#/levels/', /^[A-Za-z0-9:_-]{1,120}$/, (id) => renderLevels(ctx, id), '#/blocks']
+];
+// The overview of one block from the block list (17 C.3.2, r4 review R27): the id is checked by
+// the 5.5 pattern before any read; a bad or unknown id goes to the block list.
+const BLOCKVIEW = '#/block/';
+const ID_RE = /^[A-Za-z0-9:_-]{1,120}$/;
 const DAYDONE = '#/daydone/';
+// Slice 3, track S3 (17 C.0.1 routes): every id from the hash is checked by ID_RE before any read;
+// a bad id goes to the parent list screen. #/finished/<id> has no bottom bar.
+const FINISHED = '#/finished/';
+const SUMMARY = '#/summary/';
+const EXERCISE = '#/exercise/';
 // The read-only day view (16 B.5 row 2): the store checks the id; a bad one goes to the Block tab.
 const DAYVIEW = '#/day/';
 
@@ -370,13 +400,39 @@ function render() {
   // The Day done screen (15 Part 14): a pushed full screen with no bottom bar. The day id from
   // the address is checked by the store and must name the day this session just finished.
   if (route.startsWith(DAYDONE)) { root.appendChild(renderDayDone(ctx, route.slice(DAYDONE.length))); return; }
+  for (const [pre, re, make2, parent] of PUSHED) {
+    if (!route.startsWith(pre)) continue;
+    const id = route.slice(pre.length);
+    if (!re.test(id)) { go(parent); return; }
+    root.appendChild(make2(id)); setTimeout(releaseHeld, 0); return;
+  }
+  if (route.startsWith(BLOCKVIEW)) {
+    const id = route.slice(BLOCKVIEW.length);
+    if (!ID_RE.test(id)) { go('#/blocks'); return; }
+    root.appendChild(renderBlock(ctx, id)); root.appendChild(tabbar('#/block')); return;
+  }
+  if (route.startsWith(FINISHED)) {
+    const id = route.slice(FINISHED.length);
+    if (!ID_RE.test(id)) { go('#/today'); return; }
+    root.appendChild(renderFinished(ctx, id)); return;
+  }
+  if (route.startsWith(SUMMARY)) {
+    const [id, ex] = route.slice(SUMMARY.length).split('/');
+    if (!ID_RE.test(id) || (ex !== undefined && !ID_RE.test(ex))) { go('#/blocks'); return; }
+    root.appendChild(renderSummary(ctx, id, ex)); root.appendChild(tabbar('#/block')); return;
+  }
+  if (route.startsWith(EXERCISE)) {
+    const id = route.slice(EXERCISE.length);
+    if (!ID_RE.test(id)) { go('#/exercises'); return; }
+    root.appendChild(renderExerciseDetail(ctx, id)); root.appendChild(tabbar('#/block')); return;
+  }
   if (route.startsWith(DAYVIEW)) { root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length))); root.appendChild(tabbar('#/block')); return; }
   const make = STANDALONE_ROUTES[route];
   if (!make) { go('#/today'); return; }
   root.appendChild(make());
   setTimeout(releaseHeld, 0);
   if (NO_BAR.has(route)) return;
-  const tabRoute = route === '#/check' ? '#/settings' : route;
+  const tabRoute = route === '#/check' ? '#/settings' : (route === '#/blocks' || route === '#/templates' || route === '#/exercises') ? '#/block' : route;
   root.appendChild(tabbar(tabRoute));
 }
 
@@ -425,6 +481,9 @@ async function boot() {
   // The look is set before the first render.
   try { applyTheme(await db.setting('theme', 'phone')); } catch (e) { /* the phone's own setting is used */ }
   try { await store.seed(); } catch (e) { /* seeding again next boot */ }
+  // The what-changed note (17 C.3.16): a first install writes the version silently; after an
+  // update Today shows the note once.
+  try { ctx.changedNote = await store.changedDue(); } catch (e) { ctx.changedNote = null; }
   await refreshDayOpen();
   knowDay();
   if (ctx.dayOpen) wake.request();

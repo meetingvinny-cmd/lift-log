@@ -2,11 +2,11 @@
 // the sets this round by muscle and Close block; the read-only day view at #/day/<id> (B.5 row 2,
 // LOOK 4.11); and the Easy round stop sheet (B.5 row 4). Every word comes from strings.js; his own
 // words (block name, day labels, exercise names) reach the page as text only.
-import { el, clear, glyph, sheet, toast, ghostTally } from './dom.js';
+import { el, clear, glyph, sheet, toast, ghostTally, typedConfirm, untyped } from './dom.js';
 import { t } from './strings.js';
 import { MUSCLE_NAMES, MUSCLE_DETAIL_NAMES, EQUIPMENT_NAMES } from '../data/exercises.js';
 import { effectiveExercise } from '../store.js';
-import { tallyGroups, helperLine, dayTitle, tildeGlyph } from './today.js';
+import { helperLine, dayTitle, ringGlyph, tildeGlyph } from './today.js';
 
 const DAY_OPEN = 'day open';    // the store's refusal code for Close block with a day open (B.5 row 7)
 const fmtNum = (n) => (n === null || n === undefined) ? '' : String(Math.round(n * 100) / 100);
@@ -52,83 +52,168 @@ export function muscleName(key) {
 
 // ---------------- the Block tab ----------------
 
-export function renderBlock(ctx) {
+// blockId (17 C.3.2, r4 review R27): the overview of that block from the block list, at
+// #/block/<id>. None: the current block. A bad or unknown id goes to the block list.
+export function renderBlock(ctx, blockId) {
   const screen = el('section', { class: 'screen', id: 'block' });
-  draw(ctx, screen, null).catch((e) => { screen.appendChild(el('p', { class: 'raw' }, String(e && e.message))); });
+  draw(ctx, screen, null, blockId || null).catch((e) => { screen.appendChild(el('p', { class: 'raw' }, String(e && e.message))); });
   return screen;
 }
 
 // A tap on a round cell draws again with that round's day rows; only the newest draw is put in.
 const drawSeq = new WeakMap();
-async function draw(ctx, screen, shown) {
+async function draw(ctx, screen, shown, blockId) {
   const seq = (drawSeq.get(screen) || 0) + 1;
   drawSeq.set(screen, seq);
   const store = ctx.store;
-  const block = await store.activeBlock();
+  let block = null, current = true;
+  if (blockId) {
+    let info = null;
+    try { info = await store.blockInfo(blockId); } catch (e) { info = null; }
+    if (!info) { ctx.go('#/blocks'); return; }
+    block = info.block;
+    current = info.current;
+  } else {
+    block = await store.activeBlock();
+  }
   const ov = block ? await store.blockOverview(block.id, shown) : null;
+  const grid = block ? await store.roundGrid(block.id) : null;
   if (drawSeq.get(screen) !== seq) return;
   clear(screen);
+  const allRow = el('div', { class: 'card', id: 'block-links' },
+    el('a', { class: 'row row-link menu-row', href: '#/blocks', id: 'blocks-all' }, el('span', { class: 'grow' }, t('blocks.all')), glyph('chevron')),
+    el('a', { class: 'row row-link menu-row', href: '#/exercises', id: 'lib-row' }, el('span', { class: 'grow' }, t('lib.row')), glyph('chevron')));
   if (!ov) {
     screen.appendChild(el('h1', {}, t('block.title')));
     screen.appendChild(el('div', { class: 'empty', id: 'block-none' }, ghostTally(4), el('h2', {}, t('empty.today.title')), el('p', { class: 'lead' }, t('empty.today.line'))));
+    screen.appendChild(allRow);
     return;
   }
+  // Muscle levels (17 C.3.7, LOOK 4.7 r4.1): the first row of the grouped card, on the current
+  // block only while it is not done.
+  if (current && ov.status !== 'done') {
+    allRow.prepend(el('a', { class: 'row row-link menu-row', href: '#/levels/' + ov.id, id: 'levels-row' }, el('span', { class: 'grow' }, t('levels.row')), glyph('chevron')));
+  }
+  // A block that is not current (R27): no End block, every day opens read only; a done block is
+  // read only; an active one offers Use this block.
+  ov.current = current;
+  screen.setAttribute('data-current', String(current));
   const profile = t(ov.profile === 'adaptive' ? 'profile.adjust' : 'profile.fixed');
   screen.setAttribute('data-block', ov.id);
   screen.append(
     el('h1', {}, t('block.title')),
-    el('p', { class: 'lead', id: 'block-head' }, ov.passes === null ? t('block.head.open', { name: ov.name, profile }) : t('block.head', { name: ov.name, rounds: ov.passes, profile })),
-    el('div', { class: 'round-strip', id: 'round-strip' }, ov.rounds.map(r => roundCell(ctx, screen, ov, r))),
-    el('p', { class: 'label', id: 'round-label' }, t('round.label', { r: ov.shown })),
-    el('div', { class: 'card', id: 'block-days' }, ov.days.map(d => dayRow(ctx, ov, d))));
-  if (ov.muscles.length) {
-    screen.append(el('p', { class: 'label' }, t('block.musclesets')),
-      el('div', { class: 'muscle-table', id: 'muscle-table' }, ov.muscles.map(m => {
-        const diff = diffText(m.change);
-        return el('div', { class: 'muscle-row', 'data-muscle': m.muscle },
-          el('span', { class: 'muscle-name' }, muscleName(m.muscle)),
-          el('span', { class: 'num muscle-sets' }, String(m.sets)),
-          el('span', { class: 'small muscle-diff' }, diff === null ? '' : t('block.musclediff', { diff })));
-      })));
+    el('p', { class: 'lead', id: 'block-head' }, ov.passes === null ? t('block.head.open', { name: ov.name, profile }) : t('block.head', { name: ov.name, rounds: ov.passes, profile })));
+  if (!current && ov.status === 'active') {
+    screen.appendChild(el('button', { class: 'btn btn-secondary', type: 'button', id: 'block-use', on: { click: () => useFlow(ctx, ov) } }, t('blocks.use')));
   }
+  screen.append(roundGrid(ctx, screen, ov, grid), gridStepper(ctx, screen, ov, grid));
   // Close block (B.5 row 7, LOOK 4.7): a secondary button, never the danger skin; current block only.
-  if (ov.status !== 'done') {
+  screen.appendChild(allRow);
+  if (ov.status !== 'done' && current) {
     screen.appendChild(el('button', { class: 'btn btn-secondary', type: 'button', id: 'block-end', on: { click: () => endFlow(ctx, ov) } }, t('daymenu.end')));
   }
 }
 
-// One round cell (LOOK 4.7): the round over its state word; the current round has the accent
-// border; a done round shows the check, the easy round the drawn "~". A tap shows its day rows.
-function roundCell(ctx, screen, ov, r) {
-  const word = roundWord(r);
-  return el('button', {
-    class: 'round-cell is-' + r.state + (r.easy ? ' is-easy' : ''), type: 'button', 'data-round': String(r.pass), 'data-state': r.state,
-    'data-easy': String(!!r.easy), 'aria-pressed': String(r.pass === ov.shown), on: { click: () => { draw(ctx, screen, r.pass).catch(() => {}); } }
-  }, el('span', { class: 'num round-num' }, t('round.short', { r: r.pass })),
-  el('span', { class: 'round-word' }, r.state === 'done' ? glyph('check') : r.easy ? tildeGlyph() : null, word ? t(word) : ''));
+// Use this block (C.3.2): a plain confirm only while a day of the current block is open.
+async function useFlow(ctx, ov) {
+  const go = async () => {
+    try { await ctx.store.setCurrentBlock(ov.id); } catch (e) { toast(t('today.notsaved')); return; }
+    ctx.go('#/today');
+  };
+  if (!(await ctx.store.isDayOpen().catch(() => false))) return go();
+  const yes = el('button', { class: 'btn btn-secondary', type: 'button', id: 'use-yes' }, t('blocks.use'));
+  const no = el('button', { class: 'btn btn-quiet', type: 'button', id: 'use-cancel' }, t('text.cancel'));
+  const sh = sheet({ id: 'use-sheet', title: t('blocks.use.ask') }, yes, el('div', { class: 'quiet-row' }, no));
+  yes.addEventListener('click', () => { sh.close(); go(); });
+  no.addEventListener('click', () => sh.close());
+  return undefined;
 }
 
-// One day row (LOOK 4.7): the day's name, its tally, its word at the right, and the chevron.
-function dayRow(ctx, ov, d) {
-  const w = dayWord(d);
-  let right = null;
-  if (w && (w[1] === 'notplanned')) right = el('span', { class: 'pill pill-info' }, t(w[0]));
-  else if (w && w[1] === 'skipped') right = el('span', { class: 'pill pill-skip' }, t(w[0]));
-  else if (w) right = el('span', { class: 'block-day-word is-' + w[1] }, t(w[0]));
-  let tally = null;
-  if (d.total > 0) {
-    tally = el('span', { class: 'tally tally-grouped block-day-tally', role: 'img', 'aria-label': d.total === 1 ? t('tally.aria.one', { done: d.done }) : t('tally.aria', { done: d.done, total: d.total }) });
-    for (const g of tallyGroups(Array.from({ length: d.total }, (_, i) => i < d.done))) {
-      tally.appendChild(el('span', { class: 'tally-group', 'aria-hidden': 'true' }, g.map(m => el('span', { class: (m.slash ? 'tally-slash' : 'tally-stroke') + (m.done ? ' is-done' : ''), 'aria-hidden': 'true' }))));
-    }
+// The round grid (17 C.3.11, LOOK 4.12; replaces the 4.7 round strip): one column per round with
+// its reps-left goal (none on an open-ended block or on Fixed), one row per day label, a 56 x 56
+// cell per day with its state glyph and grid.cell aria. The current round header carries the
+// accent border. Any cell opens through openDay (Today for the current day of the current block,
+// the stop sheet on an easy day with hard days left, else the read-only day view).
+const STATE_WORD = { done: 0, skipped: 1, now: 2, planned: 3, notplanned: 4 };
+export function cellState(c) { return t('grid.states')[STATE_WORD[c.state]]; }
+
+function roundGrid(ctx, screen, ov, g) {
+  const box = el('div', { class: 'round-grid', id: 'round-grid', role: 'group', 'aria-label': t('grid.rounds') });
+  const head = el('div', { class: 'grid-row grid-headrow' }, el('span', { class: 'grid-head' }));
+  for (const r of ov.rounds) {
+    const goal = (g.rounds.find(x => x.pass === r.pass) || {}).goal;
+    head.appendChild(el('span', { class: 'grid-col is-' + r.state + (r.easy ? ' is-easy' : ''), 'data-round': String(r.pass), 'data-state': r.state, 'data-easy': String(!!r.easy) },
+      el('span', { class: 'num grid-r' }, t('round.short', { r: r.pass })),
+      goal === null || goal === undefined ? null : el('span', { class: 'small grid-goal' }, t('grid.goal', { n: goal }))));
   }
-  return el('button', { class: 'row row-link menu-row block-day', type: 'button', 'data-blockday': d.ref, 'data-status': d.status, 'data-now': String(!!d.now), on: { click: () => openDay(ctx, ov, d) } },
-    el('span', { class: 'grow block-day-name' }, dayTitle(d)), tally, right, glyph('chevron'));
+  box.appendChild(head);
+  for (const row of g.rows) {
+    const line = el('div', { class: 'grid-row', 'data-gridday': String(row.day) }, el('span', { class: 'grid-head' }, dayTitle({ label: row.label, day: row.day })));
+    for (const c of row.cells) {
+      const d = { ref: c.ref, pass: c.pass, day: c.day, now: c.now, status: c.state === 'now' ? (ov.days.find(x => x.ref === c.ref) || {}).status || 'planned' : c.state };
+      // A button never acts as a table cell in the browser (it stacked every cell under R1), so each
+      // button sits inside its own cell span.
+      line.appendChild(el('span', { class: 'grid-td' }, el('button', {
+        class: 'grid-cell is-' + c.state, type: 'button', 'data-blockday': c.ref, 'data-status': d.status, 'data-now': String(!!c.now), 'data-cell': c.state,
+        'aria-label': t('grid.cell', { r: c.pass, label: row.label || String(row.day), state: cellState(c) }), on: { click: () => openDay(ctx, ov, d) }
+      }, c.state === 'done' ? glyph('check') : c.state === 'skipped' ? glyph('skip') : c.state === 'now' ? ringGlyph() : null)));
+    }
+    box.appendChild(line);
+  }
+  return el('div', { class: 'grid-scroll' }, box);
+}
+
+// The round count under the grid (C.3.11, r4.6 Q2): minus and plus on a block with a length
+// (Fixed too), each disabled with its reason line when the store refuses; an open-ended block
+// shows grid.open; a done block shows nothing.
+function gridStepper(ctx, screen, ov, g) {
+  if (g.open) return el('p', { class: 'small', id: 'grid-open' }, t('grid.open'));
+  if (!g.plus || !g.minus || !ov.current) return el('div', { id: 'grid-none', hidden: true });
+  const less = el('button', { class: 'btn btn-icon stepper', type: 'button', id: 'grid-less', 'aria-label': t('grid.less') }, glyph('minus'));
+  const more = el('button', { class: 'btn btn-icon stepper', type: 'button', id: 'grid-more', 'aria-label': t('grid.more') }, glyph('plus'));
+  less.disabled = !g.minus.ok;
+  more.disabled = !g.plus.ok;
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    let r = null;
+    try { r = await ctx.store.resizeBlock(ov.id, 1); } catch (e) { toast(t('today.notsaved')); draw(ctx, screen, null, screen.getAttribute('data-current') === 'false' ? ov.id : null).catch(() => {}); return; }
+    toast(t('grid.added', { n: r.block.passes }));
+    draw(ctx, screen, null, ov.current ? null : ov.id).catch(() => {});
+  });
+  less.addEventListener('click', () => removeSheet(ctx, screen, ov, g));
+  const reasons = [];
+  if (!g.minus.ok) reasons.push(el('p', { class: 'small grid-reason', id: 'grid-less-why' }, t(g.minus.reason.key, g.minus.reason.vals)));
+  if (!g.plus.ok) reasons.push(el('p', { class: 'small grid-reason', id: 'grid-more-why' }, t(g.plus.reason.key, g.plus.reason.vals)));
+  return el('div', { class: 'grid-count', id: 'grid-count' },
+    el('div', { class: 'grid-stepper' }, el('span', { class: 'grow' }, t('grid.rounds')), less, el('span', { class: 'num', id: 'grid-n' }, String(ov.passes)), more),
+    ...reasons);
+}
+
+// Minus (LOOK 4.12): the typed REMOVE sheet with the Danger button; end.line under the line when
+// the minus finishes the block (r4.6 Q1), then the Block finished screen with the nudge once.
+function removeSheet(ctx, screen, ov, g) {
+  const go = el('button', { class: 'btn btn-danger', type: 'button', id: 'grid-remove-go' }, glyph('warn'), t('grid.remove.go'));
+  const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'grid-remove-cancel' }, t('text.cancel'));
+  const conf = typedConfirm(t('grid.remove.type'), 'REMOVE', go);
+  const sh = sheet({ id: 'grid-remove', title: t('grid.remove.title', { r: ov.passes }), canDismiss: () => untyped(conf) },
+    el('p', { class: 'small' }, t('grid.remove.line')), g.minus.finishes ? el('p', { class: 'small', id: 'grid-remove-end' }, t('end.line')) : null,
+    conf, go, el('div', { class: 'quiet-row' }, cancel));
+  cancel.addEventListener('click', () => sh.close());
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    const typed = conf.querySelector('input') ? conf.querySelector('input').value.trim() : '';
+    let r = null;
+    try { r = await ctx.store.resizeBlock(ov.id, -1, typed); } catch (e) { go.disabled = false; toast(t('today.notsaved')); return; }
+    sh.close();
+    if (r.finished) { ctx.finished = { id: ov.id, nudge: true }; ctx.go('#/finished/' + ov.id); return; }
+    draw(ctx, screen, null, ov.current ? null : ov.id).catch(() => {});
+  });
 }
 
 // A day row tap: an easy-round day while hard days are left opens the stop sheet (B.5 row 4, M40);
 // the current day goes to Today; any other day opens the read-only view.
 function openDay(ctx, ov, d) {
+  if (ov.current === false) { ctx.go('#/day/' + d.ref); return; }
   const n = easyStop(ov, d);
   if (n > 0) { easySheet(ctx, n); return; }
   if (d.now) { ctx.go('#/today'); return; }
@@ -184,7 +269,12 @@ async function drawDay(ctx, screen, dayId) {
   let p = null;
   try { p = await ctx.store.dayPreview(dayId); } catch (e) { p = null; }
   if (!p) { ctx.go('#/block'); return; }
-  if (p.state === 'open' || p.state === 'current') { ctx.go('#/today'); return; }
+  // The current day goes to Today only on the current block; on any other block every day opens
+  // here read only (17 C.3.2, r4 review R27).
+  if (p.state === 'open' || p.state === 'current') {
+    const active = await ctx.store.activeBlock().catch(() => null);
+    if (active && active.id === p.block.id) { ctx.go('#/today'); return; }
+  }
   const day = p.day, b = p.block;
   const roundPill = el('span', { class: 'pill pill-info', id: 'round-pill' }, b.passes === null ? t('today.round', { r: day.pass }) : t('today.round.of', { r: day.pass, n: b.passes }));
   let second = null;

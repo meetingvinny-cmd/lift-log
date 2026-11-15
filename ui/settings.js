@@ -3,7 +3,8 @@
 // with textContent only.
 import { el, clear, glyph, sheet, toast, typedConfirm, untyped } from './dom.js';
 import { t, tn } from './strings.js';
-import { LIMITS, backupBig, backupMB } from '../backup.js';
+import { LIMITS, backupBig, backupMB, EQUIPMENT_DETAILS } from '../backup.js';
+import { EQUIPMENT_DETAIL_NAMES } from '../data/exercises.js';
 
 const DAY_MS = 24 * 3600 * 1000;
 const fmtDate = (ms) => new Date(ms).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
@@ -73,6 +74,7 @@ export function renderSettings(ctx) {
     el('div', { class: 'group', id: 'block-group' },
       el('p', { class: 'label' }, t('settings.group.block')),
       blockCard),
+    equipmentGroup(ctx),
     el('div', { class: 'group', id: 'units-group' },
       el('p', { class: 'label' }, t('settings.units')),
       el('div', { class: 'card' }, el('div', { class: 'row check-row' }, unitsSeg(ctx), el('span', { class: 'what-to-do' }, t('settings.units.line'))))),
@@ -396,4 +398,31 @@ export function loadBlockFlow(ctx) {
       return undefined;
     });
   });
+}
+
+// Saved equipment (17 C.3.1, LOOK 4.9): the 10 finer kinds as multi-select chips. The key absent
+// reads as every kind. The last picked chip stays picked and shows the equip.min toast; an empty
+// list is never stored.
+export function equipmentGroup(ctx) {
+  const box = el('div', { class: 'chips-row chips-wrap', id: 'equip-chips' });
+  let picked = [];
+  const paint = () => {
+    for (const b of box.children) {
+      const on = picked.includes(b.getAttribute('data-equip'));
+      b.classList.toggle('is-on', on);
+      b.setAttribute('aria-pressed', String(on));
+    }
+  };
+  for (const k of EQUIPMENT_DETAILS) {
+    box.appendChild(el('button', { class: 'chip', type: 'button', 'data-equip': k, 'aria-pressed': 'false', on: { click: async () => {
+      if (picked.includes(k) && picked.length === 1) { toast(t('equip.min')); return; }
+      const next = picked.includes(k) ? picked.filter(x => x !== k) : [...picked, k];
+      try { picked = await ctx.store.setSavedEquipment(next); } catch (e) { toast(t('today.notsaved')); }
+      paint();
+    } } }, glyph('check'), EQUIPMENT_DETAIL_NAMES[k]));
+  }
+  ctx.store.getSavedEquipment().then((v) => { picked = v; paint(); }).catch(() => {});
+  return el('div', { class: 'group', id: 'equip-group' },
+    el('p', { class: 'label' }, t('settings.group.equipment')),
+    el('div', { class: 'card' }, el('div', { class: 'row check-row' }, box), el('p', { class: 'small what-to-do' }, t('equip.line'))));
 }

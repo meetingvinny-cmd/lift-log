@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { RULES } from '../../../rules.js';
 import {
   planDay, applyLiveEdit, feedbackDue, currentPosition, resizeBlock, buildBlock, autoBuildDays,
+  fillSlots, sizeWarning, copyStartValues, validateRules,
   nextWeekSets, startingSets, stepFor, easyWeekPlan, effortTarget
 } from '../../../engine.js';
 import { createStore } from '../../../store.js';
@@ -396,23 +397,11 @@ test('resizeBlock, Fixed: refused below the current round, no effort change', ()
 test('buildBlock: always Fixed, frozen on the rules version', () => {
   const b = buildBlock(RULES, { id: 'b1', created_at: 5, name: 'N', profile: 'adaptive', day_templates: [], levels: { mk_a: 'top' } });
   assert.equal(b.profile, 'fixed');
-  assert.deepEqual(b.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.deepEqual(b.rules_frozen, { profile: 'fixed', rules_version: RULES.rules_version });
+  assert.equal(RULES.rules_version, 'signed-2', 'a new block freezes signed-2 (r4.4 R17)');
   assert.equal(b.profile_switch, null);
   assert.deepEqual(b.levels, { mk_a: 'top' });
   assert.deepEqual(b.switch_conditions, []);
-});
-
-test('autoBuildDays (first version): top muscles twice, the rest once, days even', () => {
-  const r = autoBuildDays(A, { mk_a: 'top', mk_b: 'top', mk_c: 'middle', mk_d: 'bottom', bogus: 'other' }, 3);
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.days.map(d => d.label), ['A', 'B', 'C']);
-  const times = (m) => r.days.filter(d => d.slots.some(s => s.muscle === m)).length;
-  assert.deepEqual([times('mk_a'), times('mk_b'), times('mk_c'), times('mk_d'), times('bogus')], [2, 2, 1, 1, 0]);
-  const sizes = r.days.map(d => d.slots.length);
-  assert.ok(Math.max(...sizes) - Math.min(...sizes) <= 1);
-  assert.equal(autoBuildDays(A, {}, 1).ok, false);
-  assert.equal(autoBuildDays(A, {}, 7).ok, false);
-  assert.deepEqual(autoBuildDays(A, { mk_a: 'top' }, 2), autoBuildDays(A, { mk_a: 'top' }, 2), 'same in, same out');
 });
 
 // ---------------- applyLiveEdit ----------------
@@ -691,4 +680,203 @@ test('assist row through planDay: same assist, plus 1 rep; the easy round keeps 
   }
   const e = planDay(A, b, h, { pass: 4, day: 1 });
   assert.ok(e.sets.filter(s => s.kind === 'work').every(s => s.target.load === 60), 'the easy round keeps the assist');
+});
+
+
+// ---------------- the guided builder (17 C.3.5, C.3.6) ----------------
+
+const DETAILS = ['chest', 'back', 'traps_neck', 'shoulders', 'biceps', 'triceps', 'forearms_grip', 'abs_core', 'quads', 'hamstrings', 'glutes', 'calves'];
+const CHIP_OF = { chest: 'chest', back: 'back', traps_neck: 'back', shoulders: 'shoulders', biceps: 'arms', triceps: 'arms', forearms_grip: 'arms', abs_core: 'core', quads: 'legs', hamstrings: 'legs', glutes: 'legs', calves: 'legs' };
+const KINDS = ['machine', 'smith', 'cable', 'barbell', 'landmine', 'dumbbell', 'kettlebell', 'band', 'body', 'other'];
+// A seeded made-up generator (no Math.random): the same 200 pools every run.
+function lcg(seed) { let x = seed >>> 0; return () => { x = (Math.imul(x, 1664525) + 1013904223) >>> 0; return x / 4294967296; }; }
+function madePool(rnd, size) {
+  const pick = (list) => list[Math.floor(rnd() * list.length)];
+  return Array.from({ length: size }, (_, i) => {
+    const md = pick(DETAILS);
+    return { id: 'pe_' + i, name: 'Made-up ' + String(1000 + Math.floor(rnd() * 9000)), muscle_detail: md, muscle: CHIP_OF[md], equipment_detail: pick(KINDS),
+      screened: rnd() < 0.7, left_out_of_builder: rnd() < 0.25, done_count: Math.floor(rnd() * 5) };
+  });
+}
+function madeBoard(rnd) {
+  const n = 2 + Math.floor(rnd() * 5);
+  return Array.from({ length: n }, (_, i) => ({ day: i + 1, label: String.fromCharCode(65 + i),
+    lifts: Array.from({ length: 1 + Math.floor(rnd() * 6) }, (_, k) => ({ slot: k + 1, muscle_detail: DETAILS[Math.floor(rnd() * DETAILS.length)], level: 'middle', exercise_id: null })) }));
+}
+const eachPick = (days, fn) => { for (const d of days) for (const l of d.lifts) if (l.exercise_id) fn(l, d); };
+
+test('fillSlots property sweep, 200 made-up pools: never a lift left out of the builder (M44), never an unscreened one (M45), never outside the picked kinds (M47)', () => {
+  const rnd = lcg(20261114);
+  let picks = 0;
+  for (let i = 0; i < 200; i++) {
+    const pool = madePool(rnd, 5 + Math.floor(rnd() * 60));
+    const kinds = KINDS.filter(() => rnd() < 0.6);
+    const byId = new Map(pool.map(p => [p.id, p]));
+    for (const emptyOnly of [true, false]) {
+      const r = fillSlots(F, madeBoard(rnd), pool, { emptyOnly, equipment: kinds });
+      assert.equal(r.ok, true);
+      eachPick(r.days, (l, d) => {
+        const ex = byId.get(l.exercise_id);
+        picks++;
+        assert.equal(ex.left_out_of_builder, false, 'M44: pool ' + i + ' placed a lift left out of the builder');
+        assert.equal(ex.screened, true, 'M45: pool ' + i + ' placed an unscreened lift');
+        assert.ok(kinds.includes(ex.equipment_detail), 'M47: pool ' + i + ' placed a kind not picked');
+        assert.equal(ex.muscle_detail, l.muscle_detail, 'the slot muscle');
+        assert.equal(d.lifts.filter(x => x.exercise_id === l.exercise_id).length, 1, 'never the same exercise twice in a day');
+      });
+    }
+  }
+  assert.ok(picks > 500, picks + ' picks checked');
+});
+
+test('fillSlots with Fill empty slots only leaves every picked slot as it was (M46, B08)', () => {
+  const rnd = lcg(7);
+  for (let i = 0; i < 50; i++) {
+    const pool = madePool(rnd, 40);
+    const board = madeBoard(rnd);
+    for (const d of board) for (const l of d.lifts) if (rnd() < 0.4) { l.exercise_id = 'his_pick_' + d.day + '_' + l.slot; l.hand = true; }
+    const before = JSON.stringify(board);
+    const r = fillSlots(F, board, pool, { emptyOnly: true, equipment: KINDS });
+    assert.equal(JSON.stringify(board), before, 'the input is never changed');
+    for (const d of board) for (const l of d.lifts) {
+      const got = r.days.find(x => x.day === d.day).lifts.find(x => x.slot === l.slot);
+      if (l.exercise_id) assert.equal(got.exercise_id, l.exercise_id, 'M46: a picked slot was refilled');
+    }
+  }
+  // emptyOnly false refills every slot but a hand pick on this board
+  const pool = [{ id: 'q1', name: 'Q one', muscle_detail: 'chest', muscle: 'chest', equipment_detail: 'machine', screened: true, left_out_of_builder: false, done_count: 0 }];
+  const board = [{ day: 1, label: 'A', lifts: [{ slot: 1, muscle_detail: 'chest', exercise_id: 'old', hand: false }, { slot: 2, muscle_detail: 'chest', exercise_id: 'mine', hand: true }] }];
+  const all = fillSlots(F, board, pool, { emptyOnly: false, equipment: ['machine'] });
+  assert.deepEqual(all.days[0].lifts.map(l => l.exercise_id), ['q1', 'mine']);
+});
+
+test('fillSlots order: most done sets first, then name, then id (R4-18); a chip slot takes any row of its chip', () => {
+  const row = (id, name, done, md) => ({ id, name, muscle_detail: md || 'quads', muscle: 'legs', equipment_detail: 'machine', screened: true, left_out_of_builder: false, done_count: done });
+  const pool = [row('z1', 'Alpha', 1), row('z2', 'Beta', 4), row('z3', 'Alpha', 4), row('z0', 'Alpha', 4), row('h1', 'Ham', 9, 'hamstrings')];
+  const board = [{ day: 1, label: 'A', lifts: [1, 2, 3, 4].map(slot => ({ slot, muscle_detail: 'quads', exercise_id: null })) }];
+  assert.deepEqual(fillSlots(F, board, pool, { equipment: ['machine'] }).days[0].lifts.map(l => l.exercise_id), ['z0', 'z3', 'z2', 'z1']);
+  const chip = [{ day: 1, label: 'A', lifts: [{ slot: 1, muscle_detail: null, muscle: 'legs', exercise_id: null }] }];
+  assert.equal(fillSlots(F, chip, pool, { equipment: ['machine'] }).days[0].lifts[0].exercise_id, 'h1');
+  assert.deepEqual(fillSlots(F, board, pool, { equipment: ['machine'] }), fillSlots(F, board, pool, { equipment: ['machine'] }), 'same in, same out');
+  const none = fillSlots(F, board, pool, { equipment: ['band'] });
+  assert.equal(none.filled, 0);
+  assert.ok(none.days[0].lifts.every(l => l.exercise_id === null), 'no fit leaves the slot empty');
+});
+
+test('recommend (fillSlots only): that muscle, a picked kind, never a left-out lift; again moves to the next (IW6)', () => {
+  const pool = [
+    { id: 'r1', name: 'Aa', muscle_detail: 'back', muscle: 'back', equipment_detail: 'cable', screened: true, left_out_of_builder: false, done_count: 3 },
+    { id: 'r2', name: 'Bb', muscle_detail: 'back', muscle: 'back', equipment_detail: 'cable', screened: true, left_out_of_builder: true, done_count: 9 },
+    { id: 'r3', name: 'Cc', muscle_detail: 'back', muscle: 'back', equipment_detail: 'band', screened: true, left_out_of_builder: false, done_count: 9 },
+    { id: 'r4', name: 'Dd', muscle_detail: 'back', muscle: 'back', equipment_detail: 'cable', screened: true, left_out_of_builder: false, done_count: 1 },
+    { id: 'r5', name: 'Ee', muscle_detail: 'chest', muscle: 'chest', equipment_detail: 'cable', screened: true, left_out_of_builder: false, done_count: 9 }];
+  const board = [{ day: 1, label: 'A', lifts: [{ slot: 1, muscle_detail: 'back', exercise_id: null }, { slot: 2, muscle_detail: 'back', exercise_id: null }] }];
+  const one = fillSlots(F, board, pool, { only: { day: 1, slot: 2 }, equipment: ['cable'] });
+  assert.deepEqual(one.days[0].lifts.map(l => l.exercise_id), [null, 'r1'], 'IW6: only that slot, never r2 (left out) or r3 (band)');
+  assert.equal(fillSlots(F, board, pool, { only: { day: 1, slot: 2 }, equipment: ['cable'], index: 1 }).days[0].lifts[1].exercise_id, 'r4');
+  assert.equal(fillSlots(F, board, pool, { only: { day: 1, slot: 2 }, equipment: ['cable'], index: 2 }).days[0].lifts[1].exercise_id, 'r1', 'wraps');
+});
+
+test('autoBuildDays: a top muscle gets more slots per rotation than a middle one at every length 2 to 6 (M48, BW4, CW2)', () => {
+  for (const n of [2, 3, 4, 5, 6]) {
+    const r = autoBuildDays(F, { top: ['chest'], middle: ['back'], bottom: ['calves'] }, n, []);
+    assert.equal(r.ok, true);
+    const count = (m) => r.days.reduce((a, d) => a + d.lifts.filter(l => l.muscle_detail === m).length, 0);
+    assert.ok(count('chest') > count('back'), 'M48: at ' + n + ' days top ' + count('chest') + ' vs middle ' + count('back'));
+    assert.ok(count('back') >= count('calves'));
+    assert.deepEqual([count('chest'), count('back'), count('calves')], [F.builder.slots_per_rotation.top[n], F.builder.slots_per_rotation.middle[n], F.builder.slots_per_rotation.bottom[n]]);
+    assert.deepEqual(r.days.map(d => d.label), ['A', 'B', 'C', 'D', 'E', 'F'].slice(0, n));
+  }
+});
+
+test('autoBuildDays: spread on different days, top before middle before bottom, his rank inside a level, same in same out', () => {
+  const lv = { top: ['quads', 'chest'], middle: ['back', 'shoulders'], bottom: ['calves'] };
+  const r = autoBuildDays(F, lv, 3, []);
+  for (const m of ['quads', 'chest', 'back', 'shoulders']) {
+    const on = r.days.filter(d => d.lifts.some(l => l.muscle_detail === m)).length;
+    const total = r.days.reduce((a, d) => a + d.lifts.filter(l => l.muscle_detail === m).length, 0);
+    assert.equal(on, total, m + ' never twice in one day when its slots fit the days');
+  }
+  const rank = { quads: 0, chest: 1, back: 2, shoulders: 3, calves: 4 };
+  for (const d of r.days) {
+    assert.deepEqual(d.lifts.map(l => l.slot), d.lifts.map((_, i) => i + 1));
+    for (let i = 1; i < d.lifts.length; i++) assert.ok(rank[d.lifts[i - 1].muscle_detail] < rank[d.lifts[i].muscle_detail], 'order in day ' + d.label);
+  }
+  assert.deepEqual(autoBuildDays(F, lv, 3, []), autoBuildDays(F, lv, 3, []));
+  // 6 top slots at 6 days vs 4 for a top muscle: a muscle with more slots than days repeats
+  assert.equal(autoBuildDays(F, { top: ['chest'] }, 6, []).days.every(d => d.lifts.length === 1) === false, true, '4 slots on 6 days: 4 days hold it');
+});
+
+test('autoBuildDays: refuses 1 or 7 days and a muscle on two levels (M50 engine half)', () => {
+  assert.equal(autoBuildDays(F, { top: ['chest'] }, 1, []).ok, false);
+  assert.equal(autoBuildDays(F, { top: ['chest'] }, 7, []).ok, false);
+  assert.equal(autoBuildDays(F, { top: ['chest'], middle: ['chest'] }, 3, []).ok, false);
+});
+
+test('autoBuildDays: the hard cap of 8 a day; a slot with no room goes on the dropped list, never a silent drop (R4-16)', () => {
+  const lv = { top: DETAILS.slice(0, 10), middle: [], bottom: [] };    // 10 top muscles x 2 slots on 2 days = 20 slots, room 16
+  const r = autoBuildDays(F, lv, 2, []);
+  assert.ok(r.days.every(d => d.lifts.length <= 8));
+  const placed = r.days.reduce((a, d) => a + d.lifts.length, 0);
+  assert.equal(placed + r.dropped.length, 20);
+  assert.equal(r.dropped.length, 4);
+  assert.deepEqual(r.dropped.map(x => x.muscle_detail), ['quads', 'quads', 'hamstrings', 'hamstrings']);
+});
+
+test('autoBuildDays fills from the pool through the same gate: never a left-out or unscreened lift', () => {
+  const pool = [
+    { id: 'p1', name: 'P1', muscle_detail: 'chest', muscle: 'chest', equipment_detail: 'machine', screened: true, left_out_of_builder: true, done_count: 0 },
+    { id: 'p2', name: 'P2', muscle_detail: 'chest', muscle: 'chest', equipment_detail: 'machine', screened: false, left_out_of_builder: false, done_count: 0 },
+    { id: 'p3', name: 'P3', muscle_detail: 'chest', muscle: 'chest', equipment_detail: 'machine', screened: true, left_out_of_builder: false, done_count: 0 }];
+  const r = autoBuildDays(F, { top: ['chest'], middle: ['back'] }, 2, pool);
+  assert.deepEqual(r.days.map(d => d.lifts.map(l => l.exercise_id)), [['p3', null], ['p3']]);
+  assert.ok(autoBuildDays(F, { top: ['chest'] }, 3, []).days.every(d => d.lifts.every(l => l.exercise_id === null)), 'an empty pool leaves every slot empty');
+});
+
+test('sizeWarning: past 6 exercises or 10 work sets a day warns; at the line it does not (B07, R4-16)', () => {
+  const day = (n, sets) => ({ lifts: Array.from({ length: n }, (_, i) => ({ slot: i + 1, sets })) });
+  assert.equal(sizeWarning(F, day(6, 1)), false);
+  assert.equal(sizeWarning(F, day(7, 1)), true);
+  assert.equal(sizeWarning(F, { lifts: [{ sets: 5 }, { sets: 5 }] }), false, '10 work sets');
+  assert.equal(sizeWarning(F, { lifts: [{ sets: 5 }, { sets: 6 }] }), true, '11 work sets');
+  assert.equal(sizeWarning(F, day(6, null)), false, 'no set count: its starting sets (1)');
+});
+
+// ---------------- copyStartValues (17 C.3.8, R4-17) ----------------
+
+const cs = (n, status, load, o) => ({ kind: 'work', origin: 'plan', set_n: n, side: 'none', exercise_id: 'ex_a', status, done: status === 'done' ? { load, reps: 8 } : null, target: { load: 90 }, ...(o || {}) });
+test('copyStartValues: done sets 100, 100, 105 start at 105; sets = the planned count (R4-17)', () => {
+  const r = copyStartValues(F, { exercise_id: 'ex_a', sets: 2, rep_low: 8, rep_high: 10, start_load: 80 }, [cs(1, 'done', 100), cs(2, 'done', 100), cs(3, 'done', 105)]);
+  assert.deepEqual(r, { sets: 3, start_load: 105, rep_low: 8, rep_high: 10 });
+});
+test('copyStartValues: no done set starts at the round target load', () => {
+  const r = copyStartValues(F, { exercise_id: 'ex_a', sets: 2, rep_low: 8, rep_high: 10, start_load: 80 }, [cs(1, 'planned'), cs(2, 'skipped')]);
+  assert.deepEqual(r, { sets: 2, start_load: 90, rep_low: 8, rep_high: 10 });
+  assert.equal(copyStartValues(F, { exercise_id: 'ex_a', sets: 2, start_load: 80 }, []).start_load, 80, 'no round rows: the lift start load');
+});
+test('copyStartValues: a hand-added set is not counted, for sets or load', () => {
+  const r = copyStartValues(F, { exercise_id: 'ex_a', sets: 2, rep_low: 8, rep_high: 10 },
+    [cs(1, 'done', 100), cs(2, 'done', 100), cs(3, 'done', 130, { origin: 'added' })]);
+  assert.deepEqual([r.sets, r.start_load], [2, 100]);
+  const lr = copyStartValues(F, { exercise_id: 'ex_a', sets: 1 }, [cs(1, 'done', 40, { side: 'L' }), cs(1, 'done', 40, { side: 'R' })]);
+  assert.equal(lr.sets, 1, 'an L and R pair is one set');
+});
+
+// ---------------- E15: a level change mid block (17 C.3.7) ----------------
+
+test('E15: after a level change from middle to top, the next round uses the top rule row (Adjust each round)', () => {
+  const ex = [{ id: 'ex_q', muscle: 'legs', muscle_detail: 'quads', equipment: 'machine', load_kind: 'external', weight_steps: null, step_default: 5, machine: true, no_added_sets: false, flags_set: true }];
+  const blk = (level) => ({ id: 'be', passes: 4, unit: 'lb', levels: { quads: level }, exercise_flags: {}, day_templates: [
+    { day: 1, label: 'A', lifts: [{ slot: 1, exercise_id: 'ex_q', sets: 1, rep_low: 8, rep_high: 12, start_load: 100, reps_left_target: 2, warmups: [], sides: 'none', load_basis: 'total', count_label: null, failure_set: false, note: '' }] }] });
+  const h = { days: [], sets: [], feedback: [], exercises: ex };
+  const p1 = planDay(A, blk('middle'), h, { pass: 1, day: 1 });
+  h.days.push({ ...p1.day, status: 'done', scores: {}, short_sleep_since_last: false });
+  for (const s of p1.sets) h.sets.push({ ...s, status: 'done', done: { load: 100, reps: 12, reps_left: 2, reps_left_plus: false, failure: false } });
+  h.feedback.push({ id: p1.day.id + ':x1', day_id: p1.day.id, exercise_id: 'ex_q', pump: 1, soreness: 1, workload: 2, checks: {} });
+  const mid = planDay(A, blk('middle'), h, { pass: 2, day: 1 });
+  const top = planDay(A, blk('top'), h, { pass: 2, day: 1 });
+  assert.equal(mid.notes[0].row, 'R11', 'on middle these answers hold');
+  assert.equal(top.notes[0].row, 'R8', 'E15: on top the same answers take the top row');
+  assert.equal(top.notes[0].sets, 2);
+  assert.equal(planDay(F, blk('top'), h, { pass: 2, day: 1 }).notes[0].sets, 1, 'on Fixed nothing he lifts changes');
 });

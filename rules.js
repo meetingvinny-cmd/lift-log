@@ -1,6 +1,6 @@
 // rules.js - the round adjust rule table (TD-2 to TD-7). Data only: no function value
 // is exported, nothing is imported, every object is frozen deep at load.
-// Signed by health-coach (signed-1). Field names and numbers are the signed ones.
+// Signed by health-coach (signed-1, then signed-2 with the builder and copy parts). Field names and numbers are the signed ones.
 // Comments name a source only as "health-coach verdict item N" or "TD-n".
 
 const SIGNALS_FIXED = {
@@ -99,7 +99,25 @@ const SET_KINDS = [                 // health-coach verdict item R4-12: warm-ups
   { key: 'failure', counts: 1, miss_check: false }
 ];
 
-const BUILDER = {};                 // a later slice fills this (TD-8, TD-9)
+// The builder part (TD-8): what the guided builder lays out. Read only by autoBuildDays,
+// fillSlots and sizeWarning; no rule of a round reads it, so a block planned on signed-1 plans
+// exactly as before (TD-8).
+const BUILDER = {
+  days_per_rotation_min: 2, days_per_rotation_max: 6,          // TD-8, health-coach verdict item R4-16
+  slots_per_rotation: {                                         // TD-8, health-coach verdict item C3: top strictly above middle at every length
+    top:    { 2: 2, 3: 3, 4: 3, 5: 3, 6: 4 },
+    middle: { 2: 1, 3: 2, 4: 2, 5: 2, 6: 3 },
+    bottom: { 2: 1, 3: 1, 4: 1, 5: 1, 6: 2 } },
+  max_lifts_per_day: 8,                                         // TD-8, health-coach verdict item R4-16: hard cap
+  warn_lifts_per_day: 6, warn_work_sets_per_day: 10,            // TD-8, health-coach verdict item R4-16: soft warning, never blocks
+  default_level_on_board: 'middle',                             // TD-8, health-coach verdict item C4 (Steady)
+  default_rep_range: null,                                      // TD-8, health-coach verdict item C5: no goal line until he types one
+  default_reps_left_target: 2                                   // TD-8, health-coach verdict item C5: stop 2 short
+};
+
+// The copy part (TD-8, health-coach verdict item R4-17): nothing goes up on its own, a copy
+// starts where he really was.
+const COPY = { sets_from: 'planned', load_from: 'last_done', fallback: 'round_goal' };
 
 function deepFreeze(o) {
   if (o && typeof o === 'object' && !Object.isFrozen(o)) {
@@ -109,26 +127,31 @@ function deepFreeze(o) {
   return o;
 }
 
+// signed-2 (TD-8): signed-1 plus the builder and copy parts. Both names read the same profile
+// table, so a block frozen on signed-1 plans exactly as before; a new block freezes signed-2.
 export const RULES = deepFreeze({
-  rules_version: 'signed-1',
+  rules_version: 'signed-2',
   set_kinds: SET_KINDS,
   profiles: {
     fixed: {
       signals: SIGNALS_FIXED,
       set_rules: { source: 'newest_for_muscle', rows: [{ id: 'F1', when: {}, delta: 0, why: 'why.plan' }] },
       caps: CAPS, start_sets: START_SETS, effort: EFFORT_FIXED, load: LOAD_FIXED,
-      easy_week: EASY_FIXED, carry_forward: CARRY_FIXED, live_edits: LIVE_EDITS, builder: BUILDER
+      easy_week: EASY_FIXED, carry_forward: CARRY_FIXED, live_edits: LIVE_EDITS, builder: BUILDER, copy: COPY
     },
     adaptive: {
       signals: SIGNALS_ADAPTIVE,
       set_rules: { source: 'newest_for_muscle', rows: ROWS_ADAPTIVE },
       caps: CAPS, start_sets: START_SETS, effort: EFFORT_ADAPTIVE, load: LOAD_ADAPTIVE,
-      easy_week: EASY_ADAPTIVE, carry_forward: CARRY, live_edits: LIVE_EDITS, builder: BUILDER
+      easy_week: EASY_ADAPTIVE, carry_forward: CARRY, live_edits: LIVE_EDITS, builder: BUILDER, copy: COPY
     }
   }
 });
 
 // Every version a block can be frozen on. A block keeps its version for life.
 // 'none' is the first freeze; it reads as the Fixed profile, which plans exactly as before.
-export const RULES_BY_VERSION = deepFreeze({ 'signed-1': RULES });
-export const RULE_VERSIONS = deepFreeze(['none', 'signed-1']);
+export const RULES_BY_VERSION = deepFreeze({
+  'signed-1': { rules_version: 'signed-1', set_kinds: RULES.set_kinds, profiles: RULES.profiles },
+  'signed-2': RULES
+});
+export const RULE_VERSIONS = deepFreeze(['none', 'signed-1', 'signed-2']);

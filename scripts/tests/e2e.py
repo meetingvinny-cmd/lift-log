@@ -31,6 +31,10 @@ LOG_DIR = os.environ.get("LIFTLOG_LOG_DIR") or os.path.join(APP_DIR, "test-outpu
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1")
 STANDALONE = "Object.defineProperty(Navigator.prototype, 'standalone', { get: () => true, configurable: true });"
+# Slice 3 one-time intros (17 C.3.16): the older suites tap Got it on any intro sheet the moment it
+# shows, as he would, so their flows run unchanged. The slice3 tips part opens its pages without it.
+INTRO_AUTO = ("(() => { const go = () => { const b = document.querySelector('[data-intro-ok]'); if (b) b.click(); };"
+              " new MutationObserver(go).observe(document, { childList: true, subtree: true }); })();")
 # Counts Content-Security-Policy refusals through a binding (no string waits, the CSP blocks those).
 CSP_COUNTER = ("document.addEventListener('securitypolicyviolation', (e) => {"
                " if (window.__cspHit) window.__cspHit(e.violatedDirective + ' ' + e.blockedURI); });")
@@ -49,6 +53,15 @@ def _app_version():
 
 
 APP_VERSION = _app_version()
+
+
+def _rules_version():
+    import re as _re
+    with open(os.path.join(APP_DIR, "version.js")) as f:
+        return _re.search(r"RULES_VERSION = '([^']+)'", f.read()).group(1)
+
+
+RULES_VERSION = _rules_version()
 
 
 def bump(v, n):
@@ -191,13 +204,15 @@ class Audit:
         return [u for u in self.requests + self.failed if not self.ours(u)] + self.foreign + self.sockets
 
 
-def new_context(browser, audit, standalone, vp="440", extra=()):
+def new_context(browser, audit, standalone, vp="440", extra=(), intros=True):
     v = VIEWPORTS[vp]
     ctx = browser.new_context(
         viewport={"width": v["width"], "height": v["height"]}, device_scale_factor=v["scale"], is_mobile=True,
         has_touch=True, user_agent=UA, service_workers="allow")
     if standalone:
         ctx.add_init_script(STANDALONE)
+        if intros:
+            ctx.add_init_script(INTRO_AUTO)
     for s in extra:
         ctx.add_init_script(s)
     audit.attach_context(ctx)
@@ -393,12 +408,13 @@ def suite_slice0(browser, base, vp, local):
             page.evaluate("h => { location.hash = h; }", route)
             page.wait_for_timeout(150)
             layout(page, tag, screen)
+        # Slice 3 (17 C.0.1): #/history stops showing Coming next; with no finished day it shows its own empty state.
         check(tag + "(2) icon: Block and History show their empty states",
-              page.locator(".empty h2").inner_text().strip() == "Coming next")
+              page.locator(".empty h2").inner_text().strip() == "Nothing logged yet")
         page.click("a.tab[href='#/settings']")
         page.wait_for_selector("#settings")
         check(tag + "(2) icon: settings shows version " + APP_VERSION, page.inner_text("[data-fact='version'] .val") == APP_VERSION)
-        check(tag + "(2) icon: settings shows rules 'signed-1'", page.inner_text("[data-fact='rules'] .val") == "signed-1")
+        check(tag + "(2) icon: settings shows rules " + RULES_VERSION, page.inner_text("[data-fact='rules'] .val") == RULES_VERSION)
         layout(page, tag, "settings")
         page.click("#open-check")
 
@@ -606,6 +622,31 @@ def suite_update(browser, base, cb):
 
     section("case 1", case_1)
 
+    # The what-changed note (17 C.3.16, AW1, JW2, M70): a first install shows none; an update from A
+    # to B shows it once on Today, and not again after the next reload.
+    def case_changed():
+        ctx, page = fresh(False)
+        settle(page, 600)
+        first = page.locator("#changed-banner").count()
+        SERVE["app"] = B
+        page.evaluate("navigator.serviceWorker.getRegistration().then(r => r.update())")
+        settle_takeover(page, "liftlog-" + V_B)
+        page.wait_for_selector("#today > *", timeout=15000)
+        try:
+            page.wait_for_selector("#changed-banner", timeout=6000)
+            shown = True
+        except Exception:
+            shown = False
+        head = page.inner_text("#changed-banner").strip() if shown else ""
+        page.reload(); page.wait_for_selector("#today > *"); settle(page, 800)
+        again = page.locator("#changed-banner").count()
+        check("M70: a first install shows no what-changed note", first == 0)
+        check("AW1 JW2: an update from A to B shows the note once on Today, and not after the next reload",
+              shown and head.startswith("Updated to " + V_B + ".") and again == 0, {"shown": shown, "head": head, "again": again})
+        ctx.close()
+
+    section("what-changed case", case_changed)
+
     # Update after visibilitychange: returning to the app checks for a new version.
     def case_vis():
         ctx, page = fresh(True)
@@ -732,7 +773,7 @@ def suite_update(browser, base, cb):
                 page.click("#builder-cancel")
                 page.wait_for_selector("#setup-build")
                 page.click("#unit-lb")
-                page.click("#setup-build")
+                build_click(page, "#setup-build")
                 page.wait_for_selector("#draft-sheet")
                 page.click("#draft-over")
                 page.wait_for_selector("#builder[data-step='1']")
@@ -1148,12 +1189,21 @@ def finish(page, score=None, stay=False, at_nudge=False):
     return False
 
 
+def poll_quiet(page, js, timeout=3000):
+    """poll() that answers False instead of raising when the time runs out."""
+    try:
+        return poll(page, js, timeout=timeout)
+    except Exception:
+        return False
+
+
 def leave_day_done(page):
     try:
         settle(page, 200)
         if page.locator("#done-go").count():
             page.click("#done-go")
-        page.wait_for_selector("#today > *", timeout=10000)
+        # On the last day of a block the button goes to Block finished (17 C.3.9).
+        page.wait_for_selector("#today > *, #finished > *", timeout=10000)
     except Exception:
         pass   # a reload to a new version lands on Today by itself
 
@@ -1196,6 +1246,19 @@ def differs(a, b):
     return [k for k in a if a[k] != b.get(k)]
 
 
+def build_click(page, sel):
+    """Build a block (setup or empty Today). From 0.4.0 it opens the New block chooser (17 C.3.3);
+    this taps Build from scratch there, so a case written for the builder reaches it as before.
+    An older build with no chooser goes straight on."""
+    page.click(sel)
+    try:
+        poll(page, "() => !!document.getElementById('new') || !!document.getElementById('builder') || !!document.getElementById('draft-sheet')", 5000)
+    except Exception:
+        return
+    if page.locator("#new").count():
+        page.click("#new-scratch")
+
+
 def go_route(page, route, sel):
     page.evaluate("h => { location.hash = h; }", route)
     page.wait_for_selector(sel, timeout=10000)
@@ -1211,7 +1274,7 @@ def build_two_day_block(page):
     """First run by taps: units, then a 2-day block with 2 exercises each, rounds 3."""
     page.wait_for_selector("#setup")
     page.click("#unit-lb")
-    page.click("#setup-build")
+    build_click(page, "#setup-build")
     page.wait_for_selector("#builder[data-step='1']")
     page.fill("#block-name", "Test block")
     page.click("#builder-next")
@@ -1700,12 +1763,12 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         sid = tick(page, fb="save")
         page.reload(); page.wait_for_selector("#today[data-day]"); settle(page)
         check(tag + "offline: a set logged with no server and no network is there after a reload", state_of(page, sid) == "done")
-        # From 0.3.0 the Block tab shows the Block overview (16 B.1 step 8); History still shows Coming next.
-        go_route(page, "#/block", "#block #round-strip")
+        # From 0.3.0 the Block tab shows the Block overview (16 B.1 step 8); from 0.4.0 History is built (17 C.3.12).
+        go_route(page, "#/block", "#block #round-grid")
         check(tag + "offline: the block tab shows the Block overview", page.locator("#block [data-blockday]").count() >= 1)
         layout(page, tag, "block tab")
-        go_route(page, "#/history", ".empty")
-        check(tag + "offline: the history tab shows Coming next", page.inner_text(".empty h2").strip() == "Coming next")
+        go_route(page, "#/history", "#history > *")
+        check(tag + "offline: the history tab shows Coming next", page.locator("#history h1").count() == 1 and page.inner_text("#history").find("Coming next") < 0)
         layout(page, tag, "history tab")
         ctx.set_offline(False)
         ctx.close()
@@ -1854,15 +1917,16 @@ def suite_slice1(browser, base, vp, local, cb, parts):
             tick(page, fb="save")
         finish(page)
         go_route(page, "#/today", "#today > *")
-        check(tag + "polish: C27 a finished block shows Block finished with Build and Load",
-              page.locator("#block-done").count() == 1 and page.locator("#block-done #build-block").count() == 1 and page.locator("#block-done #load-block").count() == 1,
+        # Slice 3 (17 C.3.9): the row holds Start a new block and Copy this block, no Load.
+        check(tag + "polish: C27 a finished block shows Block finished with Start a new block and Copy this block",
+              page.locator("#block-done").count() == 1 and page.locator("#block-done #fin-new").count() == 1 and page.locator("#block-done #fin-copy").count() == 1,
               page.inner_text("#today")[:120])
         ctx.close()
 
         # C32 and C41: builder reorder and start weight steps (PD18, PD20).
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build") if page.locator("#setup-build").count() else None
+        build_click(page, "#setup-build") if page.locator("#setup-build").count() else None
         builder_day_a(page, ("leg_press", "lat_pulldown"))
         fill_change(page, "[data-lift='0:0'] .lift-nums input:nth-child(4)", "100")
         page.click("[data-loadstep='0:0+']")
@@ -1888,7 +1952,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Stage 4 A3 (14.8 CHANGE A3): a kg build steps the start weight 1 kg on a step 5 row.
         ctx, page = new()
         page.click("#unit-kg")
-        page.click("#setup-build") if page.locator("#setup-build").count() else None
+        build_click(page, "#setup-build") if page.locator("#setup-build").count() else None
         builder_day_a(page, ("leg_press",))
         fill_change(page, "[data-lift='0:0'] .lift-nums input:nth-child(4)", "20")
         page.click("[data-loadstep='0:0+']")
@@ -1901,7 +1965,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Save: the block is lb and its start weight is the lb step he made.
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build") if page.locator("#setup-build").count() else None
+        build_click(page, "#setup-build") if page.locator("#setup-build").count() else None
         builder_day_a(page, ("leg_press",))
         fill_change(page, "[data-lift='0:0'] .lift-nums input:nth-child(4)", "100")
         page.click("[data-loadstep='0:0+']")
@@ -1912,7 +1976,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         page.click("#units [data-k='kg']")
         settle(page, 300)
         go_route(page, "#/today", "#build-block")
-        page.click("#build-block")
+        build_click(page, "#build-block")
         # No draft ask: this case fails by its own name and the part goes on (PD28 is caught by Part 4).
         try:
             page.wait_for_selector("#draft-sheet", timeout=5000)
@@ -1958,7 +2022,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Part 2: a blank name saves the default name and opens round 1 day 1 (BW11).
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         page.wait_for_selector("#builder[data-step='1']")
         settle(page, 300)
         ph = page.get_attribute("#block-name", "placeholder")
@@ -1975,7 +2039,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Part 3: one tap removes the middle exercise; Save keeps the other two in order (S06, BW8).
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         builder_day_a(page, ("leg_press", "lat_pulldown", "leg_extension"))
         layout(page, tag, "builder step 3 with the remove buttons")
         page.click("[data-remove='0:1']")
@@ -1991,7 +2055,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Part 3: a day with no exercise left blocks Save and names the day.
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         builder_day_a(page, ("leg_press",))
         page.click("#add-day"); page.wait_for_selector("[data-day-card='1']")
         page.click("[data-addex='1']"); page.wait_for_selector("#picker")
@@ -2014,12 +2078,12 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # the unit, so Today then shows the No block screen and its button is #build-block (T3).
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         page.wait_for_selector("#builder[data-step='1']")
         page.fill("#block-name", "Kept draft")
         page.click("#builder-cancel")
         page.wait_for_selector("#build-block")
-        page.click("#build-block")
+        build_click(page, "#build-block")
         # No ask sheet: the case fails here by its own name, never on a wait timeout.
         try:
             page.wait_for_selector("#draft-sheet", timeout=5000)
@@ -2034,14 +2098,14 @@ def suite_slice1(browser, base, vp, local, cb, parts):
             kept = page.input_value("#block-name") == "Kept draft"
             page.click("#builder-cancel")
             page.wait_for_selector("#build-block")
-            page.click("#build-block")
+            build_click(page, "#build-block")
             page.wait_for_selector("#draft-sheet")
             page.click("#draft-over")
             page.wait_for_selector("#builder[data-step='1']")
             fresh = page.input_value("#block-name") == ""
             page.click("#builder-cancel")
             page.wait_for_selector("#build-block")
-            page.click("#build-block")
+            build_click(page, "#build-block")
             page.wait_for_selector("#builder[data-step='1']")
             settle(page, 300)
             no_ask = page.locator("#draft-sheet").count() == 0
@@ -2084,7 +2148,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
 
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         builder_day_a(page, ("leg_press",))
         page.click("[data-relabel='0']")
         page.wait_for_selector("#relabel-sheet")
@@ -2099,7 +2163,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         # Part 5: a block with no start weight opens round 1 with empty weight boxes and the no-weight line (W02, CW1).
         ctx, page = new()
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         builder_day_a(page, ("leg_press", "lat_pulldown"))
         to_review_and_save(page)
         sid = open_set(page)
@@ -2112,7 +2176,7 @@ def suite_slice1(browser, base, vp, local, cb, parts):
     def three_set_block(page, start="100"):
         """Day A: leg press 3 sets at the given start weight, then lat pulldown 3 sets. Saved from the builder."""
         page.click("#unit-lb")
-        page.click("#setup-build")
+        build_click(page, "#setup-build")
         builder_day_a(page, ("leg_press", "lat_pulldown"))
         for sel in ("[data-lift='0:0']", "[data-lift='0:1']"):
             fill_change(page, sel + " .lift-nums input:nth-child(1)", "3")
@@ -2487,9 +2551,12 @@ def suite_slice1(browser, base, vp, local, cb, parts):
         day_menu(page, "skip")
         page.wait_for_selector("#skipday-sheet")
         page.click("#skipday-go")
-        page.wait_for_selector("#block-done")
+        # Slice 3 (17 C.3.9): the Block finished screen first, the nudge over it once.
+        page.wait_for_selector("#finished #fin-new")
+        if page.locator("#nudge").count() or poll_quiet(page, "() => !!document.getElementById('nudge')", 3000):
+            page.click("#nudge-later")
         check(tag + "polish: Skip day on the last day of a 1-round block shows the Block finished choices (Part 15)",
-              page.locator("#block-done #build-block").count() == 1 and page.locator("#block-done #load-block").count() == 1)
+              page.locator("#finished #fin-new").count() == 1 and page.locator("#finished #fin-copy").count() == 1)
         ctx.close()
 
     def polish_breaks():
@@ -3165,8 +3232,13 @@ def suite_slice2(browser, base, vp, parts):
         layout(page, tag, "close block confirm")
         page.click("#end-go")
         # PD210: a missing Block finished state fails this check by its name, never a timeout.
+        # Slice 3 (17 C.3.9): the Block finished screen first, with the nudge over it once; Today then
+        # shows the Block finished row.
         try:
-            page.wait_for_selector("#block-done", timeout=10000)
+            page.wait_for_selector("#finished #fin-new", timeout=10000)
+            if poll_quiet(page, "() => !!document.getElementById('nudge')", 3000):
+                page.click("#nudge-later")
+            go_route(page, "#/today", "#block-done")
             shown = True
         except Exception:
             shown = False
@@ -3389,18 +3461,18 @@ def suite_slice2(browser, base, vp, parts):
         leave_day_done(page)
         go_route(page, "#/today", "#today[data-day]")
 
+    # Slice 3 (17 C.3.11): the round grid replaced the round strip; every round's days show at once.
     def block_tab(page, rnd=None):
-        go_route(page, "#/block", "#block #round-strip")
-        if rnd is not None:
-            page.click("#round-strip [data-round='%d']" % rnd)
-            poll(page, "() => { const c = document.querySelector(\"#round-strip [data-round='%d']\"); return !!c && c.getAttribute('aria-pressed') === 'true'; }" % rnd)
-            settle(page, 300)
+        go_route(page, "#/block", "#block #round-grid")
+        settle(page, 300)
 
     def strip(page):
-        return page.eval_on_selector_all("#round-strip [data-round]", "els => els.map(e => [e.getAttribute('data-round'), e.getAttribute('data-state'), e.getAttribute('data-easy'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+        return page.eval_on_selector_all("#round-grid [data-round]", "els => els.map(e => [e.getAttribute('data-round'), e.getAttribute('data-state'), e.getAttribute('data-easy'), e.innerText.replace(/\\s+/g, ' ').trim()])")
 
-    def day_rows(page):
-        return page.eval_on_selector_all("#block-days [data-blockday]", "els => els.map(e => [e.getAttribute('data-blockday'), e.getAttribute('data-status'), e.getAttribute('data-now'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+    # The cells of one round (the current round by default): [ref, status, now, aria-label].
+    def day_rows(page, rnd=None):
+        r = rnd or int(page.get_attribute("#round-grid [data-round][data-state='now']", "data-round") or 1)
+        return page.eval_on_selector_all("#round-grid [data-blockday*=':p%d:d']" % r, "els => els.map(e => [e.getAttribute('data-blockday'), e.getAttribute('data-status'), e.getAttribute('data-now'), e.getAttribute('aria-label')])")
 
     def no_write_controls(page):
         return page.evaluate("() => { const v = document.getElementById('dayview'); return !!v && v.querySelectorAll('button, input, [data-tick], [data-step], [data-setmenu], [data-menu], #day-menu, #finish-day, #sleep-card').length === 0; }")
@@ -3411,51 +3483,30 @@ def suite_slice2(browser, base, vp, parts):
         ctx, page, out = adaptive_page()
         block_tab(page)
         st = strip(page)
-        check(tag + "(e) block overview: the round strip shows R1 done, R2 now, R3 later and R4 easy",
+        check(tag + "(e) block overview: the round grid shows R1 done, R2 now, R3 later and R4 easy",
               [x[:3] for x in st] == [["1", "done", "false"], ["2", "now", "false"], ["3", "later", "false"], ["4", "later", "true"]]
-              and st[0][3] == "R1 done" and st[1][3] == "R2 now" and st[3][3] == "R4 easy", st)
+              and [x[3].split(" ")[0] for x in st] == ["R1", "R2", "R3", "R4"], st)
         check(tag + "(e) block overview: the head line names the block, its rounds and Adjust each round",
               page.inner_text("#block-head").strip() == "Made-up schema two block · 4 rounds · Adjust each round", page.inner_text("#block-head"))
         check(tag + "(e) block overview: the current round has the accent border",
-              page.evaluate("() => { const c = document.querySelector(\"#round-strip [data-round='2']\"), o = document.querySelector(\"#round-strip [data-round='3']\"); return getComputedStyle(c).borderTopWidth === '2px' && getComputedStyle(o).borderTopWidth === '1px'; }"))
+              page.evaluate("() => { const c = document.querySelector(\"#round-grid [data-round='2']\"), o = document.querySelector(\"#round-grid [data-round='3']\"); return getComputedStyle(c).borderTopWidth === '2px' && getComputedStyle(o).borderTopWidth === '1px'; }"))
         dr = day_rows(page)
         check(tag + "(e) block overview: ROUND 2 day rows read Day A Now and Day B Not planned yet",
-              page.inner_text("#round-label").strip() == "ROUND 2" and len(dr) == 2 and dr[0][1] == "planned" and dr[0][2] == "true" and dr[0][3].endswith("Now")
-              and dr[1][1] == "notplanned" and dr[1][3].endswith("Not planned yet") and page.locator("#block-days [data-status='notplanned'] .pill-info").count() == 1, dr)
-        # Sets this round by muscle: every work set of round 2 not skipped, by muscle key, against round 1.
-        exs = {e["id"]: e for e in rows(page, "exercises")}
-        def by_muscle(pass_n):
-            seen, out_ = set(), {}
-            for x in rows(page, "sets"):
-                if (":p%d:" % pass_n) not in x["id"] or x["kind"] != "work" or x["status"] == "skipped":
-                    continue
-                k = (x["day_id"], x["slot"], x["set_n"])
-                if k in seen:
-                    continue
-                seen.add(k)
-                e = exs.get(x["exercise_id"]) or {}
-                key = e.get("muscle_detail") or e.get("muscle")
-                out_[key] = out_.get(key, 0) + 1
-            return out_
-        now_, before = by_muscle(2), by_muscle(1)
-        table = page.eval_on_selector_all("#muscle-table [data-muscle]", "els => els.map(e => [e.getAttribute('data-muscle'), e.querySelector('.muscle-sets').innerText.trim(), e.querySelector('.muscle-diff').innerText.trim()])")
-        want = []
-        for k in sorted(set(now_) | set(before)):
-            d = now_.get(k, 0) - before.get(k, 0)
-            want.append([k, str(now_.get(k, 0)), "" if d == 0 else ("%+d from last round" % d)])
-        check(tag + "(e) block overview: the sets this round by muscle with the change line", table == want and any(w[2] for w in want), {"page": table, "want": want})
+              len(dr) == 2 and dr[0][1] == "planned" and dr[0][2] == "true" and dr[0][3].endswith(": current")
+              and dr[1][1] == "notplanned" and dr[1][3].endswith(": not planned yet"), dr)
+        # Slice 3 (17 C.3.10, LOOK 4.7): the sets-by-muscle table moved to the Block summary (e2e slice3 summary part).
         check(tag + "(e) block overview: Close block is a secondary button", page.locator("#block-end.btn-secondary").count() == 1)
         layout(page, tag, "block overview")
         # A round 4 day (easy round, not planned yet) with hard days left: the stop sheet (plural line).
         block_tab(page, 4)
-        page.click("#block-days [data-blockday$=':p4:d1']")
+        page.click("#round-grid [data-blockday$=':p4:d1']")
         page.wait_for_selector("#easy-sheet")
         check(tag + "stop sheet: with 4 hard days left the line counts them",
               page.inner_text("#easy-line").strip() == "4 hard days are not finished yet." and page.inner_text("#easy-sheet h2").strip() == "Finish the hard days first")
         page.click("#easy-cancel"); poll(page, "() => !document.getElementById('easy-sheet')")
         # Round 3 day A: not planned yet, read only.
         block_tab(page, 3)
-        page.click("#block-days [data-blockday$=':p3:d1']")
+        page.click("#round-grid [data-blockday$=':p3:d1']")
         page.wait_for_selector("#dayview[data-state='notplanned']")
         check(tag + "(e) not planned yet: the pill and its line, one row per set, empty cells, nothing that writes",
               page.inner_text("#state-pill").strip() == "Not planned yet" and page.inner_text("#day-line").strip() == "Its numbers are set when the day before it is finished."
@@ -3467,7 +3518,7 @@ def suite_slice2(browser, base, vp, parts):
         for bad in ("nope", "__proto__", bid + ":p9:d1", bid + ":p1:d7", "x%20y"):
             page.evaluate("h => { location.hash = h; }", "#/day/" + bad)
             try:
-                page.wait_for_selector("#block #round-strip", timeout=6000)
+                page.wait_for_selector("#block #round-grid", timeout=6000)
                 ok = True
             except Exception:
                 ok = False
@@ -3476,13 +3527,13 @@ def suite_slice2(browser, base, vp, parts):
         # A round 1 day planned but not current: its targets read only with day.later.line.
         ctx, page = fixed_page()
         block_tab(page)
-        page.click("#block-days [data-blockday$=':p1:d2']")
+        page.click("#round-grid [data-blockday$=':p1:d2']")
         page.wait_for_selector("#dayview[data-state='later']")
         helpers = page.eval_on_selector_all("#dayview .set .helper", "els => els.map(e => e.innerText.trim()).filter(Boolean)")
         check(tag + "(e) planned not current: the line names the day before, the targets show read only",
               page.inner_text("#day-line").strip() == "Opens after Day A." and page.locator("#state-pill").count() == 0 and len(helpers) >= 1 and no_write_controls(page), helpers[:2])
         page.click("#day-back")
-        page.wait_for_selector("#block #round-strip")
+        page.wait_for_selector("#block #round-grid")
         check(tag + "(e) the Back link goes to the Block tab", page.locator("#dayview").count() == 0)
         ctx.close()
 
@@ -3498,8 +3549,8 @@ def suite_slice2(browser, base, vp, parts):
         block_tab(page)
         dr = day_rows(page)
         check(tag + "(d) block overview: the skipped day shows the Skipped pill, the next day Now",
-              dr[0][1] == "skipped" and dr[0][3].endswith("Skipped") and dr[1][2] == "true", dr)
-        page.click("#block-days [data-blockday='%s']" % d["id"])
+              dr[0][1] == "skipped" and dr[0][3].endswith(": skipped") and dr[1][2] == "true", dr)
+        page.click("#round-grid [data-blockday='%s']" % d["id"])
         page.wait_for_selector("#dayview[data-state='skipped']")
         page.evaluate("() => { const r = document.querySelector('#dayview .set'); if (r) r.click(); }")
         settle(page, 400)
@@ -3590,7 +3641,7 @@ def suite_slice2(browser, base, vp, parts):
         wait_state(page, sid, "done")
         clear_sheets(page)
         block_tab(page, 4)
-        page.click("#block-days [data-blockday$=':p4:d1']")
+        page.click("#round-grid [data-blockday$=':p4:d1']")
         try:
             page.wait_for_selector("#easy-sheet", timeout=6000)
             shown = True
@@ -3781,7 +3832,7 @@ def suite_slice2(browser, base, vp, parts):
                     # (b) the stop sheet: an easy-round day opened from the Block tab while round 3 day B is open.
                     log_open_sets(page, key, profile, seen, stop_after=1)
                     block_tab(page, 4)
-                    page.click("#block-days [data-blockday$=':p4:d1']")
+                    page.click("#round-grid [data-blockday$=':p4:d1']")
                     try:
                         page.wait_for_selector("#easy-sheet", timeout=6000)
                         shown = True
@@ -3847,7 +3898,7 @@ def suite_slice2(browser, base, vp, parts):
         check(tag + "(c) swap Rest of block: the block's day holds the new exercise with no weight",
               lift1["exercise_id"] == "hack_squat" and lift1["start_load"] is None and page.locator("[data-exercise='hack_squat']").count() == 1, lift1)
         block_tab(page, 3)
-        page.click("#block-days [data-blockday$=':p3:d1']")
+        page.click("#round-grid [data-blockday$=':p3:d1']")
         page.wait_for_selector("#dayview")
         check(tag + "(c) swap Rest of block: a later day shows the new exercise; the Today only swap does not reach it",
               page.locator("#dayview [data-slot='1'][data-exercise='hack_squat']").count() == 1
@@ -3894,6 +3945,960 @@ def suite_slice2(browser, base, vp, parts):
     check(tag + "zero console errors", not audit.errors, audit.errors[:5])
 
 
+# ---------------- suite slice3 (17 C.4 row "e2e.py --suite slice3") ----------------
+
+# Each Slice 3 step adds its named parts to SLICE3_PARTS (name, function(ctx3)); ctx3 carries the helpers.
+SLICE3_PARTS = []
+
+
+def slice3_part(name):
+    def deco(fn):
+        SLICE3_PARTS.append((name, fn))
+        return fn
+    return deco
+
+
+def suite_slice3(browser, base, vp, parts):
+    tag = "[%s] slice3 " % vp
+    o = urlparse(base)
+    origin = o.scheme + "://" + o.netloc
+    audit = Audit(origin)
+    want = lambda name: (not parts) or name in parts
+
+    def new(now_ms=None):
+        extra = [clock_at(now_ms)] if now_ms else []
+        ctx, page = new_context(browser, audit, standalone=True, vp=vp, extra=extra)
+        page.set_default_timeout(10000)
+        page.goto(base)
+        page.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(page)
+        settle(page, 300)
+        return ctx, page
+
+    def rows(page, store):
+        return page.evaluate(DB_ALL, store)
+
+    def toast_text(page):
+        return page.evaluate("() => { const t = document.querySelector('.toast.is-on'); return t ? t.textContent : null; }")
+
+    h = {"tag": tag, "base": base, "vp": vp, "new": new, "rows": rows, "toast": toast_text, "audit": audit, "browser": browser}
+    for name, fn in SLICE3_PARTS:
+        if not want(name):
+            continue
+        section(tag + name, lambda fn=fn: fn(h))
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, "e2e_slice3_%s_network.json" % vp), "w") as f:
+        json.dump({"origin": origin, "requests": len(audit.requests), "off_origin": audit.off_origin(), "csp_violations": audit.csp}, f, indent=1)
+    off = audit.off_origin()
+    check(tag + "network audit: zero requests off our origin and zero CSP violations", not off and not audit.csp,
+          "%d requests, %d off origin, %d CSP %s" % (len(audit.requests), len(off), len(audit.csp), (off + audit.csp)[:3]))
+    check(tag + "zero console errors", not audit.errors, audit.errors[:5])
+
+
+# ---- Slice 3 helpers (S1) ----
+
+S3_LIFT = "(slot, ex, sets, load) => ({ slot, exercise_id: ex, sets, rep_low: 8, rep_high: 12, start_load: load, failure_set: false, reps_left_target: 2, warmups: [], sides: 'none', load_basis: 'total', count_label: null, note: '' })"
+# Make blocks straight through a second store on the same database (setup only), then reload.
+S3_MAKE = """async (specs) => { const { db } = await import('./db.js'); const { createStore } = await import('./store.js');
+  const st = createStore({ db }); const L = %s; const out = [];
+  for (const sp of specs) { const b = await st.createBlock({ name: sp.name, passes: sp.passes, day_templates: sp.days.map((d, i) => ({ day: i + 1, label: d.label,
+    lifts: d.lifts.map((x, j) => L(j + 1, x[0], x[1], x[2])) })) }, null, { activate: !!sp.activate }); out.push(b.id); await new Promise(r => setTimeout(r, 5)); }
+  return out; }""" % S3_LIFT
+S3_SETTING = "async (k) => { const { db } = await import('./db.js'); return db.setting(k, null); }"
+S3_PUT_SETTING = "async ([k, v]) => { const { db } = await import('./db.js'); await db.setSetting(k, v); return true; }"
+
+
+def s3_unit_first(page):
+    """First run: pick lb so the empty screens show their Build a block button."""
+    if page.locator("#setup").count():
+        page.click("#unit-lb")
+
+
+def s3_make(page, specs):
+    ids = page.evaluate(S3_MAKE, specs)
+    page.reload()
+    page.wait_for_selector("#today > *", timeout=15000)
+    settle(page, 300)
+    return ids
+
+
+TWO_BLOCKS = [{"name": "Older block", "passes": 3, "activate": True, "days": [{"label": "A", "lifts": [["leg_press", 2, 150], ["lat_pulldown", 2, 100]]},
+                                                                             {"label": "B", "lifts": [["chest_press_machine", 2, 80]]}]},
+              {"name": "Newer block", "passes": 2, "days": [{"label": "A", "lifts": [["push_up", 2, None], ["leg_extension", 2, 60]]}]}]
+
+
+def s3_to_picker(page):
+    """Today with no block, or setup: Build a block, Build from scratch, to the step 3 picker of day 1."""
+    s3_unit_first(page)
+    sel = "#setup-build" if page.locator("#setup-build").count() else "#build-block"
+    build_click(page, sel)
+    page.wait_for_selector("#builder[data-step='1']")
+    page.fill("#block-name", "S3 block")
+    page.click("#builder-next")
+    page.wait_for_selector("#builder[data-step='2']")
+    fill_change(page, "#block-rounds", "2")
+    page.click("#builder-next")
+    page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']")
+    page.wait_for_selector("#picker")
+    settle(page, 400)
+
+
+def pick_ids(page):
+    return page.eval_on_selector_all("[data-pick]", "els => els.map(e => e.getAttribute('data-pick'))")
+
+
+@slice3_part("list")
+def part_s3_list(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    page.wait_for_selector("#setup")
+    page.click("#unit-lb")
+    page.click("#setup-build")
+    try:
+        page.wait_for_selector("#new", timeout=5000)
+    except Exception:
+        pass
+    check(tag + "C.3.3: first run's Build a block opens the New block chooser", page.locator("#new").count() == 1 and page.locator("#new-scratch").count() == 1)
+    if page.locator("#new-scratch").count():
+        page.click("#new-scratch")
+    page.wait_for_selector("#builder[data-step='1']")
+    page.fill("#block-name", "Body block")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='2']")
+    fill_change(page, "#block-rounds", "2")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']"); page.wait_for_selector("#picker"); settle(page, 400)
+    page.click("[data-chip='3']"); settle(page, 400)
+    free = pick_ids(page)
+    check(tag + "C.2.7: the picker Free chip shows a kettlebell row and never a band row", any("kettlebell" in i for i in free) and not any(i.startswith("band_") for i in free), free[:8])
+    page.click("[data-chip='4']"); settle(page, 400)
+    body = pick_ids(page)
+    check(tag + "C.2.7: the Body chip shows push up", "push_up" in body, body[:8])
+    layout(page, tag, "picker (Slice 3 chips)")
+    page.click("[data-pick='push_up']")
+    page.wait_for_selector("#builder[data-step='3']")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='4']")
+    page.click("#block-save")
+    page.wait_for_selector("#today[data-day]"); settle(page, 400)
+    card = "[data-exercise='push_up']"
+    word = page.locator(card + " [data-val='body']").first
+    check(tag + "C.2.7: a body-load lift on Today shows your body and no weight steppers",
+          word.count() == 1 and word.inner_text().strip() == "your body" and page.locator(card + " [data-step='load+']").count() == 0
+          and page.locator(card + " [data-step='reps+']").count() >= 1, page.inner_text(card)[:160])
+    sid = open_set(page)
+    tick(page, sid)
+    done = [r for r in h["rows"](page, "sets") if r["exercise_id"] == "push_up" and r["status"] == "done"]
+    check(tag + "C.2.7: the body-load tick saves load 0", len(done) == 1 and done[0]["done"]["load"] == 0, done and done[0]["done"])
+    ctx.close()
+
+
+@slice3_part("equipment")
+def part_s3_equipment(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    go_route(page, "#/settings", "#equip-group")
+    chips = page.eval_on_selector_all("#equip-chips [data-equip]", "els => els.map(e => [e.getAttribute('data-equip'), e.getAttribute('aria-pressed')])")
+    check(tag + "C.3.1: Settings shows the 10 kinds, every one picked on first run", len(chips) == 10 and all(c[1] == "true" for c in chips), chips)
+    layout(page, tag, "Settings with the equipment group")
+    page.click("#equip-chips [data-equip='band']"); settle(page, 400)
+    saved = page.evaluate(S3_SETTING, "equipment_saved")
+    check(tag + "C.3.1: untick Band stores the other 9 kinds", saved is not None and "band" not in saved and len(saved) == 9, saved)
+    go_route(page, "#/today", "#today > *")
+    s3_to_picker(page)
+    ids = pick_ids(page)
+    check(tag + "X04 M67: with Band unticked the picker hides every band row, in All", ids and not any(i.startswith("band_") for i in ids), [i for i in ids if "band" in i][:5])
+    page.click("#picker-allgear"); settle(page, 400)
+    ids2 = pick_ids(page)
+    check(tag + "C.3.1: Show all equipment shows the band rows for this visit", any(i.startswith("band_") for i in ids2))
+    page.click("#picker-back"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']"); page.wait_for_selector("#picker"); settle(page, 400)
+    check(tag + "C.3.1: a new picker visit hides them again", not any(i.startswith("band_") for i in pick_ids(page)))
+    page.click("#picker-back"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("#builder-cancel"); settle(page)
+    # The last picked chip stays picked and says why (equip.min); empty is never stored.
+    page.evaluate(S3_PUT_SETTING, ["equipment_saved", ["band"]])
+    go_route(page, "#/settings", "#equip-group"); settle(page, 400)
+    page.click("#equip-chips [data-equip='band']"); settle(page, 300)
+    check(tag + "C.3.1: the last picked chip stays picked and shows Keep at least one kind picked",
+          h["toast"](page) == "Keep at least one kind picked." and page.get_attribute("#equip-chips [data-equip='band']", "aria-pressed") == "true"
+          and page.evaluate(S3_SETTING, "equipment_saved") == ["band"], h["toast"](page))
+    ctx.close()
+
+
+@slice3_part("blocks")
+def part_s3_blocks(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    older, newer = s3_make(page, TWO_BLOCKS)
+    go_route(page, "#/block", "#block[data-block]")
+    check(tag + "S01: the Block tab overview holds the All blocks row", page.locator("#blocks-all").count() == 1)
+    page.click("#blocks-all"); page.wait_for_selector("#blocks-list")
+    rows = page.eval_on_selector_all("[data-blockrow]", "els => els.map(e => [e.getAttribute('data-blockrow'), e.getAttribute('data-current'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+    check(tag + "C.3.2 S02: the list holds both blocks newest first, the Current pill on the current one only",
+          [r[0] for r in rows] == [newer, older] and [r[1] for r in rows] == ["false", "true"] and page.locator("[data-pill='current']").count() == 1
+          and "Current" in rows[1][2] and "2 rounds" in rows[0][2] and "0 days done" in rows[0][2], rows)
+    check(tag + "C.3.2 M74: a new block made while one is current did not take the mark", page.evaluate(S3_SETTING, "active_block_id") == older)
+    layout(page, tag, "block list")
+    page.click("[data-blockmore='%s']" % newer); page.wait_for_selector("#row-menu")
+    items = page.eval_on_selector_all("#row-menu [data-rowitem]", "els => els.map(e => [e.getAttribute('data-rowitem'), e.innerText.trim()])")
+    check(tag + "C.3.2 S02: the row menu holds the 6 actions in order",
+          [i[0] for i in items] == ["note", "rename", "copy", "summary", "template", "delete"]
+          and [i[1] for i in items] == ["Note", "Rename", "Copy", "Summary", "Save as template", "Delete"], items)
+    layout(page, tag, "block row menu")
+    page.click("#row-menu [data-rowitem='delete']"); page.wait_for_selector("#del-sheet")
+    off0 = page.is_disabled("#del-go")
+    page.fill("#del-sheet input", "DELET")
+    off1 = page.is_disabled("#del-go")
+    page.fill("#del-sheet input", "DELETE")
+    on = not page.is_disabled("#del-go")
+    check(tag + "AW6 M54: Delete stays disabled until DELETE is typed", off0 and off1 and on, [off0, off1, on])
+    page.click("#del-cancel"); settle(page)
+    # A block note saves and shows after a reload (L10).
+    page.click("[data-blockmore='%s']" % older); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='note']"); page.wait_for_selector("#blocknote-sheet")
+    page.fill("#blocknote-in", "Seat 4 on the press")
+    page.click("#blocknote-save"); settle(page, 400)
+    page.reload(); page.wait_for_selector("#blocks-list"); settle(page, 300)
+    page.click("[data-blockmore='%s']" % older); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='note']"); page.wait_for_selector("#blocknote-sheet")
+    check(tag + "L10: a block note saves and shows after a reload", page.input_value("#blocknote-in") == "Seat 4 on the press")
+    page.click("#blocknote-cancel"); settle(page)
+    # Rename shows on the list and on the Block tab (HW4).
+    page.click("[data-blockmore='%s']" % older); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='rename']"); page.wait_for_selector("#rename-sheet")
+    page.fill("#rename-in", "Legs first"); page.click("#rename-save"); settle(page, 400)
+    named = page.inner_text("[data-blockrow='%s']" % older)
+    go_route(page, "#/block", "#block-head")
+    check(tag + "HW4: the new name shows on the list and on the Block tab", "Legs first" in named and "Legs first" in page.inner_text("#block-head"), named)
+    # The overview of a block that is not current (R27, M93): no End block, Use this block, every day opens read only.
+    go_route(page, "#/block/" + newer, "#block[data-block='%s']" % newer)
+    check(tag + "M93: a block that is not current shows no End block, and offers Use this block",
+          page.locator("#block-end").count() == 0 and page.locator("#block-use").count() == 1 and page.get_attribute("#block", "data-current") == "false")
+    page.reload(); page.wait_for_selector("#block[data-block='%s']" % newer)
+    check(tag + "C.3.2: a reload keeps that block's overview", page.locator("#block-use").count() == 1)
+    page.click("[data-blockday]"); settle(page, 400)
+    check(tag + "C.3.2 R27: a day of a block that is not current opens read only", page.evaluate("location.hash").startswith("#/day/"), page.evaluate("location.hash"))
+    go_route(page, "#/block/@@bad", "#blocks-list")
+    check(tag + "C.0.1: a bad block id goes to the block list", page.evaluate("location.hash") == "#/blocks")
+    go_route(page, "#/block/" + newer, "#block-use")
+    page.click("#block-use"); page.wait_for_selector("#today[data-day]"); settle(page, 300)
+    check(tag + "C.3.2: Use this block makes it current", page.evaluate(S3_SETTING, "active_block_id") == newer)
+    # A done block is read only.
+    page.evaluate("async (id) => { const { db } = await import('./db.js'); const b = await db.get('blocks', id); await db.put('blocks', { ...b, status: 'done', finished_at: Date.now() }); return true; }", older)
+    page.reload(); page.wait_for_selector("#today > *")
+    go_route(page, "#/block/" + older, "#block[data-block='%s']" % older)
+    check(tag + "C.3.2: a done block is read only (no Use this block, no End block)", page.locator("#block-use").count() == 0 and page.locator("#block-end").count() == 0)
+    # Delete the current block: the mark moves (S02); its rows are gone.
+    go_route(page, "#/blocks", "#blocks-list")
+    page.click("[data-blockmore='%s']" % newer); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='delete']"); page.wait_for_selector("#del-sheet")
+    page.fill("#del-sheet input", "DELETE"); page.click("#del-go"); settle(page, 600)
+    left = [r["id"] for r in h["rows"](page, "blocks")]
+    sets_left = [r["id"] for r in h["rows"](page, "sets") if r["block_id"] == newer]
+    check(tag + "AW6 S02: delete removes the block and its sets; the mark leaves it",
+          left == [older] and not sets_left and page.evaluate(S3_SETTING, "active_block_id") != newer, {"blocks": left, "mark": page.evaluate(S3_SETTING, "active_block_id")})
+    snaps = page.evaluate("async () => { const { db } = await import('./db.js'); return (await db.all('snapshots')).map(s => s.reason); }")
+    check(tag + "M51: a before-delete safety copy is kept", "before-delete" in snaps, snaps)
+    ctx.close()
+
+
+@slice3_part("chooser")
+def part_s3_chooser(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    s3_make(page, TWO_BLOCKS[:1])
+    go_route(page, "#/blocks", "#blocks-list")
+    page.click("#blocks-new"); page.wait_for_selector("#new")
+    names = page.eval_on_selector_all("#new .choice .choice-title", "els => els.map(e => e.innerText.trim())")
+    check(tag + "S03 BW1: the chooser offers the three starts, then Load a block file",
+          names == ["Build from scratch", "Start from a template", "Guided builder"] and page.locator("#new-load").count() == 1
+          and page.locator("nav.tabbar").count() == 0, names)
+    gaps = page.eval_on_selector_all("#new .choice", """els => els.map(b => { const o = b.getBoundingClientRect(), i = b.querySelector('.grow').getBoundingClientRect();
+      return [Math.round(i.top - o.top), Math.round(o.bottom - i.bottom)]; })""")
+    check(tag + "C.3.3 LOOK 3.4: each choice's words sit inside the button with room above and below (at least 8px)",
+          len(gaps) == 3 and all(a >= 8 and b >= 8 for a, b in gaps), gaps)
+    layout(page, tag, "New block chooser")
+    page.click("#new-scratch"); page.wait_for_selector("#builder[data-step='1']")
+    check(tag + "S03: Build from scratch opens the builder", True)
+    page.click("#builder-cancel"); settle(page)
+    ctx.close()
+
+
+@slice3_part("makeflags")
+def part_s3_makeflags(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    page.click("#unit-lb")
+    load_block_file(page, BLOCK_V2)
+    go_route(page, "#/builder", "#builder")
+    page.fill("#block-name", "Q")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='2']")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']"); page.wait_for_selector("#picker"); settle(page, 300)
+    page.click("#picker-make"); page.wait_for_selector("#make-sheet"); settle(page, 400)
+    qs = page.eval_on_selector_all("#make-flags [data-flagq]", "els => els.map(e => e.getAttribute('data-flagq'))")
+    check(tag + "C.2.5 item 4: Make my own exercise asks the block's three questions in his words",
+          qs == ["machine", "no_added_sets", "left_out_of_builder"] and "Made-up machine question?" in page.inner_text("#make-flags"), qs)
+    page.fill("#make-name", "Seat move")
+    for k, yes in (("machine", True), ("no_added_sets", False), ("left_out_of_builder", False)):
+        page.click("[data-flagans='%s-%s']" % (k, "yes" if yes else "no"))
+    page.click("#make-save"); settle(page, 500)
+    row = next((r for r in h["rows"](page, "exercises") if r["name"] == "Seat move"), None)
+    check(tag + "C.2.5 item 4: three answers set the flags and flags_set", row is not None and row["machine"] is True and row["flags_set"] is True, row and {k: row[k] for k in ("machine", "flags_set")})
+    ctx.close()
+
+
+# ---- Slice 3 S2 parts: templates, guided builder, levels, copy ----
+
+S3_TPL_COUNT = "async () => { const m = await import('./data/templates.js'); return m.TEMPLATES.length; }"
+
+
+def tpl_ids(page):
+    return page.eval_on_selector_all("[data-tpl]", "els => els.filter(e => e.tagName === 'BUTTON').map(e => e.getAttribute('data-tpl'))")
+
+
+def tpl_filter(page, kind, values):
+    page.click("[data-tplf='%s']" % kind); page.wait_for_selector("#tplf-sheet")
+    for v in values:
+        page.click("#tplf-sheet [data-tplopt='%s']" % v)
+    page.click("#tplf-done"); settle(page, 400)
+
+
+@slice3_part("templates")
+def part_s3_templates(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    n_ours = page.evaluate(S3_TPL_COUNT)
+    go_route(page, "#/new", "#new")
+    page.click("#new-template"); page.wait_for_selector("#tpl-list [data-tpl]"); settle(page, 300)
+    all_ids = tpl_ids(page)
+    check(tag + "S04: the browser lists every one of our templates from data/templates.js", n_ours >= 1 and len(all_ids) == n_ours, [n_ours, len(all_ids)])
+    check(tag + "S01: Templates keeps the bottom bar on the Block tab", page.locator("nav.tabbar a.is-active[data-tab='#/block']").count() == 1)
+    layout(page, tag, "template browser")
+    tpl_filter(page, "days", ["3"])
+    three = tpl_ids(page)
+    lines = page.eval_on_selector_all(".tpl-line", "els => els.map(e => e.innerText)")
+    check(tag + "S04 B11: the Days 3 filter narrows the list to 3-day templates and its chip shows the count",
+          0 < len(three) < len(all_ids) and all(l.startswith("3 days") for l in lines) and "Days 1" in page.inner_text("[data-tplf='days']")
+          and page.is_visible("#tpl-clear"), [len(three), lines[:3], page.inner_text("[data-tplf='days']")])
+    page.click("#tpl-clear"); settle(page, 300)
+    check(tag + "S04: Clear filters brings the whole list back and hides itself", len(tpl_ids(page)) == len(all_ids) and not page.is_visible("#tpl-clear"))
+    tpl_filter(page, "focus", ["even"])
+    even = tpl_ids(page)
+    check(tag + "S04: a Focus filter narrows the list", 0 < len(even) < len(all_ids), len(even))
+    page.click("#tpl-clear"); settle(page, 300)
+    first_name = page.inner_text("[data-tpl='%s'] .tpl-name" % all_ids[2]).strip()
+    page.fill("#tpl-search", first_name[:14].lower()); settle(page, 400)
+    found = tpl_ids(page)
+    check(tag + "S04: search finds a template by name, case blind", all_ids[2] in found and len(found) < len(all_ids), [first_name, found])
+    page.fill("#tpl-search", "zzzz no such"); settle(page, 400)
+    check(tag + "C.3.4: no match shows No templates match.", page.locator("#tpl-none").count() == 1 and "No templates match." in page.inner_text("#tpl-none"))
+    page.fill("#tpl-search", ""); settle(page, 400)
+    page.click("[data-tpl='%s']" % all_ids[0]); page.wait_for_selector("#template[data-tpl]"); settle(page, 300)
+    days = page.locator("[data-tplday]").count()
+    slots = page.locator("[data-tplslot]").count()
+    first_slot = page.inner_text("[data-tplslot]").split("\n")[0].strip()
+    check(tag + "r4.6 Q7: a 1-set slot in the preview reads '1 set', never '1 sets'", first_slot.endswith(", 1 set"), first_slot)
+    line = page.inner_text("[data-tplslot] .tpl-slot-line")
+    check(tag + "S05: the preview shows each day's slots with its sets, muscle, level and rep range",
+          days >= 2 and slots >= days and " set" in page.inner_text("[data-tplslot]") and " · " in line and page.locator("#tpl-delete").count() == 0
+          and page.locator("nav.tabbar").count() == 0, [days, slots, line])
+    layout(page, tag, "template preview")
+    page.click("#tpl-start"); page.wait_for_selector("#builder[data-step='2']"); settle(page, 300)
+    check(tag + "C.3.4: Start opens the builder at Rounds", True)
+    fill_change(page, "#block-rounds", "3")
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='3']")
+    built = page.locator("[data-lift]").count()
+    page.click("#builder-next"); page.wait_for_selector("#builder[data-step='4']")
+    page.click("#block-save")
+    page.wait_for_selector("#today[data-day]"); settle(page, 400)
+    blk = h["rows"](page, "blocks")
+    check(tag + "S05: Save makes a Fixed block that names its template", len(blk) == 1 and blk[0]["template_id"] == all_ids[0] and blk[0]["profile"] == "fixed"
+          and sum(len(d["lifts"]) for d in blk[0]["day_templates"]) == built and all(l["reps_left_target"] == 2 for d in blk[0]["day_templates"] for l in d["lifts"]),
+          blk and {"template_id": blk[0]["template_id"], "lifts": sum(len(d["lifts"]) for d in blk[0]["day_templates"]), "built": built})
+    # Save as template from the row menu, then it lists under Made by mine with the Mine pill; its preview deletes it.
+    go_route(page, "#/blocks", "#blocks-list")
+    bid = blk[0]["id"]
+    page.click("[data-blockmore='%s']" % bid); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='template']"); page.wait_for_selector("#tplsave-sheet")
+    page.fill("#tplsave-in", "My own copy"); page.click("#tplsave-save"); settle(page, 500)
+    check(tag + "C.3.4: Save as template shows Saved as a template.", h["toast"](page) == "Saved as a template.", h["toast"](page))
+    go_route(page, "#/templates", "#tpl-list [data-tpl]")
+    tpl_filter(page, "author", ["mine"])
+    mine = tpl_ids(page)
+    check(tag + "BW13: his template lists under Made by mine with the Mine pill", len(mine) == 1 and mine[0].startswith("m") and page.locator("[data-pill='mine']").count() == 1, mine)
+    page.click("#tpl-clear"); settle(page, 300)
+    page.click("[data-tpl='%s']" % mine[0]); page.wait_for_selector("#template[data-tpl]")
+    page.click("#tpl-delete"); page.wait_for_selector("#tpl-delete-sheet")
+    page.click("#tpl-delete-go"); page.wait_for_selector("#templates"); settle(page, 500)
+    snaps = page.evaluate("async () => { const { db } = await import('./db.js'); return (await db.all('snapshots')).map(s => s.reason); }")
+    check(tag + "M91: Delete template removes it after a before-delete safety copy", not h["rows"](page, "templates") and "before-delete" in snaps, snaps)
+    go_route(page, "#/template/@@bad", "#templates")
+    check(tag + "C.0.1: a bad template id goes to the template list", page.evaluate("location.hash") == "#/templates")
+    ctx.close()
+
+
+def g_open(page):
+    go_route(page, "#/new", "#new")
+    page.click("#new-guided"); page.wait_for_selector("#guided[data-step='1']")
+
+
+def g_add(page, level, muscles):
+    page.click("[data-lvadd='%s']" % level); page.wait_for_selector("#addmuscle-sheet")
+    for m in muscles:
+        page.click("#addmuscle-sheet [data-addmuscle='%s']" % m)
+    page.click("#addmuscle-done"); settle(page, 200)
+
+
+def g_order(page):
+    return page.evaluate("() => Object.fromEntries([...document.querySelectorAll('[data-level]')].map(c => [c.getAttribute('data-level'), [...c.querySelectorAll('[data-lvrow]')].map(r => r.getAttribute('data-lvrow'))]))")
+
+
+@slice3_part("guided")
+def part_s3_guided(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    page.evaluate("async () => { const { db } = await import('./db.js'); await db.setSetting('unit', 'lb'); return true; }")
+    g_open(page)
+    chips = page.eval_on_selector_all("[data-gdays]", "els => els.map(e => e.getAttribute('data-gdays'))")
+    check(tag + "B03 G26: step 1 offers 2 to 6 days and no 7; Next is off until one is picked",
+          chips == ["2", "3", "4", "5", "6"] and page.is_disabled("#guided-next") and page.locator("nav.tabbar").count() == 0, chips)
+    layout(page, tag, "guided step 1")
+    page.click("[data-gdays='3']"); settle(page, 200)
+    page.click("#guided-next"); page.wait_for_selector("#guided[data-step='2']")
+    empties = page.locator("[data-levelempty]").count()
+    check(tag + "ZW1: each empty level shows its line", empties == 3 and "No muscles here." in page.inner_text("[data-levelempty='top']"), empties)
+    check(tag + "C.3.5: Next stays off on step 2 with no muscle", page.is_disabled("#guided-next"))
+    g_add(page, "top", ["quads", "chest"])
+    page.click("[data-lvadd='middle']"); page.wait_for_selector("#addmuscle-sheet")
+    q = "#addmuscle-sheet [data-addmuscle='quads']"
+    check(tag + "BW3 M50: a muscle on Grow shows taken and cannot be picked for Steady",
+          page.is_disabled(q) and "on Grow" in page.inner_text(q), page.inner_text(q))
+    page.click("#addmuscle-sheet [data-addmuscle='back']"); page.click("#addmuscle-done"); settle(page, 200)
+    o1 = g_order(page)
+    check(tag + "B06 M50: each muscle sits on one level", o1 == {"top": ["quads", "chest"], "middle": ["back"], "bottom": []}, o1)
+    layout(page, tag, "guided levels")
+    page.click("[data-lvmove='chest:up']"); settle(page, 200)
+    page.click("[data-lvmove='quads:down']"); settle(page, 200)
+    o2 = g_order(page)
+    check(tag + "BW2: up moves inside a level; down past the end moves into the next level", o2 == {"top": ["chest"], "middle": ["quads", "back"], "bottom": []}, o2)
+    page.click("[data-lvmove='quads:up']"); settle(page, 200)
+    page.click("#guided-back"); page.wait_for_selector("#guided[data-step='1']")
+    page.click("#guided-next"); page.wait_for_selector("#guided[data-step='2']")
+    o3 = g_order(page)
+    check(tag + "BW2: the rank is kept after Back and Next", o3 == {"top": ["chest", "quads"], "middle": ["back"], "bottom": []}, o3)
+    check(tag + "C.3.5: the first muscle of the top level has its up shown off", page.is_disabled("[data-lvmove='chest:up']"))
+    handle = page.get_attribute("[data-drag='chest']", "aria-hidden")
+    check(tag + "r4.3 H7 c: the drag handle is aria-hidden with no label", handle == "true" and page.get_attribute("[data-drag='chest']", "aria-label") is None)
+    page.click("#level-info"); page.wait_for_selector("#levels-sheet")
+    lines = page.locator("#levels-sheet .level-line").count()
+    page.click("#levels-close"); settle(page, 200)
+    check(tag + "AW7: the levels sheet opens with the explain lines and closes", lines >= 6 and page.locator("#levels-sheet").count() == 0, lines)
+    page.click("#guided-next"); page.wait_for_selector("#guided[data-step='3']"); settle(page, 500)
+    intro = page.locator("#intro-board").count()
+    if intro:
+        page.click("#intro-ok"); settle(page, 300)
+    cards = page.locator("[data-gday]").count()
+    check(tag + "S07 BW7: Next fills the board, one card per day; the board intro shows on the first visit", cards == 3 and intro == 1, [cards, intro])
+    layout(page, tag, "guided board")
+    # Add muscle with a count of 2 adds 2 slots on that day (BW9).
+    before = page.locator("[data-gday='1'] [data-gslot]").count()
+    page.click("[data-gaddmuscle='1']"); page.wait_for_selector("#gmuscle-sheet")
+    page.click("[data-gstep='calves+']"); page.click("[data-gstep='calves+']")
+    check(tag + "r4.6 Q5: the count buttons read their own words", page.get_attribute("[data-gstep='calves+']", "aria-label") == "1 more Calves slot" and page.get_attribute("[data-gstep='calves-']", "aria-label") == "1 less Calves slot",
+          [page.get_attribute("[data-gstep='calves+']", "aria-label"), page.get_attribute("[data-gstep='calves-']", "aria-label")])
+    page.click("#gmuscle-done"); settle(page, 300)
+    after = page.locator("[data-gday='1'] [data-gslot][data-muscle='calves']").count()
+    check(tag + "BW9: a count of 2 adds 2 slots of that muscle on that day", after == 2 and page.locator("[data-gday='1'] [data-gslot]").count() == before + 2, [before, after])
+    # Fill the day to 6, then 7 (warning, Next live), then 8 (full), then a ninth is refused.
+    def day1():
+        return page.locator("[data-gday='1'] [data-gslot]").count()
+    page.click("[data-gaddmuscle='1']"); page.wait_for_selector("#gmuscle-sheet")
+    while day1() < 6:
+        page.click("[data-gstep='abs_core+']" if page.inner_text("[data-gcount='abs_core']") != "4" else "[data-gstep='biceps+']"); settle(page, 50)
+        page.click("#gmuscle-done"); settle(page, 200)
+        if day1() < 6:
+            page.click("[data-gaddmuscle='1']"); page.wait_for_selector("#gmuscle-sheet")
+    six_warn = page.locator("[data-gwarn='1']").count()
+    page.click("[data-gaddmuscle='1']"); page.wait_for_selector("#gmuscle-sheet")
+    page.click("[data-gstep='triceps+']"); page.click("#gmuscle-done"); settle(page, 300)
+    seven_warn = page.locator("[data-gwarn='1']").count()
+    check(tag + "B07 M49: 6 exercises shows no warning; 7 shows it and Next still works",
+          day1() == 7 and six_warn == 0 and seven_warn == 1 and not page.is_disabled("#guided-next") and "30 minutes" in page.inner_text("[data-gwarn='1']"), [day1(), six_warn, seven_warn])
+    page.click("[data-gaddmuscle='1']"); page.wait_for_selector("#gmuscle-sheet")
+    page.click("[data-gstep='triceps+']"); page.click("[data-gstep='triceps+']"); settle(page, 300)
+    refused = h["toast"](page)
+    page.click("#gmuscle-done"); settle(page, 300)
+    check(tag + "R4-16: a ninth exercise on a day is refused; a full day shows A day holds at most 8 exercises.",
+          day1() == 8 and refused == "A day holds at most 8 exercises." and page.is_disabled("[data-gaddmuscle='1']") and page.locator("[data-gfull='1']").count() == 1, [day1(), refused])
+    # Slot delete is one tap.
+    page.click("[data-gday='1'] [data-gslot] [data-slotdel]"); settle(page, 300)
+    check(tag + "C.3.5: a slot delete is one tap", day1() == 7)
+    # Reset gives back the step 3 layout (BW6, S06).
+    page.click("#guided-tools"); page.wait_for_selector("#gtools-sheet")
+    page.click("[data-gtool='reset']"); page.wait_for_selector("#reset-sheet")
+    page.click("#reset-sheet-go"); settle(page, 300)
+    check(tag + "BW6 S06: Reset gives back the step 3 layout", day1() == before, [day1(), before])
+    # The picker from a slot lists only that slot's muscle; a pick fills it (S12).
+    slot = page.get_attribute("[data-gday='2'] [data-gslot]", "data-gslot")
+    muscle = page.get_attribute("[data-gday='2'] [data-gslot]", "data-muscle")
+    sel = "[data-gslot='%s'] [data-slotpick]" % slot
+    if page.locator(sel).count() == 0:
+        page.click("[data-gslot='%s'] [data-slotrec]" % slot); settle(page, 400)
+    page.click(sel); page.wait_for_selector("#picker"); settle(page, 400)
+    picks = page.eval_on_selector_all("[data-pick]", "els => els.map(e => e.getAttribute('data-pick'))")
+    md = page.evaluate("async (ids) => { const m = await import('./data/exercises.js'); const by = new Map(m.SEED_EXERCISES.map(e => [e.id, e.muscle_detail])); return [...new Set(ids.map(i => by.get(i) || 'custom'))]; }", picks)
+    check(tag + "S12: the picker from a slot lists only that muscle", picks and md == [muscle], [muscle, md, len(picks)])
+    page.click("[data-pick='%s']" % picks[-1]); page.wait_for_selector("#guided[data-step='3']"); settle(page, 300)
+    got = page.inner_text("[data-gslot='%s'] .slot-ex" % slot)
+    check(tag + "S12: the pick fills the slot", page.get_attribute("[data-gslot='%s']" % slot, "data-filled") == "true", got)
+    check(tag + "r4.6 Q7: a hand pick shows no Suggest one", page.locator("[data-gslot='%s'] [data-slotrec]" % slot).count() == 0)
+    # Clear empties every pick and keeps the slots (BW6).
+    n_slots = page.locator("[data-gslot]").count()
+    page.click("#guided-tools"); page.wait_for_selector("#gtools-sheet")
+    page.click("[data-gtool='clear']"); page.wait_for_selector("#clear-sheet")
+    page.click("#clear-sheet-go"); settle(page, 300)
+    check(tag + "BW6: Clear takes every pick off and keeps the slots",
+          page.locator("[data-gslot][data-filled='true']").count() == 0 and page.locator("[data-gslot]").count() == n_slots)
+    # Suggest one fills one slot (S12, IW6).
+    first = page.get_attribute("[data-gslot]", "data-gslot")
+    page.click("[data-gslot='%s'] [data-slotrec]" % first); settle(page, 400)
+    one = page.locator("[data-gslot][data-filled='true']").count()
+    check(tag + "S12 IW6: Suggest one fills that one slot", one == 1 and page.get_attribute("[data-gslot='%s']" % first, "data-filled") == "true", one)
+    name1 = page.inner_text("[data-gslot='%s'] .slot-ex" % first)
+    has_rec = page.locator("[data-gslot='%s'] [data-slotrec]" % first).count() == 1
+    if has_rec:
+        page.click("[data-gslot='%s'] [data-slotrec]" % first); settle(page, 400)
+    name2 = page.inner_text("[data-gslot='%s'] .slot-ex" % first)
+    check(tag + "r4.6 Q7: a suggested slot keeps Suggest one, and a second tap moves to the next exercise", has_rec and name2 != name1, [name1, name2])
+    # Fill for me with Fill empty slots only fills only the empty slots and keeps the one he has (B08).
+    kept = page.inner_text("[data-gslot='%s'] .slot-ex" % first)
+    page.click("#guided-autofill"); page.wait_for_selector("#fill-sheet")
+    check(tag + "C.3.6: the Fill for me sheet has the switch on and the 10 kinds", page.get_attribute("#fill-empty", "aria-checked") == "true" and page.locator("[data-fillk]").count() == 10)
+    page.click("[data-fillk='band']"); page.click("#fill-go"); settle(page, 500)
+    filled = page.locator("[data-gslot][data-filled='true']").count()
+    check(tag + "B08: Fill for me fills the empty slots and keeps the one he had", filled > 1 and page.inner_text("[data-gslot='%s'] .slot-ex" % first) == kept, [filled, kept])
+    layout(page, tag, "guided board filled")
+    # Add day and Take out this day.
+    page.click("#guided-addday"); settle(page, 300)
+    four = page.locator("[data-gday]").count()
+    page.click("[data-gremoveday='4']"); settle(page, 300)
+    check(tag + "BW6 S06: Add day adds a day; Take out this day takes an empty one off at once", four == 4 and page.locator("[data-gday]").count() == 3)
+    page.click("#guided-next"); page.wait_for_selector("#guided[data-step='4']"); settle(page, 400)
+    review_days = page.locator("[data-greview]").count()
+    check(tag + "C.3.5: Review lists every day with its lifts", review_days == 3 and not page.is_disabled("#guided-save"), review_days)
+    layout(page, tag, "guided review")
+    page.fill("#guided-name", "Guided e2e")
+    page.click("#guided-save"); page.wait_for_selector("#today[data-day]"); settle(page, 400)
+    blk = h["rows"](page, "blocks")
+    check(tag + "C.3.5: Save makes a Fixed block with his levels", len(blk) == 1 and blk[0]["profile"] == "fixed" and blk[0]["levels"].get("chest") == "top"
+          and blk[0]["levels"].get("back") == "middle" and blk[0]["name"] == "Guided e2e", blk and blk[0]["levels"])
+    # The board intro never shows twice (BW7).
+    g_open(page)
+    page.click("[data-gdays='2']"); page.click("#guided-next"); page.wait_for_selector("#guided[data-step='2']")
+    g_add(page, "top", ["chest"])
+    page.click("#guided-next"); page.wait_for_selector("#guided[data-step='3']"); settle(page, 600)
+    check(tag + "BW7: the board intro does not show on a second visit", page.locator("#intro-board").count() == 0)
+    ctx.close()
+
+
+@slice3_part("levels")
+def part_s3_levels(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    (bid,) = s3_make(page, TWO_BLOCKS[:1])
+    go_route(page, "#/block", "#levels-row")
+    check(tag + "C.3.7: the overview of the current block has the Muscle levels row first", page.inner_text("#block-links .row").startswith("Muscle levels"))
+    page.click("#levels-row"); page.wait_for_selector("#levels[data-block]"); settle(page, 400)
+    o = g_order(page)
+    check(tag + "C.3.7: a block with no levels shows every muscle it trains on Steady with the unsaved line",
+          page.locator("#levels-unsaved").count() == 1 and "Steady" in page.inner_text("#levels-unsaved") and not o["top"] and len(o["middle"]) >= 2, o)
+    layout(page, tag, "muscle levels")
+    first = o["middle"][0]
+    page.click("[data-lvmove='%s:up']" % first); settle(page, 200)
+    page.click("#levels-save"); page.wait_for_selector("#block[data-block]"); settle(page, 400)
+    lv = h["rows"](page, "blocks")[0]["levels"]
+    check(tag + "E15 C.3.7: Save levels writes the new level", lv.get(first) == "top", lv)
+    page.click("#levels-row"); page.wait_for_selector("#levels[data-block]"); settle(page, 300)
+    check(tag + "C.3.7: after a save the unsaved line is gone", page.locator("#levels-unsaved").count() == 0)
+    ctx.close()
+
+
+@slice3_part("copy")
+def part_s3_copy(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    (bid,) = s3_make(page, TWO_BLOCKS[:1])
+    page.evaluate("async () => { const { db } = await import('./db.js'); await db.setSetting('unit', 'kg'); return true; }")
+    go_route(page, "#/blocks", "#blocks-list")
+    page.click("[data-blockmore='%s']" % bid); page.wait_for_selector("#row-menu")
+    page.click("#row-menu [data-rowitem='copy']"); page.wait_for_selector("#copy[data-step='1'] [data-copyround]"); settle(page, 300)
+    rounds = page.eval_on_selector_all("[data-copyround]", "els => els.map(e => e.getAttribute('data-copyround'))")
+    check(tag + "C.3.8: step 1 offers every round of a block with a length", rounds == ["1", "2", "3"] and page.locator("nav.tabbar").count() == 0, rounds)
+    layout(page, tag, "copy step 1")
+    page.click("[data-copyround='1']"); page.wait_for_selector("#copy[data-step='2'] #copy-unit"); settle(page, 300)
+    check(tag + "B09: Review says the weights stay in the source unit (lb) with Settings on kg", "lb" in page.inner_text("#copy-unit") and page.locator("[data-copylift]").count() == 3, page.inner_text("#copy-unit"))
+    layout(page, tag, "copy review")
+    page.click("#copy-next"); page.wait_for_selector("#copy-go")
+    page.click("#copy-go"); page.wait_for_selector("#switch-sheet")
+    page.click("#switch-no"); page.wait_for_selector("#blocks-list"); settle(page, 400)
+    blks = h["rows"](page, "blocks")
+    c = [b for b in blks if b["id"] != bid]
+    check(tag + "AW4 B09 M74: the copy has the same days and exercises, keeps lb, names its source, and took no mark",
+          len(c) == 1 and c[0]["unit"] == "lb" and c[0]["copied_from"] == {"block_id": bid, "pass": 1}
+          and [[l["exercise_id"] for l in d["lifts"]] for d in c[0]["day_templates"]] == [[l["exercise_id"] for l in d["lifts"]] for d in [b for b in blks if b["id"] == bid][0]["day_templates"]]
+          and page.evaluate(S3_SETTING, "active_block_id") == bid, c and {"unit": c[0]["unit"], "copied_from": c[0]["copied_from"]})
+    go_route(page, "#/copy/@@bad", "#blocks-list")
+    check(tag + "C.0.1: a bad copy id goes to the block list", page.evaluate("location.hash") == "#/blocks")
+
+# ---- Slice 3 parts, track S3 (17 C.3.9 to C.3.16) ----
+
+def s3_log_day(page):
+    """Tick every set of the day on Today, then Finish day and close the nudge; stays on Day done."""
+    page.wait_for_selector("#today[data-day]")
+    guard = 0
+    while open_set(page) and guard < 40:
+        tick(page, fb="save")
+        guard += 1
+    return finish(page, stay=True)
+
+
+def s3_day_item(page, item):
+    page.click("#day-menu")
+    page.wait_for_selector("#day-menu-sheet")
+    page.click("#day-menu-sheet [data-dayitem='%s']" % item)
+
+
+ONE_DAY = lambda name, passes, sets=1: {"name": name, "passes": passes, "activate": True, "days": [{"label": "A", "lifts": [["leg_press", sets, 100]]}]}
+
+
+@slice3_part("finished")
+def part_s3_finished(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    bid = s3_make(page, [ONE_DAY("Last day block", 1)])[0]
+    go_route(page, "#/today", "#today[data-day]")
+    nudges = {"n": 0}
+    page.expose_function("__s3nudge", lambda: nudges.__setitem__("n", nudges["n"] + 1))
+    page.evaluate("() => { new MutationObserver(() => { const n = document.getElementById('nudge'); if (n && !n.dataset.seen) { n.dataset.seen = '1'; window.__s3nudge(); } }).observe(document.body, { childList: true, subtree: true }); }")
+    s3_log_day(page)
+    at_day_done = page.locator("#daydone").count() == 1
+    page.click("#done-go")
+    page.wait_for_selector("#finished #fin-new")
+    settle(page, 1200)
+    blk = next(b for b in h["rows"](page, "blocks") if b["id"] == bid)
+    check(tag + "S19 C.3.9: the last day of the last round shows Block finished with Start a new block and Copy this block",
+          at_day_done and page.locator("#finished #fin-new.btn-primary").count() == 1 and page.locator("#finished #fin-copy.btn-secondary").count() == 1
+          and page.text_content("#fin-name").strip() == "Last day block" and page.locator(".tabbar").count() == 0
+          and blk["status"] == "done" and isinstance(blk["finished_at"], (int, float)), {"block": [blk["status"], blk["finished_at"]]})
+    rows_ = page.eval_on_selector_all("#finished [data-fin]", "els => els.map(e => [e.getAttribute('data-fin'), e.innerText.replace(/\\s+/g, ' ').trim()])")
+    check(tag + "C.3.9: the stat rows read 1 round done and 1 day done; a zero row is left out",
+          rows_ == [["fin.rounds", "1 round done"], ["fin.days", "1 day done"]], rows_)
+    check(tag + "C.3.9 R22: the whole last-day chain shows exactly one backup nudge", nudges["n"] == 1 and page.locator("#nudge").count() == 0, nudges)
+    layout(page, tag, "block finished")
+    go_route(page, "#/today", "#block-done")
+    check(tag + "C.3.9: Today then shows Block finished with Start a new block and Copy this block, no line",
+          page.locator("#block-done #fin-new").count() == 1 and page.locator("#block-done #fin-copy").count() == 1 and page.locator("#block-done .lead").count() == 0)
+    page.click("#block-done #fin-new"); page.wait_for_selector("#new")
+    check(tag + "C.3.9: Start a new block opens the chooser", page.evaluate("location.hash") == "#/new")
+    go_route(page, "#/finished/@@bad", "#today > *")
+    check(tag + "C.0.1: a bad #/finished/ id goes to Today", page.evaluate("location.hash") == "#/today")
+    ctx.close()
+
+
+@slice3_part("summary")
+def part_s3_summary(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    spec = {"name": "Summary block", "passes": 3, "activate": True, "days": [{"label": "A", "lifts": [["leg_press", 2, 150], ["lat_pulldown", 2, 100]]},
+                                                                         {"label": "B", "lifts": [["chest_press_machine", 2, 80]]}]}
+    bid = s3_make(page, [spec])[0]
+    go_route(page, "#/today", "#today[data-day]")
+    s3_log_day(page)
+    go_route(page, "#/summary/" + bid, "#summary-switch")
+    tiles = page.eval_on_selector_all("#sum-tiles [data-tile]", "els => els.map(e => [e.getAttribute('data-tile'), e.querySelector('.sum-n').innerText.trim()])")
+    page.click("#summary-switch [data-seg='1']"); page.wait_for_selector("#sum-muscles")
+    head = page.eval_on_selector_all("#sum-muscles thead th", "els => els.map(e => e.textContent.trim())")
+    body = page.eval_on_selector_all("#sum-muscles tbody tr", "els => els.map(e => [e.getAttribute('data-muscle'), ...[...e.querySelectorAll('td')].map(td => td.innerText.trim())])")
+    exs = {e["id"]: e for e in h["rows"](page, "exercises")}
+    want = {}
+    seen = set()
+    for x in h["rows"](page, "sets"):
+        if x["block_id"] != bid or x["kind"] != "work" or x["status"] != "done":
+            continue
+        k = (x["day_id"], x["slot"], x["set_n"])
+        if k in seen:
+            continue
+        seen.add(k)
+        e = exs[x["exercise_id"]]
+        m = e.get("muscle_detail") or e.get("muscle")
+        want[m] = want.get(m, 0) + 1
+    got = {r[0]: r[1:] for r in body}
+    check(tag + "S14 S15: mid block the summary shows the day counts and a per-round sets-per-muscle table",
+          tiles == [["done", "1"], ["skipped", "0"], ["notdone", "5"]] and head == ["Muscle", "R1", "R2", "R3"]
+          and set(got) == set(want) and all(got[m] == [str(want[m]), "0", "0"] for m in want), {"tiles": tiles, "head": head, "got": got, "want": want})
+    layout(page, tag, "summary muscles")
+    page.click("#summary-switch [data-seg='2']"); page.wait_for_selector("#sum-exercises")
+    ids = page.eval_on_selector_all("[data-sumex]", "els => els.map(e => e.getAttribute('data-sumex'))")
+    check(tag + "C.3.10: the Exercises page lists the exercises done in this block", sorted(ids) == ["lat_pulldown", "leg_press"], ids)
+    page.click("[data-sumex='leg_press']"); page.wait_for_selector("#summary .trend")
+    check(tag + "C.3.10: an exercise opens its table and trend line for this block only",
+          page.locator("#summary [data-histblock]").count() == 1 and page.locator("#summary .hist-round").count() == 1)
+    go_route(page, "#/summary/@@bad", "#blocks-list")
+    check(tag + "C.0.1: a bad #/summary/ id goes to the block list", page.evaluate("location.hash") == "#/blocks")
+    ctx.close()
+
+
+@slice3_part("grid")
+def part_s3_grid(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    spec = {"name": "Grid block", "passes": 2, "activate": True, "days": [{"label": "A", "lifts": [["leg_press", 1, 150]]}, {"label": "B", "lifts": [["lat_pulldown", 1, 100]]}]}
+    bid = s3_make(page, [spec])[0]
+    go_route(page, "#/block", "#round-grid")
+    cols = page.eval_on_selector_all("#round-grid [data-round]", "els => els.map(e => e.innerText.replace(/\\s+/g, ' ').trim())")
+    cells = page.eval_on_selector_all("#round-grid [data-blockday]", "els => els.map(e => [e.getAttribute('data-blockday').split(':').slice(-2).join(':'), e.getAttribute('data-cell')])")
+    check(tag + "S11 C.3.11: the grid shows one column per round and one cell per day with its state (Fixed: no goal line)",
+          cols == ["R1", "R2"] and cells == [["p1:d1", "now"], ["p2:d1", "notplanned"], ["p1:d2", "planned"], ["p2:d2", "notplanned"]], {"cols": cols, "cells": cells})
+    check(tag + "C.3.11 r4.6 Q2: both minus and plus show on Fixed, live", page.is_enabled("#grid-less") and page.is_enabled("#grid-more"))
+    # The grid is a real grid on screen: each day row on one line, each round's cell under its own
+    # round head (a by-eye look found every cell stacked under R1 when the buttons were the cells).
+    geo = page.evaluate("""() => { const box = (e) => e.getBoundingClientRect();
+      const heads = [...document.querySelectorAll('#round-grid [data-round]')].map(e => { const b = box(e); return b.left + b.width / 2; });
+      return [...document.querySelectorAll('#round-grid [data-gridday]')].map(r => [...r.querySelectorAll('[data-blockday]')].map((c, i) => {
+        const b = box(c); return { top: Math.round(b.top), mid: Math.abs(b.left + b.width / 2 - heads[i]) < 2 }; })); }""")
+    check(tag + "S11 C.3.11: each day's cells sit on one line, each under its round head",
+          len(geo) == 2 and all(len(r) == 2 and len({c["top"] for c in r}) == 1 and all(c["mid"] for c in r) for r in geo)
+          and geo[0][0]["top"] < geo[1][0]["top"], geo)
+    layout(page, tag, "round grid")
+    page.click("#grid-more"); settle(page, 500)
+    check(tag + "C.3.11: plus adds a round at once and the toast shows the count",
+          h["toast"](page) == "Rounds: 3" and page.locator("#round-grid [data-round]").count() == 3)
+    page.click("#grid-less"); page.wait_for_selector("#grid-remove")
+    off0 = page.is_disabled("#grid-remove-go")
+    page.fill("#grid-remove input", "REMOV")
+    off1 = page.is_disabled("#grid-remove-go")
+    page.fill("#grid-remove input", "REMOVE")
+    check(tag + "M59: minus stays disabled until REMOVE is typed", off0 and off1 and page.is_enabled("#grid-remove-go"), [off0, off1])
+    page.click("#grid-remove-go"); settle(page, 600)
+    check(tag + "C.3.11: REMOVE takes the round off the end", next(b for b in h["rows"](page, "blocks") if b["id"] == bid)["passes"] == 2)
+    page.click("#round-grid [data-blockday$=':p1:d2']"); page.wait_for_selector("#dayview")
+    check(tag + "S11: a day that is not the current one opens read only", page.get_attribute("#dayview", "data-state") == "later")
+    go_route(page, "#/block", "#round-grid")
+    page.click("#round-grid [data-cell='now']"); page.wait_for_selector("#today[data-day]")
+    check(tag + "S11: the current cell goes to Today", page.evaluate("location.hash") == "#/today")
+    # Down to 1 round: minus then shows its reason (r4.6 Q2, grid.min).
+    go_route(page, "#/block", "#round-grid")
+    page.click("#grid-less"); page.wait_for_selector("#grid-remove")
+    page.fill("#grid-remove input", "REMOVE"); page.click("#grid-remove-go"); settle(page, 600)
+    check(tag + "C.3.11 r4.6 Q2: at 1 round minus is disabled with grid.min",
+          page.is_disabled("#grid-less") and page.inner_text("#grid-less-why").strip() == "A block needs at least 1 round.", page.inner_text("#grid-count"))
+    ctx.close()
+    # r4.6 Q1: REMOVE at the start of the last round finishes the block.
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    bid = s3_make(page, [ONE_DAY("Two round block", 2)])[0]
+    go_route(page, "#/today", "#today[data-day]")
+    s3_log_day(page)
+    page.click("#done-go"); page.wait_for_selector("#today[data-day]")
+    go_route(page, "#/block", "#round-grid")
+    page.click("#grid-less"); page.wait_for_selector("#grid-remove")
+    end_line = page.locator("#grid-remove-end").count() == 1
+    page.fill("#grid-remove input", "REMOVE"); page.click("#grid-remove-go")
+    try:
+        page.wait_for_selector("#finished #fin-new", timeout=8000)
+        fin = True
+    except Exception:
+        fin = False
+    blk = next(b for b in h["rows"](page, "blocks") if b["id"] == bid)
+    check(tag + "r4.6 Q1: REMOVE at the start of the last round shows end.line, deletes its planned day and opens Block finished",
+          end_line and fin and blk["status"] == "done" and blk["passes"] == 1 and not [d for d in h["rows"](page, "days") if d["pass"] == 2],
+          {"end line": end_line, "finished": fin, "block": [blk["status"], blk["passes"]]})
+    ctx.close()
+
+
+@slice3_part("history")
+def part_s3_history(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    go_route(page, "#/history", "#history-none")
+    check(tag + "C.3.12: with no finished day History shows its empty state", page.inner_text("#history-none h2").strip() == "Nothing logged yet")
+    go_route(page, "#/today", "#today > *")
+    s3_make(page, [ONE_DAY("History block", 3, sets=2)])
+    for _ in range(2):
+        go_route(page, "#/today", "#today[data-day]")
+        s3_log_day(page)
+        page.click("#done-go")
+    go_route(page, "#/history", "#history-days")
+    rows_ = page.eval_on_selector_all("[data-histday]", "els => els.map(e => e.querySelector('.hist-pos').innerText.trim())")
+    check(tag + "S13 C.3.12: Days lists the finished days newest first by place, under the block label",
+          rows_ == ["R2 D1 A", "R1 D1 A"] and page.text_content("[data-histlabel]").strip() == "BLOCK: History block", rows_)
+    check(tag + "C.3.12: a day row's second line reads date, time and the set count", " · 2 sets" in page.inner_text("[data-histday] .hist-when"))
+    ink = page.evaluate("""() => { const s = document.querySelector('[data-histday] .tally-stroke.is-done'); const g = document.createElement('span');
+      g.className = 'tally-stroke'; document.body.appendChild(g); const ghost = getComputedStyle(g).backgroundColor; g.remove();
+      return s ? { done: getComputedStyle(s).backgroundColor, ghost, h: s.getBoundingClientRect().height } : null; }""")
+    check(tag + "C.3.12 LOOK 4.8: a History day row draws the large tally, done strokes in ink, not ghost",
+          ink is not None and ink["done"] != ink["ghost"] and ink["h"] >= 30, ink)
+    layout(page, tag, "history days")
+    page.click("#history-switch [data-seg='1']"); page.wait_for_selector("[data-histex]")
+    page.click("[data-histex='leg_press']"); page.wait_for_selector("#history .trend")
+    dots = page.locator("#history .trend .trend-dot").count()
+    aria = page.get_attribute("#history .trend", "aria-label")
+    last = page.get_attribute("#history .trend .trend-last", "data-last")
+    check(tag + "S13 C.3.12: the trend line has one dot per round, the last one labeled, and an aria-label in words",
+          dots == 2 and last == "100" and aria.startswith("Leg press: top set 100 to 100 lb over 2 rounds") and page.locator("#history .trend title").count() == 1, [dots, last, aria])
+    rounds = page.eval_on_selector_all("#history .hist-round", "els => els.map(e => e.innerText.replace(/\\s+/g, ' ').trim())")
+    check(tag + "C.3.12: the by-round table shows each round's sets as load x reps", rounds[0].startswith("R1") and re.search(r"100 x \d+", rounds[0]) is not None, rounds)
+    layout(page, tag, "history by exercise")
+    page.reload(); page.wait_for_selector("#history-days")
+    check(tag + "C.3.12: the view switch resets to Days after a reload (kept in memory only)", page.get_attribute("#history", "data-view") == "days")
+    page.click("[data-histday]"); page.wait_for_selector("#dayview")
+    check(tag + "C.3.12: a History day opens the read-only day view", page.get_attribute("#dayview", "data-state") == "done")
+    ctx.close()
+
+
+@slice3_part("library")
+def part_s3_library(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    s3_make(page, [ONE_DAY("Library block", 2)])
+    go_route(page, "#/today", "#today[data-day]")
+    s3_log_day(page)
+    page.click("#done-go")
+    go_route(page, "#/block", "#lib-row")
+    page.click("#lib-row"); page.wait_for_selector("#lib-list [data-libex]")
+    n = page.locator("[data-libex]").count()
+    names = page.eval_on_selector_all("[data-libex]", "els => els.map(e => e.querySelector('.grow span').innerText.trim().toLowerCase())")
+    check(tag + "AW2 C.3.13: the library lists every exercise by name", n == len(h["rows"](page, "exercises")) and names == sorted(names), n)
+    layout(page, tag, "library")
+    page.click("[data-libf='logged']"); settle(page, 300)
+    check(tag + "AW2 IW2: Logged only shows only exercises with a done set", page.eval_on_selector_all("[data-libex]", "els => els.map(e => e.getAttribute('data-libex'))") == ["leg_press"])
+    page.click("[data-libf='logged']"); settle(page, 300)
+    page.click("[data-libf='muscle']"); page.wait_for_selector("#libpick-muscle")
+    page.click("[data-libpick='calves']"); page.click("#libpick-close"); settle(page, 300)
+    calves = page.eval_on_selector_all("[data-libex]", "els => els.map(e => e.getAttribute('data-libex'))")
+    ex = {e["id"]: e for e in h["rows"](page, "exercises")}
+    check(tag + "IW2: the Muscle filter narrows to that muscle and its chip shows the count",
+          calves and all(ex[i].get("muscle_detail") == "calves" for i in calves) and page.inner_text("[data-libf='muscle']").strip() == "Muscle 1", calves[:4])
+    page.click("#lib-clear"); settle(page, 300)
+    # Equipment starts at saved equipment.
+    page.evaluate(S3_PUT_SETTING, ["equipment_saved", ["machine", "smith", "cable", "barbell", "landmine", "dumbbell", "kettlebell", "body", "other"]])
+    page.reload(); page.wait_for_selector("#lib-list [data-libex]")
+    ids = page.eval_on_selector_all("[data-libex]", "els => els.map(e => e.getAttribute('data-libex'))")
+    check(tag + "C.3.13: the equipment filter starts at the saved kinds", page.inner_text("[data-libf='equipment']").strip() == "Equipment 9"
+          and not any(ex[i].get("equipment_detail") == "band" for i in ids), page.inner_text("#lib-filters"))
+    # Exercise detail: the pinned note from Edit note, after a reload (L10); the link; History.
+    go_route(page, "#/exercise/leg_press", "#exd-switch")
+    page.click("#exd-editnote"); page.wait_for_selector("#exnote-sheet")
+    page.fill("#exnote-in", "Seat 5, pin 3")
+    page.click("#exnote-save"); settle(page, 400)
+    page.evaluate("async () => { const { db } = await import('./db.js'); const { createStore } = await import('./store.js'); await createStore({ db }).saveExerciseText('leg_press', 'link', 'https://example.com/watch?v=1'); return true; }")
+    page.reload(); page.wait_for_selector("#exd-switch")
+    a = page.locator("#exd-link")
+    check(tag + "AW3 IW3 L10: the pinned note shows after a reload; the link is an <a> with both rel words and no player",
+          page.inner_text("#exd-note").strip() == "Seat 5, pin 3" and a.count() == 1 and a.get_attribute("rel") == "noopener noreferrer"
+          and a.get_attribute("href") == "https://example.com/watch?v=1" and page.locator("iframe, video, embed").count() == 0)
+    check(tag + "C.3.14: Edit note never marks the row edited", not ex["leg_press"].get("edited") and not next(e for e in h["rows"](page, "exercises") if e["id"] == "leg_press").get("edited"))
+    layout(page, tag, "exercise detail")
+    page.click("#exd-switch [data-seg='1']"); page.wait_for_selector("#exd-body [data-histblock]")
+    check(tag + "AW3 IW4: the History tab lists past sets", re.search(r"100 x \d+", page.inner_text("#exd-body")) is not None, page.inner_text("#exd-body")[:120])
+    go_route(page, "#/exercise/@@bad", "#library")
+    check(tag + "C.0.1: a bad #/exercise/ id goes to the library", page.evaluate("location.hash") == "#/exercises")
+    ctx.close()
+
+
+@slice3_part("bodyweight")
+def part_s3_bodyweight(h):
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    s3_make(page, [ONE_DAY("Weight block", 2)])
+    go_route(page, "#/today", "#today[data-day]")
+    s3_day_item(page, "bw"); page.wait_for_selector("#bw-sheet")
+    layout(page, tag, "body weight sheet")
+    page.fill("#bw-in", "1001"); page.click("#bw-save"); settle(page, 300)
+    refused = page.inner_text("#bw-help").strip() == "Use a number from 20 to 1000" and page.locator("#bw-sheet").count() == 1
+    page.fill("#bw-in", "182,5"); page.click("#bw-save"); settle(page, 500)
+    did = page.get_attribute("#today", "data-day")
+    day = next(d for d in h["rows"](page, "days") if d["id"] == did)
+    check(tag + "DW8 C.3.15: 1001 is refused with num.bw; 182,5 saves 182.5 on the day", refused and day["body_weight"] == 182.5, {"refused": refused, "bw": day["body_weight"]})
+    s3_log_day(page)
+    page.click("#done-go")
+    flat = page.evaluate("async () => { const { db } = await import('./db.js'); const { createStore } = await import('./store.js'); return (await createStore({ db }).backupObject()).flat_log; }")
+    check(tag + "O06 DW8: the backup's flat_log carries body_weight on every row of that day", flat and all(r["body_weight"] == 182.5 for r in flat), [r.get("body_weight") for r in flat][:3])
+    go_route(page, "#/history", "#history-days")
+    check(tag + "C.3.15: History shows the body weight on the day's second line", "182.5 lb body weight" in page.inner_text("[data-histday] .hist-when"))
+    ctx.close()
+
+
+@slice3_part("tips")
+def part_s3_tips(h):
+    tag = h["tag"]
+    audit = h["audit"]
+    def tipless():
+        c, p = new_context(h["browser"], audit, standalone=True, vp=h["vp"], intros=False)
+        p.set_default_timeout(10000)
+        p.goto(h["base"]); p.wait_for_selector("#today > *", timeout=15000); wait_controller(p); settle(p, 300)
+        return c, p
+    ctx, page = tipless()
+    s3_unit_first(page)
+    s3_make(page, [{"name": "Tip block", "passes": 2, "activate": True, "days": [{"label": "A", "lifts": [["leg_press", 2, 100], ["lat_pulldown", 2, 80]]}]}])
+    go_route(page, "#/today", "#today[data-day]")
+    first = page.evaluate("() => { const t = document.getElementById('tip'); const c = document.querySelector('#today .ex-card'); return !!t && !!c && t.getAttribute('data-tip') === 'tip_warmup' && (t.compareDocumentPosition(c) & 4) > 0; }")
+    check(tag + "S17 W03: a round 1 day shows the warm-up tip above the first card", first and "log the weight you really lift" in page.inner_text("#tip"))
+    layout(page, tag, "warm-up tip")
+    tick(page, fb="save"); settle(page, 400)
+    check(tag + "S17: after the first tick the rest tip shows (the newest event wins)", page.get_attribute("#tip", "data-tip") == "tip_rest", page.get_attribute("#tip", "data-tip") if page.locator("#tip").count() else None)
+    page.click("#tip-close"); settle(page, 400)
+    page.reload(); page.wait_for_selector("#today[data-day]"); settle(page, 400)
+    seen = page.evaluate(S3_SETTING, "tips_seen")
+    tick(page, fb="save"); settle(page, 400)
+    check(tag + "M69: a closed tip does not come back after a reload", (seen or {}).get("tip_rest") is True
+          and not (page.locator("#tip").count() and page.get_attribute("#tip", "data-tip") == "tip_rest"), seen)
+    # A swap: the start tip under the new card (DW4).
+    page.click("[data-menu]"); page.wait_for_selector("#card-menu")
+    page.click("#card-menu [data-cardmenu='3'], #card-menu [data-item='3']")
+    page.wait_for_selector("#picker"); settle(page, 400)
+    if page.locator("#intro-ok").count():
+        page.click("#intro-ok"); settle(page, 300)
+    page.click("[data-pick='leg_extension']"); page.wait_for_selector("#today[data-day]"); settle(page, 500)
+    check(tag + "DW4: after a swap the start tip shows under the new card",
+          page.locator("#tip[data-tip='tip_start']").count() == 1 and page.evaluate("() => { const t = document.getElementById('tip'); const c = t && t.previousElementSibling; return !!c && c.getAttribute('data-exercise') === 'leg_extension'; }"))
+    ctx.close()
+    # One-time intros: the builder intro, then the picker intro, each once only (BW7).
+    ctx, page = tipless()
+    s3_unit_first(page)
+    build_click(page, "#setup-build")
+    page.wait_for_selector("#intro-sheet[data-intro='intro_builder']")
+    check(tag + "C.3.16: the builder intro shows on the first visit with Got it", page.inner_text("#intro-ok").strip() == "Got it")
+    page.click("#intro-ok"); settle(page, 300)
+    page.fill("#block-name", "Intro block"); page.click("#builder-next"); page.wait_for_selector("#builder[data-step='2']"); settle(page, 300)
+    builder_again = page.locator("#intro-sheet").count()
+    fill_change(page, "#block-rounds", "2"); page.click("#builder-next"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']"); page.wait_for_selector("#intro-sheet[data-intro='intro_picker']")
+    page.click("#intro-ok"); settle(page, 300)
+    page.click("#picker-back"); page.wait_for_selector("#builder[data-step='3']")
+    page.click("[data-addex='0']"); page.wait_for_selector("#picker"); settle(page, 600)
+    page.reload(); page.wait_for_selector("#builder, #picker, #today > *"); settle(page, 600)
+    seen = page.evaluate(S3_SETTING, "tips_seen") or {}
+    check(tag + "BW7 C.3.16: each intro shows once only, and is kept after a reload",
+          builder_again == 0 and page.locator("#intro-sheet").count() == 0 and seen.get("intro_builder") is True and seen.get("intro_picker") is True, seen)
+    ctx.close()
+
+
 # ---------------- suite upgrade (16 B.12 row "e2e.py --suite upgrade", r4.4 R8) ----------------
 
 # The last schema 1 build: the live public 0.2.6, the same app files as main 383be49, the commit
@@ -3934,6 +4939,28 @@ def make_old_build(base, name):
     v = open(os.path.join(dst, "version.js")).read()
     if ("APP_VERSION = '%s'" % OLD_VERSION) not in v or "SCHEMA = 1" not in v:
         raise RuntimeError("the archived build is not %s on schema 1" % OLD_VERSION)
+    return dst
+
+
+# The published 0.3.0 (public 5e6fb60, the tree of main 84bb94e): the last build before Slice 3.
+OLD030_COMMIT = "5e6fb60"
+PREV_VERSION = "0.3.0"
+
+
+def make_archive_build(base, name, commit, version, schema):
+    """A served copy of a published build: git archive of commit, scripts/ left out of the served copy."""
+    src = os.path.join(base, name + "-archive")
+    dst = os.path.join(base, name)
+    for p_ in (src, dst):
+        shutil.rmtree(p_, ignore_errors=True)
+    os.makedirs(src)
+    repo = os.environ.get("LIFTLOG_SOURCE_REPO") or APP_DIR
+    tar = subprocess.run(["git", "-C", repo, "archive", "--format=tar", commit], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", src], input=tar, check=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("scripts"))
+    v = open(os.path.join(dst, "version.js")).read()
+    if ("APP_VERSION = '%s'" % version) not in v or ("SCHEMA = %d" % schema) not in v:
+        raise RuntimeError("the archived build is not %s on schema %d" % (version, schema))
     return dst
 
 
@@ -4225,7 +5252,59 @@ def suite_upgrade(browser, base, cb):
         check(tag + "(6) both tabs wrote nothing after the close", norm_stores(json.loads(after)) == before)
         ctx.close()
 
-    for name, fn in (("main", case_main), ("abort", case_abort), ("twotabs", case_two_tabs)):
+    # (7) Slice 3 (DoD T3, schema unchanged at 2): the published 0.3.0 build logs real rows, then
+    # 0.4.0 takes the origin. Every row of every store is kept as it was, no upgrade copy is made
+    # (no schema change), the db stays at version 2, and the logged day shows in History.
+    def case_from030():
+        old030 = make_archive_build(cb, "upgrade-030", OLD030_COMMIT, PREV_VERSION, 2)
+        SERVE["app"] = old030
+        ctx, p1 = new_context(browser, audit, standalone=True)
+        p1.add_init_script(PIN_OLD)
+        p1.set_default_timeout(10000)
+        p1.goto(base)
+        p1.wait_for_selector("#today > *", timeout=15000)
+        wait_controller(p1)
+        check(tag + "(7) the old tab runs " + PREV_VERSION, p1.evaluate("async () => (await import('./version.js')).APP_VERSION") == PREV_VERSION)
+        p1.click("#unit-lb")
+        load_block_file(p1, os.path.join(old030 + "-archive", "scripts", "tests", "fixtures", "block_v2.json"))
+        check(tag + "(7) 0.3.0: round 1 day 1 finished with feedback", old_day(p1))
+        sid = open_set(p1)
+        if sid:
+            p1.click(q(sid) + " [data-step='load+']"); settle(p1, 500)   # a draft on the next day
+        before = {s_: p1.evaluate(DB_ALL, s_) for s_ in ("settings", "exercises", "templates", "blocks", "days", "sets", "feedback", "snapshots")}
+        p1.close()
+        SERVE["app"] = NEW
+        p2 = new_page(ctx, audit)
+        p2.set_default_timeout(10000)
+        p2.goto(base)
+        took = wait_new(p2)
+        check(tag + "(7) a new tab takes " + APP_VERSION, took)
+        if not took:
+            ctx.close()
+            return
+        p2.wait_for_selector("#today > *", timeout=15000)
+        settle(p2, 800)
+        after = {s_: p2.evaluate(DB_ALL, s_) for s_ in before}
+        n = lambda rows_: sorted(json.dumps(r_, sort_keys=True) for r_ in rows_)
+        same = {s_: n(after[s_]) == n(before[s_]) for s_ in ("exercises", "templates", "blocks", "days", "sets", "feedback", "snapshots")}
+        old_keys = {r_["key"]: r_ for r_ in before["settings"]}
+        new_keys = {r_["key"]: r_ for r_ in after["settings"]}
+        # seeded_version is the seed upsert's own marker: it moves to the new version by design (5.2).
+        changed = sorted(k_ for k_, v_ in old_keys.items() if new_keys.get(k_) != v_ and k_ != "seeded_version")
+        settings_kept = not changed and (new_keys.get("seeded_version") or {}).get("value") == APP_VERSION
+        added = sorted(set(new_keys) - set(old_keys))
+        check(tag + "(7) every 0.3.0 row is kept deep-equal on 0.4.0 (exercises, blocks, days, sets, answers, copies) and every setting kept",
+              all(same.values()) and settings_kept, {"same": same, "changed": [(k_, old_keys[k_].get("value"), (new_keys.get(k_) or {}).get("value")) for k_ in changed], "added": added})
+        check(tag + "(7) only device keys are added (seen_version on the first 0.4.0 boot)", set(added) <= {"seen_version", "tips_seen"}, added)
+        check(tag + "(7) no before-upgrade copy is made and the db stays at version 2",
+              not any(s_["reason"] == "before-upgrade" for s_ in after["snapshots"]) and p2.evaluate(DB_INFO) == 2, p2.evaluate(DB_INFO))
+        go_route(p2, "#/history", "#history")
+        settle(p2, 600)
+        check(tag + "(7) the day logged on 0.3.0 shows in History on 0.4.0", p2.locator("#history [data-histday]").count() >= 1,
+              p2.locator("#history [data-histday]").count())
+        ctx.close()
+
+    for name, fn in (("main", case_main), ("abort", case_abort), ("twotabs", case_two_tabs), ("from030", case_from030)):
         section(tag + name, fn)
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(os.path.join(LOG_DIR, "e2e_upgrade_network.json"), "w") as f:
@@ -4253,7 +5332,7 @@ def launch(p, url=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", choices=["slice0", "slice1", "slice2", "update", "twoapp", "upgrade"], default="slice0")
+    ap.add_argument("--suite", choices=["slice0", "slice1", "slice2", "slice3", "update", "twoapp", "upgrade"], default="slice0")
     ap.add_argument("--part", action="append", default=[])
     ap.add_argument("--url", default=None)
     ap.add_argument("--viewport", choices=["440", "375", "both"], default="both")
@@ -4296,6 +5375,19 @@ def main():
                     print("e2e suite=slice2 viewport=%s base=%s" % (vp, base), flush=True)
                     try:
                         suite_slice2(browser, base, vp, args.part)
+                    finally:
+                        try:
+                            srv.stop()
+                        except Exception:
+                            pass
+            elif args.suite == "slice3":
+                for vp in vps:
+                    SERVE["app"] = make_build(cb, "served3-" + vp)
+                    srv = Server()
+                    base = "http://127.0.0.1:%d%s" % (srv.port, BASE_PATH)
+                    print("e2e suite=slice3 viewport=%s base=%s" % (vp, base), flush=True)
+                    try:
+                        suite_slice3(browser, base, vp, args.part)
                     finally:
                         try:
                             srv.stop()

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# run_all.sh <slice0|slice1|slice2|live|twoapp|sim> [--url URL]
+# run_all.sh <slice0|slice1|slice2|slice3|live|twoapp|sim> [--url URL]
 # Runs one suite, writes its output to $LIFTLOG_LOG_DIR/<date>_<suite>.log, exits non-zero on any fail.
 # Needs LIFTLOG_PRIVATE_DIR (the folder that holds the four word lists, kept outside the repo).
 # slice0, slice1 and twoapp also need LIFTLOG_AT_DIR (the other app's folder); without it the twoapp step fails by name. Every node and python run uses TZ=America/New_York.
@@ -125,7 +125,37 @@ case "$SUITE" in
     step "origin check self-test" python3 scripts/tests/origin_check.py --self-test
     step "mutants" node scripts/tests/mutants.js
     ;;
-  *) print "usage: run_all.sh <slice0|slice1|slice2|live|twoapp|sim> [--url URL]"; exit 2 ;;
+  slice3)
+    # 17 C.0.1 step 19 (r4 review R39): every slice2 step plus unit stats, unit templates, the
+    # private tool tests (outside the repo, LIFTLOG_PRIVATE_DIR/tools) and e2e slice3, under the Mac load rule.
+    step "static" node --test scripts/tests/unit/static.test.js
+    step "unit rules" node --test scripts/tests/unit/rules.test.js
+    step "unit engine" node --test scripts/tests/unit/engine.test.js
+    step "unit stats" node --test scripts/tests/unit/stats.test.js
+    step "unit templates" node --test scripts/tests/unit/templates.test.js
+    step "unit backup" node --test scripts/tests/unit/backup.test.js
+    step "unit migrate" node --test scripts/tests/unit/migrate.test.js
+    step "unit store" node --test scripts/tests/unit/store.test.js
+    step "unit today" node --test scripts/tests/unit/today.test.js
+    step "private tool tests" zsh -c 'cd "${LIFTLOG_PRIVATE_DIR:-/nonexistent}/tools" && python3 -m unittest test_exercises_to_app test_programs_to_templates test_cards_to_block'
+    step "check_backup fixture" node scripts/tests/check_backup.mjs scripts/tests/fixtures/backup_v1.json
+    step "check_backup block fixture" node scripts/tests/check_backup.mjs scripts/tests/fixtures/block_v1.json --block
+    step "check_backup v2 fixture" node scripts/tests/check_backup.mjs scripts/tests/fixtures/backup_v2.json --now 2026-12-05T12:00:00-05:00
+    step "check_backup v2 block fixture" node scripts/tests/check_backup.mjs scripts/tests/fixtures/block_v2.json --block
+    step "check_backup rounds block fixture" node scripts/tests/check_backup.mjs scripts/tests/fixtures/block_rounds.json --block
+    step "repo_guard" node scripts/tests/repo_guard.js
+    step "repo_guard self-test" node scripts/tests/repo_guard.js --self-test
+    step "e2e slice0" python3 scripts/tests/e2e.py --suite slice0 --viewport both
+    step "e2e slice1" python3 scripts/tests/e2e.py --suite slice1 --viewport both
+    step "e2e slice2" python3 scripts/tests/e2e.py --suite slice2 --viewport both
+    step "e2e slice3" python3 scripts/tests/e2e.py --suite slice3 --viewport both
+    step "e2e update" python3 scripts/tests/e2e.py --suite update
+    step "e2e upgrade" python3 scripts/tests/e2e.py --suite upgrade
+    step "e2e twoapp" python3 scripts/tests/e2e.py --suite twoapp
+    step "origin check self-test" python3 scripts/tests/origin_check.py --self-test
+    step "mutants" node scripts/tests/mutants.js
+    ;;
+  *) print "usage: run_all.sh <slice0|slice1|slice2|slice3|live|twoapp|sim> [--url URL]"; exit 2 ;;
 esac
 # Mac load rule: no test server or headless browser started by this run is left running.
 LEFT=""

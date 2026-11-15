@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createStore, localDate, NotSaved, checksFor } from '../../../store.js';
+import { createStore, localDate, NotSaved, checksFor, gridReason } from '../../../store.js';
+import { TEMPLATES } from '../../../data/templates.js';
 import { buildBackup, validateBackup, validateSnapshotRow } from '../../../backup.js';
 import { SEED_EXERCISES, SEED_IDS } from '../../../data/exercises.js';
 import { APP_VERSION } from '../../../version.js';
@@ -32,7 +33,13 @@ const WRITES = ['seed', 'setSetting', 'createBlock', 'tick', 'untick', 'saveDraf
   'markBackedUp', 'saveSnapshot', 'restoreFile', 'undoSnapshot', 'eraseAll', 'clearSnapshots', 'importBlock',
   'relabelDay', 'addSetBelow', 'deleteSet', 'moveSlot', 'resetDay', 'skipDay', 'saveChecks', 'takeRestoreNote', 'probe',
   // Slice 2 (16 B.4.8, r4.4 R4 c): every new store write joins the list.
-  'answerSleep', 'setSetType', 'saveSoreness', 'liveEdit', 'resize', 'switchProfile', 'switchBack', 'changeAnswers', 'endBlock'];
+  'answerSleep', 'setSetType', 'saveSoreness', 'liveEdit', 'resize', 'switchProfile', 'switchBack', 'changeAnswers', 'endBlock',
+  // Slice 3 (17 C.3, r4.4 R22 item 1): every new store write joins the list.
+  'setSavedEquipment', 'setCurrentBlock', 'renameBlock', 'setBlockNote', 'deleteBlock',
+  // S2: templates, guided builder, levels, copy, tips.
+  'saveBlockAsTemplate', 'saveBoardAsTemplate', 'deleteTemplate', 'guidedSave', 'setPriorities', 'copyBlock', 'markTipSeen',
+  // Slice 3, track S3 (17 C.3.9 to C.3.16)
+  'resizeBlock', 'setBodyWeight', 'markChangedSeen'];
 const invariant = { checks: 0 };
 async function assertRestorable(db, store, clock, after) {
   const file = await store.backupObject();
@@ -1109,6 +1116,15 @@ test('carry-down travels in the backup, comes back on restore and Erase clears i
   assert.equal(await db.setting('carry_down', null), null, 'Erase clears it');
   await store.restoreFile(JSON.stringify(f));
   assert.equal(await db.setting('carry_down', null), true, 'a restore brings it back');
+});
+
+test('C.0.2 C.3.16: Erase all keeps the device keys tips_seen and seen_version', async () => {
+  const { db, store } = await day3();
+  await store.markTipSeen('tip_rest');
+  await db.setSetting('seen_version', '0.4.0');
+  await store.eraseAll();
+  assert.deepEqual(await db.setting('tips_seen', null), { tip_rest: true }, 'tips_seen kept');
+  assert.equal(await db.setting('seen_version', null), '0.4.0', 'seen_version kept');
 });
 
 const ns = (rows, slot, kind) => rows.filter(s => s.slot === slot && s.kind === (kind || 'work')).sort((a, b) => a.set_n - b.set_n || (a.side < b.side ? -1 : 1));
@@ -2363,7 +2379,7 @@ test('B.4.1: createBlock plans round 1 through planDay, rows with the schema 2 f
   const { db, store } = await setup(null, { uuid: fixedIds() });
   const b = await store.importBlock(JSON.stringify(blockV1()), true);
   assert.equal(b.profile, 'fixed');
-  assert.deepEqual(b.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.deepEqual(b.rules_frozen, { profile: 'fixed', rules_version: 'signed-2' });
   assert.equal(b.profile_switch, null);
   const ex = await store.exercisesMap();
   for (const d of b.day_templates) {
@@ -2684,11 +2700,11 @@ test('a new block and an imported block are always Fixed; a block file with prof
   const { db, store } = await setup(null, { uuid: fixedIds() });
   const c = await store.createBlock({ ...SPEC(), profile: 'adaptive', rules_frozen: { profile: 'adaptive', rules_version: 'signed-1' }, profile_switch: { switched_at: 1, ticks: [true, true, true], back_at: null } });
   assert.equal(c.profile, 'fixed');
-  assert.deepEqual(c.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.deepEqual(c.rules_frozen, { profile: 'fixed', rules_version: 'signed-2' });
   assert.equal(c.profile_switch, null);
   const i = await store.importBlock(JSON.stringify(blockV2()), false);
   assert.equal(i.profile, 'fixed');
-  assert.deepEqual(i.rules_frozen, { profile: 'fixed', rules_version: 'signed-1' });
+  assert.deepEqual(i.rules_frozen, { profile: 'fixed', rules_version: 'signed-2' });
   assert.equal(i.profile_switch, null);
   const before = db.dump();
   const bad = blockV2();
@@ -3207,4 +3223,661 @@ test('dayPreview: a day row gives its state; a place with no row is Not planned 
   assert.equal((await store.dayPreview(p(1, 2))).state, 'current');
   await store.skipDay(p(1, 2));
   assert.equal((await store.dayPreview(p(1, 2))).state, 'skipped');
+});
+
+
+// ---------------- Slice 3 (17 C.2.5, C.2.7, C.3.1) ----------------
+
+test('C.2.7: a body-load lift saves done.load 0 whatever was typed', async () => {
+  const { db, store } = await setup();
+  assert.equal((await db.get('exercises', 'push_up')).load_kind, 'body');
+  await store.createBlock({ name: 'Body', passes: 2, day_templates: [{ day: 1, label: 'A', lifts: [lift(1, 'push_up', 1, null)] }] });
+  const v = await store.dayView((await store.currentDay()).id);
+  const row = await store.tick(v.sets[0].id, V(25, 12));
+  assert.equal(row.done.load, 0);
+  assert.equal(row.done.reps, 12);
+});
+
+test('M75: Make my own exercise: three answers with a yes on the machine question give machine true and flags_set true; no questions give flags_set false', async () => {
+  const { store } = await setup();
+  const none = await store.addCustomExercise({ name: 'Plain move', muscle: 'legs', equipment: 'other', flags: { machine: true, no_added_sets: false, left_out_of_builder: false } });
+  assert.equal(none.flags_set, false, 'no block, no question: never screened');
+  assert.equal(none.machine, false, 'an answer to a question nobody asked is never read');
+  assert.deepEqual(await store.flagQuestions(), []);
+  await store.importBlock(JSON.stringify(blockV2()), true);
+  const qs = await store.flagQuestions();
+  assert.deepEqual(qs.map(q => q.key), ['machine', 'no_added_sets', 'left_out_of_builder']);
+  const all = await store.addCustomExercise({ name: 'Seat move', muscle: 'legs', equipment: 'other', flags: { machine: true, no_added_sets: false, left_out_of_builder: false } });
+  assert.equal(all.machine, true);
+  assert.equal(all.flags_set, true);
+  const part = await store.addCustomExercise({ name: 'Half asked', muscle: 'legs', equipment: 'other', flags: { machine: false } });
+  assert.equal(part.flags_set, false, 'two questions left open: not screened');
+});
+
+test('C.2.5 item 2: a phone-made block takes exercise_flags, checks, scores and rule_notes from his block file block; with none they stay empty', async () => {
+  const { db, store } = await setup();
+  const bare = await store.createBlock(SPEC());
+  assert.deepEqual(bare.exercise_flags, {});
+  const file = await store.importBlock(JSON.stringify(blockV2()), false);
+  assert.ok(Object.keys(file.exercise_flags).length > 0, 'the file block has flags');
+  const made = await store.createBlock(SPEC());
+  assert.deepEqual(made.exercise_flags, file.exercise_flags, 'flags from the newest file block');
+  assert.deepEqual(made.checks, file.checks);
+  assert.deepEqual(made.scores, file.scores);
+  assert.deepEqual(made.rule_notes, file.rule_notes);
+  assert.equal((await db.all('blocks')).length, 3);
+});
+
+test('M74: a new block never takes the Current mark on its own; his yes moves it; with no current block it takes it', async () => {
+  const { db, store } = await setup();
+  const a = await store.createBlock(SPEC());
+  assert.equal(await db.setting('active_block_id'), a.id, 'no block was current: the first block takes the mark');
+  const b = await store.createBlock(SPEC());
+  assert.equal(await db.setting('active_block_id'), a.id, 'another block is current: the mark stays');
+  const c = await store.createBlock(SPEC(), null, { activate: true });
+  assert.equal(await db.setting('active_block_id'), c.id, 'his yes moves the mark');
+  assert.notEqual(b.id, c.id);
+});
+
+test('M66: saved equipment: the key absent reads as every kind; an empty, unknown or repeated list is refused and nothing is stored', async () => {
+  const { db, store } = await setup();
+  const { EQUIPMENT_DETAILS } = await import('../../../backup.js');
+  assert.deepEqual(await store.getSavedEquipment(), [...EQUIPMENT_DETAILS]);
+  for (const bad of [[], ['smithy'], ['band', 'band'], null]) {
+    await assert.rejects(store.setSavedEquipment(bad), (e) => e.name === 'Refused', JSON.stringify(bad));
+  }
+  assert.equal(await db.setting('equipment_saved', 'absent'), 'absent', 'a refused list stores nothing');
+  assert.deepEqual(await store.setSavedEquipment(['band', 'machine']), ['machine', 'band'], 'kept in list order');
+  assert.deepEqual(await store.getSavedEquipment(), ['machine', 'band']);
+});
+
+test('C.3.1: a restore takes equipment_saved from the file', async () => {
+  const { clock, store } = await setup();
+  await store.createBlock(SPEC());
+  await store.setSavedEquipment(['cable', 'body']);
+  const f = await store.backupObject();
+  await store.setSavedEquipment(['machine']);
+  clock.add(MIN);
+  await store.restoreFile(JSON.stringify(f));
+  assert.deepEqual(await store.getSavedEquipment(), ['cable', 'body']);
+});
+
+// ---------------- Slice 3 block list (17 C.3.2) ----------------
+
+async function twoBlocks() {
+  const box = await setup();
+  const a = await box.store.createBlock({ ...SPEC(), name: 'First' });
+  box.clock.add(MIN);
+  const b = await box.store.createBlock({ ...SPEC(), name: 'Second' });
+  return { db: box.db, clock: box.clock, store: box.store, a, b };
+}
+
+test('C.3.2: listBlocks gives every block newest first with the Current mark and its days done', async () => {
+  const { store, clock, a, b } = await twoBlocks();
+  await logDay(store, clock);
+  const list = await store.listBlocks();
+  assert.deepEqual(list.map(x => x.id), [b.id, a.id]);
+  assert.deepEqual(list.map(x => x.current), [false, true]);
+  assert.equal(list[1].days_done, 1);
+  assert.equal(list[0].days_done, 0);
+});
+
+test('C.3.2: Use this block moves the mark on his tap; a finished block is never made current', async () => {
+  const { db, store, a, b } = await twoBlocks();
+  await store.setCurrentBlock(b.id);
+  assert.equal(await db.setting('active_block_id'), b.id);
+  await db.put('blocks', { ...(await db.get('blocks', a.id)), status: 'done' });
+  await assert.rejects(store.setCurrentBlock(a.id), (e) => e.name === 'Refused');
+  assert.equal(await db.setting('active_block_id'), b.id);
+});
+
+test('HW4: rename shows on Today and the list; a blank name is refused; the block note saves (L10)', async () => {
+  const { store, a } = await twoBlocks();
+  await store.renameBlock(a.id, 'Legs first');
+  assert.equal((await store.activeBlock()).name, 'Legs first');
+  assert.equal((await store.listBlocks()).find(x => x.id === a.id).name, 'Legs first');
+  await assert.rejects(store.renameBlock(a.id, '   '), (e) => e.name === 'Refused');
+  await store.setBlockNote(a.id, 'Seat 4 on the press');
+  assert.equal((await store.listBlocks()).find(x => x.id === a.id).notes, 'Seat 4 on the press');
+});
+
+test('M52: deleteBlock removes every day, set and feedback row of that block and nothing else', async () => {
+  const { db, store, clock, a, b } = await twoBlocks();
+  const d = await store.currentDay();
+  const v = await store.dayView(d.id);
+  await store.tick(v.sets[0].id, V(150, 10));
+  await store.saveFeedback(d.id, v.sets[0].slot, { pump: 2 }, false).catch(() => {});
+  assert.ok((await db.all('feedback')).some(f => f.day_id === d.id), 'the block has a feedback row to delete');
+  const otherSets = (await db.all('sets')).filter(s => s.block_id === b.id).length;
+  await assert.rejects(store.deleteBlock(a.id, 'delete'), (e) => e.name === 'Refused', 'a refused word changes nothing');
+  assert.ok(await db.get('blocks', a.id));
+  await store.deleteBlock(a.id, 'DELETE');
+  assert.equal(await db.get('blocks', a.id), undefined);
+  for (const s of ['days', 'sets']) assert.equal((await db.all(s)).filter(r => r.block_id === a.id).length, 0, s);
+  assert.equal((await db.all('feedback')).filter(f => f.day_id.startsWith(a.id)).length, 0, 'feedback of the block');
+  assert.equal((await db.all('sets')).filter(s => s.block_id === b.id).length, otherSets, 'the other block keeps its sets');
+  assert.ok((await db.all('exercises')).length > 0, 'exercises stay');
+});
+
+test('M51: a before-delete safety copy exists before the delete and Undo brings every store back', async () => {
+  const { db, store, clock, a } = await twoBlocks();
+  const keep = ['snapshots', 'settings', 'exercises', 'templates'];
+  const before = db.dump(keep);
+  clock.add(MIN);
+  await store.deleteBlock(a.id, 'DELETE');
+  assert.equal((await db.all('snapshots')).length, 1, 'the safety copy is written');
+  const snaps = await store.listSnapshots();
+  assert.equal(snaps[0].reason, 'before-delete');
+  clock.add(MIN);
+  await store.undoSnapshot(snaps[0].id);
+  // Undo rewrites each row through the restore path, so key order may differ: compare the rows.
+  const same = (() => { try { assert.deepStrictEqual(JSON.parse(db.dump(keep)), JSON.parse(before)); return true; } catch (e) { return false; } })();
+  assert.ok(same, 'Undo brings blocks, days, sets and feedback back exactly');
+  assert.equal(await db.setting('active_block_id'), a.id, 'and the Current mark');
+});
+
+test('M53: deleting the current block moves the mark to the other active block (S02, HW6); deleting the last block sets it to null', async () => {
+  const { db, store, a, b } = await twoBlocks();
+  assert.equal(await db.setting('active_block_id'), a.id);
+  await store.deleteBlock(a.id, 'DELETE');
+  assert.equal(await db.setting('active_block_id'), b.id);
+  await store.deleteBlock(b.id, 'DELETE');
+  assert.equal(await db.setting('active_block_id'), null);
+  assert.deepEqual(await store.listBlocks(), []);
+});
+
+test('M89: a tick held behind a slow write, then a delete: no row names the deleted block afterwards', async () => {
+  const { db, store, a } = await twoBlocks();
+  const d = await store.currentDay();
+  const v = await store.dayView(d.id);
+  db.faults.holdBatch = 1;
+  const tk = store.tick(v.sets[0].id, V(150, 10));
+  await db.spy.batchHeld;
+  const del = store.deleteBlock(a.id, 'DELETE');
+  await new Promise((res) => setTimeout(res, 30));
+  db.releaseBatch();
+  await Promise.allSettled([tk, del]);
+  for (const s of ['days', 'sets']) assert.deepEqual((await db.all(s)).filter(r => r.block_id === a.id).map(r => r.id), [], s);
+  assert.equal(await db.get('blocks', a.id), undefined);
+});
+
+
+// ---------------- S2: templates, guided builder, levels, copy (17 C.3.4 to C.3.8) ----------------
+
+// A block file that screens every list row by the BUILDER item 1 rule (health-coach C2): a spotter
+// row is left out of the builder, a laps row gets both flags, every other row both false; extra
+// sets the flags of named ids.
+function screeningFile(extra) {
+  const f = blockV2();
+  const flags = {};
+  for (const ex of SEED_EXERCISES) {
+    const spotter = Array.isArray(ex.tags) && ex.tags.includes('spotter');
+    const laps = ex.count_label === 'laps';
+    flags[ex.id] = { no_added_sets: laps, left_out_of_builder: laps || spotter };
+  }
+  for (const [id, v] of Object.entries(f.block.exercise_flags)) if (!(id in flags)) flags[id] = v;
+  Object.assign(flags, extra || {});
+  f.block.exercise_flags = flags;
+  return JSON.stringify(f);
+}
+const tplIds = (tp) => tp.days.map(d => d.slots.map(s => s.exercise_id));
+
+test('S05: Start from a real template then Save gives a block whose days and exercises equal the template (every slot screened)', async () => {
+  const { store } = await setup();
+  const tp = TEMPLATES.find(x => x.days_per_rotation === 3);
+  // His file screens every exercise this template names as fit for the builder.
+  const fit = {};
+  for (const d of tp.days) for (const sl of d.slots) fit[sl.exercise_id] = { no_added_sets: false, left_out_of_builder: false };
+  await store.importBlock(screeningFile(fit), true);
+  assert.ok(tp, 'a 3-day template ships');
+  const draft = await store.templateToDraft(tp.id);
+  assert.equal(draft.step, 2);
+  assert.equal(draft.dropped, 0);
+  assert.equal(draft.template_id, tp.id);
+  for (const d of draft.days) for (const l of d.lifts) { assert.equal(l.reps_left_target, 2, 'C5: every slot stops 2 short'); assert.equal(l.start_load, null, 'G29'); }
+  const { blockSpec } = await import('../../../ui/builder.js');
+  const spec = blockSpec(draft);
+  const b = await store.createBlock(spec, null, { activate: true });
+  assert.deepEqual(b.day_templates.map(d => d.lifts.map(l => l.exercise_id)), tplIds(tp));
+  assert.equal(b.template_id, tp.id);
+  assert.deepEqual(b.levels, tp.levels);
+  assert.equal(b.profile, 'fixed');
+});
+
+test('M71: a template slot whose exercise the flag source leaves out of the builder never reaches the block; it is refilled or dropped (C7)', async () => {
+  const { store } = await setup();
+  const tp = TEMPLATES[0];
+  const first = tp.days[0].slots[0].exercise_id;
+  await store.importBlock(screeningFile({ [first]: { no_added_sets: false, left_out_of_builder: true } }), true);
+  const draft = await store.templateToDraft(tp.id);
+  const ids = draft.days.flatMap(d => d.lifts.map(l => l.exercise_id));
+  assert.ok(!ids.includes(first), 'the left-out exercise is not in the draft');
+  const total = tp.days.reduce((n, d) => n + d.slots.length, 0);
+  assert.equal(ids.length + draft.dropped, total, 'every slot is either filled or counted as dropped');
+});
+
+test('C.3.4: with no block file, an unscreened list row in a template is refilled by a screened row of its muscle, or dropped and counted', async () => {
+  const { store } = await setup();
+  const tp = TEMPLATES[0];
+  const draft = await store.templateToDraft(tp.id);
+  const pool = await store.poolFor(null);
+  const byId = new Map(pool.map(r => [r.id, r]));
+  for (const d of draft.days) for (const l of d.lifts) assert.ok(byId.get(l.exercise_id).screened, l.exercise_id + ' is screened');
+  const total = tp.days.reduce((n, d) => n + d.slots.length, 0);
+  assert.equal(draft.days.reduce((n, d) => n + d.lifts.length, 0) + draft.dropped, total);
+});
+
+test('S04: listTemplates: Days 3 and a focus narrow the list; search finds by name; Made by mine lists only his', async () => {
+  const { store } = await setup();
+  const all = await store.listTemplates({});
+  assert.equal(all.length, TEMPLATES.length);
+  const three = await store.listTemplates({ days: [3] });
+  assert.ok(three.length > 0 && three.length < all.length && three.every(x => x.days_per_rotation === 3));
+  const focus = TEMPLATES[0].focus_key;
+  const f = await store.listTemplates({ focus: [focus] });
+  assert.ok(f.length > 0 && f.length < all.length && f.every(x => x.focus_key === focus));
+  const name = TEMPLATES[2].name;
+  const q = await store.listTemplates({ q: name.slice(0, 12).toUpperCase() });
+  assert.ok(q.some(x => x.id === TEMPLATES[2].id), 'search is case blind');
+  assert.deepEqual(await store.listTemplates({ author: ['mine'] }), []);
+  await store.setSavedEquipment(['dumbbell']);
+  const fits = await store.listTemplates({ equipment: 'fits' });
+  assert.ok(fits.every(x => x.equipment.every(k => k === 'dumbbell')));
+});
+
+test('BW13 HW5: save a block as a template; it lists under Made by mine and starts a block with the same days', async () => {
+  const { store, clock } = await setup();
+  const a = await store.createBlock(SPEC());
+  clock.add(MIN);
+  const row = await store.saveBlockAsTemplate(a.id, 'My two days');
+  assert.match(row.id, /^m/);
+  assert.equal(row.author, 'mine');
+  for (const d of row.days) for (const sl of d.slots) assert.deepEqual(Object.keys(sl).sort(), ['exercise_id', 'priority', 'rep_high', 'rep_low', 'sets']);
+  const mine = await store.listTemplates({ author: ['mine'] });
+  assert.deepEqual(mine.map(x => x.id), [row.id]);
+  const draft = await store.templateToDraft(row.id);
+  assert.deepEqual(draft.days.map(d => d.lifts.map(l => l.exercise_id)), a.day_templates.map(d => d.lifts.map(l => l.exercise_id)));
+  assert.deepEqual(draft.days.map(d => d.lifts.map(l => l.sets)), a.day_templates.map(d => d.lifts.map(l => l.sets)), 'his template keeps its own set counts');
+  await assert.rejects(store.saveBlockAsTemplate(a.id, '   '), /bad text/);
+});
+
+test('M91: deleting one of his templates keeps a before-delete safety copy and Undo brings it back; ours is refused', async () => {
+  const { db, store, clock } = await setup();
+  const a = await store.createBlock(SPEC());
+  const row = await store.saveBlockAsTemplate(a.id, 'Keep me');
+  clock.add(MIN);
+  await assert.rejects(store.deleteTemplate(TEMPLATES[0].id), /ours/);
+  await store.deleteTemplate(row.id);
+  assert.deepEqual(await db.all('templates'), []);
+  const snaps = await store.listSnapshots();
+  assert.equal(snaps.length, 1);
+  assert.equal(snaps[0].reason, 'before-delete');
+  clock.add(MIN);
+  await store.undoSnapshot(snaps[0].id);
+  assert.deepEqual((await db.all('templates')).map(r => r.id), [row.id]);
+});
+
+test('C.3.4: a template id is checked by its pattern before any read', async () => {
+  const { store } = await setup();
+  await assert.rejects(store.getTemplate('../x'), /bad id/);
+  await assert.rejects(store.getTemplate('__proto__'), /bad id/);
+  assert.equal(await store.getTemplate('t_no_such_one'), null);
+});
+
+test('C.3.5: guidedLayout then guidedSave makes a Fixed block with his levels, flags from his file and a reps-left goal of 2 on every lift', async () => {
+  const { store } = await setup();
+  const file = await store.importBlock(screeningFile(), true);
+  const levels = { top: ['quads', 'chest'], middle: ['back'], bottom: ['calves'] };
+  const { board } = await store.guidedLayout(3, levels);
+  assert.equal(board.length, 3);
+  const g = { board, levels, name: 'Guided one', notes: '', passes: 4, unit: null };
+  const b = await store.guidedSave(g, { activate: false });
+  assert.equal(b.profile, 'fixed');
+  assert.deepEqual(b.levels, { chest: 'top', quads: 'top', back: 'middle', calves: 'bottom' });
+  assert.deepEqual(b.exercise_flags, file.exercise_flags);
+  for (const d of b.day_templates) for (const l of d.lifts) { assert.equal(l.reps_left_target, 2); assert.equal(l.rep_low, null); assert.equal(l.start_load, null); }
+  await assert.rejects(store.guidedSave({ ...g, board: [...board, { day: 4, label: 'D', lifts: [] }] }), /empty day/);
+});
+
+test('C.2.5 BUILDER item 1: after his block file loads, autofill and autoBuildDays never place a spotter row or a laps row', async () => {
+  const { store } = await setup();
+  await store.importBlock(screeningFile(), true);
+  const bad = new Set(SEED_EXERCISES.filter(e => e.count_label === 'laps' || (Array.isArray(e.tags) && e.tags.includes('spotter'))).map(e => e.id));
+  assert.ok(bad.size > 0);
+  const levels = { top: ['chest', 'quads', 'abs_core'], middle: ['back', 'glutes', 'forearms_grip'], bottom: ['hamstrings', 'calves', 'shoulders'] };
+  for (const days of [2, 3, 4, 5, 6]) {
+    const { board } = await store.guidedLayout(days, levels);
+    const again = await store.autofill({ board }, { emptyOnly: false });
+    for (const bd of [board, again.board]) for (const d of bd) for (const l of d.lifts) assert.ok(!bad.has(l.exercise_id), l.exercise_id + ' placed on ' + days + ' days');
+  }
+});
+
+test('X04: autofill with Band unpicked never picks a band row; Fill empty slots only leaves a picked slot as it was', async () => {
+  const { store } = await setup();
+  await store.importBlock(screeningFile(), true);
+  const kinds = ['band'];
+  const { board } = await store.guidedLayout(2, { top: ['chest', 'back'], middle: [], bottom: [] });
+  for (const d of board) for (const l of d.lifts) l.exercise_id = null;
+  const onlyBand = await store.autofill({ board }, { equipment: kinds });
+  const pool = new Map((await store.poolFor(await store.activeBlock())).map(r => [r.id, r]));
+  for (const d of onlyBand.board) for (const l of d.lifts) if (l.exercise_id) assert.equal(pool.get(l.exercise_id).equipment_detail, 'band');
+  const noBand = await store.autofill({ board }, { equipment: ['machine', 'cable', 'barbell', 'dumbbell'] });
+  for (const d of noBand.board) for (const l of d.lifts) if (l.exercise_id) assert.notEqual(pool.get(l.exercise_id).equipment_detail, 'band');
+  const picked = noBand.board.map(d => ({ ...d, lifts: d.lifts.map(l => ({ ...l })) }));
+  picked[0].lifts[0].exercise_id = 'chest_press_machine'; picked[0].lifts[0].hand = true;
+  const keep = await store.autofill({ board: picked }, { emptyOnly: true });
+  assert.equal(keep.board[0].lifts[0].exercise_id, 'chest_press_machine');
+});
+
+test('C.3.6: poolFor counts done work sets per exercise and is read again after a write', async () => {
+  const { store, clock } = await setup();
+  await store.createBlock(SPEC());
+  const before = (await store.poolFor(null)).find(r => r.id === 'leg_press').done_count;
+  await logDay(store, clock);
+  const after = (await store.poolFor(null)).find(r => r.id === 'leg_press').done_count;
+  assert.equal(before, 0);
+  assert.equal(after, 2);
+});
+
+test('M73: a level change mid block writes blocks.levels only; every done and open day and its sets stay deep-equal; one muscle on two levels is refused', async () => {
+  const { db, store, clock } = await setup();
+  const a = await store.createBlock(SPEC());
+  await logDay(store, clock);
+  const d = await store.currentDay();
+  const v = await store.dayView(d.id);
+  await store.tick(v.sets[0].id, V(150, 10));
+  const days0 = JSON.stringify(await db.all('days')), sets0 = JSON.stringify(await db.all('sets'));
+  const lv = await store.blockLevels(a.id);
+  assert.equal(lv.saved, false, 'a block with {} shows unsaved');
+  assert.ok(lv.levels.middle.length > 0 && !lv.levels.top.length, 'every muscle it trains on the middle level');
+  await store.setPriorities(a.id, { top: ['quads'], middle: ['back'], bottom: ['chest'] });
+  assert.deepEqual((await db.get('blocks', a.id)).levels, { back: 'middle', chest: 'bottom', quads: 'top' });
+  assert.equal(JSON.stringify(await db.all('days')), days0);
+  assert.equal(JSON.stringify(await db.all('sets')), sets0);
+  await assert.rejects(store.setPriorities(a.id, { top: ['quads'], middle: ['quads'], bottom: [] }), /two levels/);
+  assert.equal((await store.blockLevels(a.id)).saved, true);
+});
+
+test('AW4: copying from round 2 gives a block with the same days and exercises, copied_from set, no source_id, Fixed', async () => {
+  const { db, store, clock } = await setup();
+  const a = await store.createBlock(SPEC());
+  for (let i = 0; i < 4; i++) await logDay(store, clock);
+  const rounds = await store.copyRounds(a.id);
+  assert.deepEqual(rounds.rounds.map(r => r.pass), [1, 2, 3]);
+  assert.deepEqual(rounds.rounds.map(r => r.days_done), [2, 2, 0]);
+  const c = await store.copyBlock(a.id, 2, { activate: false });
+  assert.deepEqual(c.day_templates.map(d => d.lifts.map(l => l.exercise_id)), a.day_templates.map(d => d.lifts.map(l => l.exercise_id)));
+  assert.deepEqual(c.copied_from, { block_id: a.id, pass: 2 });
+  assert.equal(c.source_id, null);
+  assert.equal(c.profile, 'fixed');
+  assert.equal(c.passes, a.passes);
+  assert.equal(await db.setting('active_block_id'), a.id, 'the copy took no mark (M74)');
+});
+
+test('M55: the copy keeps the source unit with settings set to the other unit (B09); start load from the last done set (R4-17)', async () => {
+  const { store, clock } = await setup();
+  const a = await store.createBlock({ ...SPEC(), unit: 'lb' });
+  await logDay(store, clock, (s) => V(s.set_n === 2 ? 155 : 150, 10));
+  await store.setSetting('unit', 'kg');
+  const pv = await store.copyPreview(a.id, 1);
+  assert.equal(pv.unit, 'lb');
+  assert.equal(pv.days[0].lifts[0].start_load, 155, 'the load of its last done work set by set number');
+  const c = await store.copyBlock(a.id, 1, { activate: true });
+  assert.equal(c.unit, 'lb');
+});
+
+test('M56: the copy keeps exercise_flags, checks, scores and rule notes of the source; a block file update of the source leaves the copy unchanged', async () => {
+  const { db, store } = await setup();
+  const src = await store.importBlock(JSON.stringify(blockV2()), true);
+  const c = await store.copyBlock(src.id, 1, { activate: false });
+  assert.deepEqual(c.exercise_flags, src.exercise_flags);
+  assert.deepEqual(c.checks, src.checks);
+  assert.deepEqual(c.scores, src.scores);
+  assert.deepEqual(c.rule_notes, src.rule_notes);
+  assert.equal(c.source_id, null);
+  const copyBefore = JSON.stringify(await db.get('blocks', c.id));
+  const f = blockV2(); f.version = (f.version || 1) + 1; f.block.notes = 'Changed by a newer file.';
+  await store.importBlock(JSON.stringify(f), false).catch(() => null);
+  assert.equal(JSON.stringify(await db.get('blocks', c.id)), copyBefore, 'the copy is untouched');
+});
+
+test('C.3.16 (minimal, S2): markTipSeen keeps a tip closed and refuses an id not in TIP_IDS', async () => {
+  const { store } = await setup();
+  assert.deepEqual(await store.tipsSeen(), {});
+  await store.markTipSeen('intro_board');
+  assert.deepEqual(await store.tipsSeen(), { intro_board: true });
+  await assert.rejects(store.markTipSeen('tip_nope'), /bad tip/);
+});
+
+// ---------------- Slice 3, track S3 (17 C.3.9 to C.3.16) ----------------
+
+// A 2-round, 2-day block logged to its end (4 days).
+async function finishedBlock() {
+  const box = await setup();
+  const b = await box.store.createBlock({ ...SPEC(), passes: 2 });
+  for (let i = 0; i < 4; i++) await logDay(box.store, box.clock);
+  return { ...box, b };
+}
+
+test('C.3.9 S19: Finish day on the last day of the last round puts status done and finished_at once, in the same write', async () => {
+  const box = await setup();
+  const b = await box.store.createBlock({ ...SPEC(), passes: 2 });
+  for (let i = 0; i < 3; i++) await logDay(box.store, box.clock);
+  assert.equal((await box.db.get('blocks', b.id)).finished_at, null, 'not before the last day');
+  const n = box.db.spy.batch;
+  const last = await logDay(box.store, box.clock);
+  const nb = await box.db.get('blocks', b.id);
+  assert.equal(nb.status, 'done');
+  assert.equal((await box.db.get('days', last.id)).done_at, nb.finished_at, 'finished_at is the time of the day finish');
+  assert.ok(box.db.spy.batch - n >= 1);
+  const v = await box.store.blockFinishedView(b.id);
+  assert.deepEqual({ rounds: v.rounds, days: v.days, skipped: v.skipped, tally: v.tally }, { rounds: 2, days: 4, skipped: 0, tally: 8 });
+});
+
+test('C.3.9: Skip day on the last day and End block also set finished_at; an active block has no finished view', async () => {
+  const box = await setup();
+  const b = await box.store.createBlock({ ...SPEC(), passes: 1 });
+  await logDay(box.store, box.clock);
+  assert.equal(await box.store.blockFinishedView(b.id), null);
+  const d = await box.store.currentDay();
+  box.clock.add(MIN);
+  await box.store.skipDay(d.id);
+  const nb = await box.db.get('blocks', b.id);
+  assert.equal(nb.status, 'done');
+  assert.equal(nb.finished_at, box.clock.now());
+  const v = await box.store.blockFinishedView(b.id);
+  assert.deepEqual({ rounds: v.rounds, days: v.days, skipped: v.skipped }, { rounds: 1, days: 1, skipped: 1 });
+  const box2 = await setup();
+  const c = await box2.store.createBlock({ ...SPEC(), passes: null });
+  for (let i = 0; i < 3; i++) await logDay(box2.store, box2.clock);
+  assert.equal((await box2.db.get('blocks', c.id)).status, 'active', 'an open-ended block never finishes by itself');
+  box2.clock.add(MIN);
+  await box2.store.endBlock(c.id);
+  assert.equal((await box2.db.get('blocks', c.id)).finished_at, box2.clock.now(), 'End block sets finished_at');
+});
+
+test('C.3.10 ZW2: blockSummary mid block gives the day counts, sets per muscle per round and the done exercises by name', async () => {
+  const { store, clock, db } = await setup();
+  const b = await store.createBlock(SPEC());
+  await logDay(store, clock);
+  const s = await store.blockSummary(b.id);
+  assert.deepEqual(s.counts, { total: 6, done: 1, skipped: 0, not_done: 5 });
+  assert.deepEqual(s.muscles.rounds, [1, 2, 3]);
+  assert.ok(s.muscles.rows.length >= 2 && s.muscles.rows.every(r => r.cells.length === 3 && r.cells[1] === 0));
+  assert.deepEqual(s.exercises.map(e => e.id).sort(), ['lat_pulldown', 'leg_press']);
+  assert.equal(await store.blockSummary('nope'), null);
+  await assert.rejects(store.blockSummary('@bad'));
+});
+
+test('M59: the grid minus is refused without REMOVE typed and changes nothing; plus adds a round', async () => {
+  const { db, store, clock } = await setup();
+  const b = await store.createBlock(SPEC());
+  const before = db.dump(['snapshots']);
+  await assert.rejects(store.resizeBlock(b.id, -1, ''), (e) => e.name === 'Refused' && e.message === 'word');
+  await assert.rejects(store.resizeBlock(b.id, -1, 'remove'), (e) => e.name === 'Refused');
+  assert.equal(db.dump(['snapshots']), before, 'nothing written');
+  const r = await store.resizeBlock(b.id, 1);
+  assert.equal(r.block.passes, 4);
+  await store.resizeBlock(b.id, -1, 'REMOVE');
+  assert.equal((await db.get('blocks', b.id)).passes, 3);
+});
+
+test('r4.6 Q1: REMOVE at the start of the last round deletes its planned untouched day and finishes the block in one batch', async () => {
+  const { db, store, clock } = await setup();
+  const b = await store.createBlock(SPEC());
+  for (let i = 0; i < 4; i++) await logDay(store, clock);
+  const keep = (await db.all('days')).filter(d => d.pass <= 2).map(d => d.id).sort();
+  const keepRows = JSON.stringify([...(await db.all('days')).filter(d => d.pass <= 2), ...(await db.all('sets')).filter(s => !s.day_id.includes(':p3:'))].sort((x, y) => (x.id < y.id ? -1 : 1)));
+  const g = await store.roundGrid(b.id);
+  assert.deepEqual(g.minus, { ok: true, finishes: true });
+  const n = db.spy.batch;
+  clock.add(MIN);
+  const r = await store.resizeBlock(b.id, -1, 'REMOVE');
+  assert.equal(db.spy.batch - n, 1, 'one batch');
+  assert.equal(r.finished, true);
+  const nb = await db.get('blocks', b.id);
+  assert.deepEqual([nb.passes, nb.status, nb.finished_at], [2, 'done', clock.now()]);
+  assert.deepEqual((await db.all('days')).map(d => d.id).sort(), keep, 'the round 3 day is gone');
+  assert.equal((await db.all('sets')).filter(s => s.day_id.includes(':p3:')).length, 0, 'and its sets');
+  assert.equal(JSON.stringify([...(await db.all('days')), ...(await db.all('sets'))].sort((x, y) => (x.id < y.id ? -1 : 1))), keepRows, 'rounds 1 and 2 are unchanged');
+});
+
+test('M99 (r4.6 Q1): a planned day with a draft set is never deleted by REMOVE, and nothing is written', async () => {
+  const { db, store, clock } = await setup();
+  const b = await store.createBlock(SPEC());
+  for (let i = 0; i < 4; i++) await logDay(store, clock);
+  const d = await store.currentDay();
+  const s = (await db.byIndex('sets', 'day_id', d.id))[0];
+  await db.put('sets', { ...s, draft: { load: 150, reps: 9 } });
+  const g = await store.roundGrid(b.id);
+  assert.equal(g.minus.ok, false);
+  assert.equal(g.minus.reason.key, 'grid.done');
+  const before = db.dump(['snapshots']);
+  await assert.rejects(store.resizeBlock(b.id, -1, 'REMOVE'), (e) => e.name === 'Refused' && e.message === 'day past the end');
+  assert.equal(db.dump(['snapshots']), before);
+});
+
+test('C.3.11 r4.6 Q2: the grid on Fixed shows both buttons, grid.min on a 1-round block, grid.done below a started round, grid.cap at the most', async () => {
+  const { db, store, clock } = await setup();
+  const one = await store.createBlock({ ...SPEC(), passes: 1 });
+  let g = await store.roundGrid(one.id);
+  assert.equal(g.plus.ok, true);
+  assert.deepEqual(g.minus, { ok: false, reason: { key: 'grid.min', vals: {} } });
+  assert.deepEqual(g.rounds, [{ pass: 1, goal: null }], 'Fixed shows no goal line');
+  assert.deepEqual(g.rows.map(r => r.cells.map(c => c.state)), [['now'], ['planned']]);
+  const three = await store.createBlock({ ...SPEC(), passes: RULES.profiles.fixed.effort.length_max }, null, { activate: true });
+  g = await store.roundGrid(three.id);
+  assert.deepEqual(g.plus, { ok: false, reason: { key: 'grid.cap', vals: { n: RULES.profiles.fixed.effort.length_max } } });
+  const two = await store.createBlock({ ...SPEC(), passes: 2 }, null, { activate: true });
+  await logDay(store, clock); await logDay(store, clock); await logDay(store, clock);
+  g = await store.roundGrid(two.id);
+  assert.deepEqual(g.minus, { ok: false, reason: { key: 'grid.done', vals: { r: 2 } } });
+  const open = await store.createBlock({ ...SPEC(), passes: null }, null, { activate: true });
+  g = await store.roundGrid(open.id);
+  assert.equal(g.open, true);
+  assert.equal(g.plus, null);
+});
+
+test('C.3.11 r4.6 Q6: a refused minus below the fewest rounds reads grid.fewest with length_min; grid.min stays the Fixed 1-round case', () => {
+  const adaptive = RULES.profiles.adaptive, fixed = RULES.profiles.fixed;
+  assert.deepEqual(gridReason('shorter than the fewest rounds', { passes: adaptive.effort.length_min }, adaptive), { key: 'grid.fewest', vals: { n: adaptive.effort.length_min } });
+  assert.deepEqual(gridReason('below the current round', { passes: 1 }, fixed), { key: 'grid.min', vals: {} });
+  assert.deepEqual(gridReason('below the current round', { passes: 3 }, fixed), { key: 'grid.done', vals: { r: 3 } });
+  assert.deepEqual(gridReason('longer than the most rounds', { passes: 9 }, fixed), { key: 'grid.cap', vals: { n: fixed.effort.length_max } });
+});
+
+test('S13 M61: history for one exercise lists both blocks newest first, each with its rounds and trend, the date from done_at', async () => {
+  const { db, store, clock } = await setup();
+  const a = await store.createBlock({ ...SPEC(), passes: 2, name: 'Old' });
+  for (let i = 0; i < 4; i++) await logDay(store, clock, (s) => V(s.target.load === null ? 100 : s.target.load + (s.id.includes(':p2:') ? 5 : 0), 10));
+  clock.add(MIN);
+  const b = await store.createBlock({ ...SPEC(), passes: 2, name: 'New' }, null, { activate: true });
+  await logDay(store, clock);
+  const h = await store.exerciseHistory('leg_press');
+  assert.deepEqual(h.blocks.map(x => x.name), ['New', 'Old']);
+  assert.deepEqual(h.blocks[1].rounds.map(r => r.pass), [1, 2]);
+  assert.deepEqual(h.blocks[1].points.map(p => p.pass), [1, 2], 'points in round order');
+  assert.ok(h.blocks[1].points[1].value >= h.blocks[1].points[0].value);
+  const only = await store.exerciseHistory('leg_press', a.id);
+  assert.deepEqual(only.blocks.map(x => x.block_id), [a.id], 'one block only');
+  const days = await store.historyDays({ limit: 30 });
+  assert.equal(days.rows[0].block.name, 'New', 'newest block first');
+  assert.deepEqual(days.rows.slice(1).map(r => [r.day.pass, r.day.day]), [[2, 2], [2, 1], [1, 2], [1, 1]], 'newest position first');
+  assert.equal(days.rows[1].sets, 4);
+  const page = await store.historyDays({ limit: 2 });
+  assert.equal(page.more, true);
+  assert.equal((await store.historyDays({ before: page.next, limit: 30 })).rows.length, 3);
+  assert.deepEqual((await store.historyExercises()).map(e => e.id).sort(), ['chest_press_machine', 'lat_pulldown', 'leg_extension', 'leg_press']);
+  assert.ok(b);
+});
+
+test('C.3.12: a day finished after midnight shows under its done_date, with done_at for the time', async () => {
+  const { db, store, clock } = await setup('2026-11-02T23:30:00-05:00');
+  await store.createBlock(SPEC());
+  const d = await store.currentDay();
+  const v = await store.dayView(d.id);
+  for (const s of v.sets) { clock.add(MIN); await store.tick(s.id, V(s.target.load, 10)); }
+  clock.add(40 * MIN);
+  await store.finishDay(d.id);
+  const row = (await store.historyDays({})).rows[0];
+  assert.equal(row.day.done_date, '2026-11-02');
+  assert.equal(localDate(row.day.done_at), '2026-11-03');
+});
+
+test('C.3.13: loggedExerciseIds ignores a planned or skipped set; listExercises filters and sorts by name', async () => {
+  const { db, store, clock } = await setup();
+  await store.createBlock(SPEC());
+  const d = await store.currentDay();
+  const v = await store.dayView(d.id);
+  await store.tick(v.sets[0].id, V(150, 10));
+  await store.skipExercise(d.id, v.sets.find(s => s.exercise_id === 'lat_pulldown').slot);
+  assert.deepEqual(await store.loggedExerciseIds(), ['leg_press']);
+  assert.deepEqual((await store.listExercises({ logged: true })).map(e => e.id), ['leg_press']);
+  const all = await store.listExercises({});
+  assert.equal(all.length, (await db.all('exercises')).length);
+  const names = all.map(e => e.name.toLowerCase());
+  assert.deepEqual(names, [...names].sort());
+  const legs = await store.listExercises({ muscle: ['quads'], equipment: ['machine'] });
+  assert.ok(legs.length && legs.every(e => e.muscle_detail === 'quads' && e.equipment_detail === 'machine'));
+  assert.deepEqual(await store.listExercises({ mine: true }), []);
+  assert.ok((await store.listExercises({ q: 'LEG PRESS' })).some(e => e.id === 'leg_press'));
+  const det = await store.exerciseDetail('leg_press');
+  assert.equal(det.exercise.id, 'leg_press');
+  assert.equal(det.history.blocks.length, 1);
+});
+
+test('C.3.15 DW8: body weight saves on an open or planned day, rounds to one decimal, refuses 20 to 1000 outside, shows in flat_log', async () => {
+  const { db, store, clock } = await setup();
+  await store.createBlock(SPEC());
+  const d = await store.currentDay();
+  await store.setBodyWeight(d.id, 180.25);
+  assert.equal((await db.get('days', d.id)).body_weight, 180.3);
+  for (const bad of [19.9, 1001, NaN, '180']) await assert.rejects(store.setBodyWeight(d.id, bad), (e) => e.name === 'Refused');
+  assert.equal((await db.get('days', d.id)).body_weight, 180.3, 'the old value stays');
+  await store.setBodyWeight(d.id, null);
+  assert.equal((await db.get('days', d.id)).body_weight, null, 'Clear writes null');
+  await store.setBodyWeight(d.id, 180.3);
+  await logDay(store, clock);
+  const flat = (await store.backupObject()).flat_log.filter(r => r.date !== undefined);
+  assert.ok(flat.length && flat.every(r => r.body_weight === 180.3), 'every flat_log row of that day carries it');
+  await assert.rejects(store.setBodyWeight(d.id, 180), (e) => e.name === 'Refused', 'a done day is refused');
+});
+
+test('C.3.16: tips_seen takes only TIP_IDS; what changed: first install writes the version silently, an older version is due once', async () => {
+  const { db, store, clock } = await setup();
+  assert.deepEqual(await store.tipsSeen(), {});
+  await store.markTipSeen('tip_rest');
+  await assert.rejects(store.markTipSeen('tip_other'), (e) => e.name === 'Refused');
+  assert.deepEqual(await store.tipsSeen(), { tip_rest: true });
+  assert.equal(await store.changedDue(), null, 'first install: no note');
+  assert.equal(await db.setting('seen_version'), APP_VERSION);
+  assert.equal(await store.changedDue(), null);
+  await db.setSetting('seen_version', '0.3.0');
+  assert.equal(await store.changedDue(), APP_VERSION);
+  await store.markChangedSeen();
+  assert.equal(await store.changedDue(), null);
+  await db.setSetting('seen_version', '0.3.0');
+  await store.createBlock(SPEC());
+  await logDay(store, clock);
+  assert.equal(await db.setting('seen_version'), APP_VERSION, 'the next Finish day writes it');
 });

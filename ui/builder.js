@@ -5,6 +5,15 @@ import { t, tn } from './strings.js';
 import { LIMITS, MUSCLES, EQUIPMENT } from '../backup.js';
 import { MUSCLE_NAMES, EQUIPMENT_NAMES, CHIP_EQUIPMENT } from '../data/exercises.js';
 import { readNumber, swapTo, stepLoad, relabelSheet } from './today.js';
+import { introOnce } from './tips.js';
+
+// The one-time intros (17 C.3.16): asked at most once per app session, shown once ever.
+const introAsked = new Set();
+function intro(ctx, id, title, lines) {
+  if (introAsked.has(id)) return;
+  introAsked.add(id);
+  setTimeout(() => { introOnce(ctx, id, title, lines).catch(() => {}); }, 0);
+}
 
 const LABELS = 'ABCDEFGHIJKLMN';
 
@@ -16,7 +25,9 @@ function freshBuild() {
 // (b.unit), so a kept lb draft saved after Settings moved to kg is still an lb block (stage 4 N3).
 // Not read yet: createBlock falls back to the setting, as before.
 export function blockSpec(b) {
-  return { name: b.name.trim(), notes: b.notes, passes: b.passes === '' ? null : b.passes, day_templates: buildDays(b), unit: b.unit || undefined };
+  // A template Start (17 C.3.4) carries the template id and its levels into the block.
+  return { template_id: b.template_id || null, levels: b.levels || {},
+    name: b.name.trim(), notes: b.notes, passes: b.passes === '' ? null : b.passes, day_templates: buildDays(b), unit: b.unit || undefined };
 }
 
 // Start weight plus or minus in the unit the new block will take (Part 18, r4.1 Q13, Q27): the
@@ -58,7 +69,9 @@ export function buildDays(b) {
   return b.days.map((d, i) => ({
     day: i + 1, label: d.label,
     lifts: d.lifts.map((l, j) => ({ slot: j + 1, exercise_id: l.exercise_id, sets: l.sets, rep_low: l.rep_low, rep_high: Math.max(l.rep_low, l.rep_high),
-      start_load: l.start_load, failure_set: l.failure_set, reps_left_target: l.failure_set ? 0 : null, warmups: [], sides: 'none',
+      start_load: l.start_load, failure_set: l.failure_set,
+      // A lift from a template Start stops 2 short (health-coach C5); a failure set takes 0.
+      reps_left_target: l.failure_set ? 0 : (typeof l.reps_left_target === 'number' ? l.reps_left_target : null), warmups: [], sides: l.sides === 'LR' ? 'LR' : 'none',
       load_basis: 'total', count_label: null, note: l.note }))
   }));
 }
@@ -129,19 +142,38 @@ export function renderBuilder(ctx) {
     save.disabled = !ok;
     save.addEventListener('click', async () => {
       save.disabled = true;
-      try {
-        await ctx.store.createBlock(blockSpec(b));
-      } catch (e) {
-        save.disabled = false;
-        toast(t('today.notsaved'));
-        return;
-      }
-      ctx.build = null;
-      ctx.go('#/today');
+      const finish = async (activate) => {
+        try {
+          await ctx.store.createBlock(blockSpec(b), null, { activate });
+        } catch (e) {
+          save.disabled = false;
+          toast(t('today.notsaved'));
+          return;
+        }
+        ctx.build = null;
+        ctx.go(activate ? '#/today' : '#/blocks');
+      };
+      // Another block is current: the new one takes the mark only on his yes (17 C.3.2, M74).
+      const current = await ctx.store.activeBlock().catch(() => null);
+      if (!current) return finish(true);
+      askSwitch((yes) => finish(yes), () => { save.disabled = false; });
+      return undefined;
     });
     screen.append(save, back(3));
   }
+  intro(ctx, 'intro_builder', 'intro.builder.title', 'intro.builder.lines');
   return screen;
+}
+
+// The 5.3 "Another block is active" ask every new-block path reuses (17 C.3.2): Yes makes the
+// new block current, No saves it and leaves the mark where it is. A scrim tap saves nothing.
+export function askSwitch(done, cancel) {
+  const yes = el('button', { class: 'btn btn-primary', type: 'button', id: 'switch-yes' }, t('fb.yes'));
+  const no = el('button', { class: 'btn btn-quiet', type: 'button', id: 'switch-no' }, t('fb.no'));
+  let picked = false;
+  const sh = sheet({ id: 'switch-sheet', title: t('block.switch'), onClose: () => { if (!picked && cancel) cancel(); } }, yes, el('div', { class: 'quiet-row' }, no));
+  yes.addEventListener('click', () => { picked = true; sh.close(); done(true); });
+  no.addEventListener('click', () => { picked = true; sh.close(); done(false); });
 }
 
 // Swap two lifts of a day; slots come from the order at Save (LOOK 4.6 reorder, C32).
@@ -218,6 +250,8 @@ function review(ctx, b) {
     // The info glyph tells the line apart without color (14.8 G18c, LOOK grayscale rule).
     ...b.days.filter(d => !d.lifts.length).map(d => el('div', { class: 'row', 'data-dayempty': String(b.days.indexOf(d)) },
       glyph('info'), el('span', { class: 'grow' }, t('builder.dayempty', { label: d.label || String(b.days.indexOf(d) + 1) })))),
+    // Slots a template Start had to leave out (17 C.3.4, health-coach C7).
+    b.dropped ? el('div', { class: 'row row-note', id: 'tpl-dropped' }, glyph('info'), el('span', { class: 'grow' }, tn('tpl.dropped', b.dropped))) : null,
     el('div', { class: 'row' }, el('span', { class: 'grow small' }, t('builder.how.line'))));
 }
 
@@ -227,9 +261,14 @@ function review(ctx, b) {
 // muscle's group, rows sorted by name inside a group (never by answers), rows the block left out
 // of the builder never shown. q is the search box text; kinds is the chip's equipment list, or
 // null for every kind. A muscle with no row is left out. Pure: no page, no store.
-export function pickerGroups(rows, q, kinds) {
+// Slice 3 (17 C.3.1, r4.4 R24): kinds and saved are equipment_detail lists. saved (his saved
+// equipment, null = every kind) hides the kinds he does not have, in every chip, "All" included;
+// his own exercises (custom) always pass it. allGear shows every kind for this visit.
+export function pickerGroups(rows, q, kinds, gear) {
+  const saved = gear && Array.isArray(gear.saved) ? gear.saved : null, allGear = !!(gear && gear.allGear);
   const needle = String(q || '').trim().toLowerCase();
-  const shown = rows.filter(e => (!needle || e.name.toLowerCase().includes(needle)) && (!kinds || kinds.includes(e.equipment)) && !e.left_out_of_builder);
+  const gearOk = (e) => allGear || !saved || e.custom === true || saved.includes(e.equipment_detail);
+  const shown = rows.filter(e => (!needle || e.name.toLowerCase().includes(needle)) && (!kinds || kinds.includes(e.equipment_detail)) && gearOk(e) && !e.left_out_of_builder);
   const out = [];
   for (const m of MUSCLES) {
     const list = shown.filter(e => e.muscle === m).sort((a, b) => a.name.localeCompare(b.name));
@@ -251,6 +290,16 @@ export function renderPicker(ctx) {
 
   const pick = async (exerciseId) => {
     // Swap and Add an exercise on Today (16 B.5 row 17) go back to Today with the pick.
+    // A guided board slot (17 C.3.5, S12): the pick fills that slot as a hand pick.
+    if (p.mode === 'slot') {
+      const g = ctx.guided;
+      const d = g && g.board && g.board.find(x => x.day === p.day);
+      const l = d && d.lifts.find(x => x.slot === p.slot);
+      if (l && !d.lifts.some(x => x !== l && x.exercise_id === exerciseId)) { l.exercise_id = exerciseId; l.hand = true; }
+      ctx.picker = null;
+      ctx.go(p.back);
+      return;
+    }
     if (p.mode === 'swap' || p.mode === 'addex') {
       await swapTo(ctx, exerciseId);
       ctx.go('#/today');
@@ -265,10 +314,18 @@ export function renderPicker(ctx) {
 
   const make = (name) => makeSheet(ctx, name, async (row) => { ctx.exerciseCache = await ctx.store.exercisesMap(); pick(row.id); });
 
+  // Saved equipment (17 C.3.1): kinds he does not have are hidden in every chip; the quiet
+  // Show all equipment toggle at the end shows them for this visit only (never stored).
+  let allGear = false;
+  const gearBtn = el('button', { class: 'btn btn-quiet', type: 'button', id: 'picker-allgear', 'aria-pressed': 'false',
+    on: { click: () => { allGear = !allGear; gearBtn.setAttribute('aria-pressed', String(allGear)); paint(); } } }, t('picker.allgear'));
   async function paint() {
     const all = [...(await ctx.store.exercisesMap()).values()];
     ctx.exerciseCache = new Map(all.map(e => [e.id, e]));
-    const groups = pickerGroups(all, search.value, CHIP_EQUIPMENT[chip]);
+    const saved = await ctx.store.getSavedEquipment().catch(() => null);
+    // From a guided slot the list holds only that slot's muscle (S12).
+    const mine = p.mode === 'slot' ? all.filter(e => e.muscle_detail === p.muscle_detail) : all;
+    const groups = pickerGroups(mine, search.value, CHIP_EQUIPMENT[chip], { saved, allGear });
     clear(list);
     if (!groups.length) {
       list.append(el('p', { class: 'lead', id: 'picker-nomatch' }, t('picker.nomatch')),
@@ -284,14 +341,16 @@ export function renderPicker(ctx) {
   search.addEventListener('input', paint);
   screen.append(
     el('div', { class: 'topbar' }, el('button', { class: 'btn btn-quiet', type: 'button', id: 'picker-back', on: { click: () => { ctx.picker = null; ctx.go(p.back); } } }, glyph('back'), t('builder.back')),
-      el('h2', { class: 'grow' }, p.mode === 'swap' ? t('menu')[3] : p.mode === 'addex' ? t('daymenu.addex') : t('builder.addex'))),
+      el('h2', { class: 'grow' }, p.mode === 'swap' ? t('menu')[3] : p.mode === 'addex' ? t('daymenu.addex') : p.mode === 'slot' ? t('intro.picker.title') : t('builder.addex'))),
     search, el('div', { class: 'chips-row' }, chips), list,
-    el('button', { class: 'btn btn-secondary', type: 'button', id: 'picker-make', on: { click: () => make(search.value.trim()) } }, glyph('plus'), t('picker.make')));
+    el('button', { class: 'btn btn-secondary', type: 'button', id: 'picker-make', on: { click: () => make(search.value.trim()) } }, glyph('plus'), t('picker.make')),
+    el('div', { class: 'quiet-row' }, gearBtn));
   paint();
+  intro(ctx, 'intro_picker', 'intro.picker.title', 'intro.picker.lines');
   return screen;
 }
 
-function makeSheet(ctx, startName, done) {
+export function makeSheet(ctx, startName, done) {
   let muscle = MUSCLES[0], equipment = EQUIPMENT[0];
   const name = el('input', { type: 'text', class: 'field', id: 'make-name', maxlength: String(LIMITS.NAME), autocomplete: 'off', 'aria-label': t('picker.make') });
   name.value = startName || '';
@@ -304,15 +363,26 @@ function makeSheet(ctx, startName, done) {
   };
   const go = el('button', { class: 'btn btn-primary', type: 'button', id: 'make-save' }, t('picker.addq', { q: name.value }));
   name.addEventListener('input', () => { go.textContent = t('picker.addq', { q: name.value.trim() }); });
+  // The current block's flag questions, in his words, asked before Save (17 C.2.5 item 4, R4-04).
+  const flags = {};
+  const qBox = el('div', { id: 'make-flags' });
+  ctx.store.flagQuestions().then((qs) => {
+    for (const q of qs) {
+      const chips = [false, true].map(yes => el('button', { class: 'chip', type: 'button', 'data-flagans': q.key + (yes ? '-yes' : '-no'), 'aria-pressed': 'false',
+        on: { click: () => { flags[q.key] = yes; chips.forEach((c, i) => { const on = (i === 1) === yes; c.classList.toggle('is-on', on); c.setAttribute('aria-pressed', String(on)); }); } } },
+        glyph('check'), t(yes ? 'fb.yes' : 'fb.no')));
+      qBox.append(el('div', { class: 'check-q', 'data-flagq': q.key }, el('p', { class: 'q-text' }, q.ask), el('div', { class: 'check-chips' }, ...chips)));
+    }
+  }).catch(() => {});
   const sh = sheet({ id: 'make-sheet', title: t('picker.make'), canDismiss: () => !name.value },
     name, seg(MUSCLES, MUSCLE_NAMES, () => muscle, (k) => { muscle = k; }, 'make-muscle'),
-    seg(EQUIPMENT, EQUIPMENT_NAMES, () => equipment, (k) => { equipment = k; }, 'make-equipment'), go);
+    seg(EQUIPMENT, EQUIPMENT_NAMES, () => equipment, (k) => { equipment = k; }, 'make-equipment'), qBox, go);
   go.addEventListener('click', async () => {
     const n = name.value.trim();
     if (!n) { name.focus(); return; }
     // A refused or failed save keeps the sheet and the typed name, with today.notsaved (SR3, SR11).
     let row = null;
-    try { row = await ctx.store.addCustomExercise({ name: n, muscle, equipment }); } catch (e) { toast(t('today.notsaved')); return; }
+    try { row = await ctx.store.addCustomExercise({ name: n, muscle, equipment, flags }); } catch (e) { toast(t('today.notsaved')); return; }
     sh.close();
     done(row);
   });

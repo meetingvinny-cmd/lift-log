@@ -7,15 +7,18 @@ import { S, t, tn, numSplit } from './strings.js';
 import { LIMITS, isLink, SET_KINDS } from '../backup.js';
 import { MUSCLE_NAMES, EQUIPMENT_NAMES } from '../data/exercises.js';
 import { finishable, effectiveExercise, deleteReason, checksFor } from '../store.js';
-import { openBuilder } from './builder.js';
+import { pickTip, tipLine, changedBanner } from './tips.js';
 
 const LINK_REL = 'noopener noreferrer';   // plain link to the uploader, never embedded
 const NO_DONE_SET = 'no done set';       // the store's refusal code for a day with no done set (R4-02)
+const REFUSED = 'Refused';               // the store's refusal error name
 const DAY_OPEN = 'day open';             // the store's refusal code for Close block with a day open (16 B.5 row 7)
 const rowState = new Map();     // set id -> 'saving' | 'failed'
 let openId = null;              // the row he tapped open, if any
 let inset = null;               // the block check inset (15 Part 17): {day, slot, after: set id or null}
 let sinceTimer = null;
+// Slice 3 (17 C.3.16): the newest tip event this app session, {kind: 'start' | 'rest', dayId, exercise_id}.
+let tipEvent = null;
 // Slice 2: the soreness-alone sheet he put off (Ask me later) or passed (Skip) this app session,
 // by feedback row id (16 B.4.4, B.5 row 9). Ask me later folds soreness into the end sheet; Skip
 // leaves it off the end sheet.
@@ -204,6 +207,12 @@ async function draw(ctx, screen) {
     return true;
   };
   const store = ctx.store;
+  // The what-changed note (17 C.3.16): once after an update, on every Today state; showing it writes
+  // seen_version, so a reload never shows it again; its close hides it for this visit.
+  if (ctx.changedNote) {
+    box.appendChild(changedBanner(ctx, ctx.changedNote));
+    if (!ctx.changedShown) { ctx.changedShown = true; store.markChangedSeen().catch(() => {}); }
+  }
   const unit = await store.getSetting('unit', null);
   const block = await store.activeBlock();
   const day = await store.currentDay();
@@ -212,7 +221,7 @@ async function draw(ctx, screen) {
   const closed = !!day && !!block && block.status === 'done' && day.block_id === block.id && day.status !== 'open';
   if (!day || closed) {
     // A block whose last day is done is finished, not missing (C27).
-    box.appendChild(unit === null && !block ? setupScreen(ctx) : block && block.status === 'done' ? blockDone(ctx) : noBlock(ctx));
+    box.appendChild(unit === null && !block ? setupScreen(ctx) : block && block.status === 'done' ? blockDone(ctx, block) : noBlock(ctx));
     commit();
     return;
   }
@@ -257,12 +266,19 @@ async function draw(ctx, screen) {
     const shown = open.draft && open.draft.load !== null && open.draft.load !== undefined ? open.draft.load : open.target.load;
     if (shown !== open.target.load && shown !== null && shown !== undefined) retarget = await store.retarget(open.id, shown).catch(() => null);
   }
+  // One tip line at a time (17 C.3.16): warm-up above the first card on round 1, rest under the card
+  // of the open row after a saved tick, start under the card after a swap.
+  const tip = pickTip(tipEvent, await store.tipsSeen().catch(() => ({ tip_warmup: true, tip_rest: true, tip_start: true })), day, !!open);
+  let firstCard = true;
   for (const slot of order) {
     const sets = v.sets.filter(s => s.slot === slot);
     // The exercise as this block uses it, in every reader on the card (15 Part 18, R4-04).
     const ex = effectiveExercise(b, v.exercises.get(sets[0].exercise_id));
     const last = (await store.lastTime(sets[0].exercise_id, day.id)).filter(s => s.kind === 'work');
+    if (tip && tip.id === 'tip_warmup' && firstCard) box.appendChild(tipLine(ctx, tip.id));
+    firstCard = false;
     box.appendChild(card(ctx, screen, v, slot, sets, ex, last, open, since, whys[slot] || null, retarget));
+    if (tip && ((tip.id === 'tip_start' && tip.exercise_id === sets[0].exercise_id) || (tip.id === 'tip_rest' && open && open.slot === slot))) box.appendChild(tipLine(ctx, tip.id));
   }
   // Finish day only on a day he started (or skipped through): one tap on an untouched day
   // must never close it and move him on (C34).
@@ -316,6 +332,8 @@ export function dayMenuRows(day, sets, block) {
   if (block && live && liveLifts(sets) < LIMITS.LIFTS_PER_DAY) rows.push('addex');
   if (live) rows.push('relabel');
   if (day.status === 'open') rows.push('reset');
+  // Slice 3 (17 C.3.15, LOOK 4.3): Body weight on a planned or open day of the day's block.
+  if (block && live) rows.push('bw');
   if (live && !(sets || []).some(s => s.status === 'done')) rows.push('skip');
   if (block && block.status !== 'done') rows.push('end');
   return rows;
@@ -333,6 +351,7 @@ function dayMenu(ctx, screen, v) {
       redraw(ctx, screen);
     }); },
     reset: () => { sh.close(); resetSheet(ctx, screen, v); },
+    bw: () => { sh.close(); bodyWeightSheet(ctx, screen, v); },
     skip: () => { sh.close(); skipDaySheet(ctx, screen, v); },
     end: () => {
       sh.close();
@@ -341,7 +360,7 @@ function dayMenu(ctx, screen, v) {
       endSheet(ctx, v);
     }
   };
-  const words = { addex: 'daymenu.addex', relabel: 'day.relabel', reset: 'day.reset', skip: 'daymenu.skip', end: 'daymenu.end' };
+  const words = { addex: 'daymenu.addex', relabel: 'day.relabel', reset: 'day.reset', bw: 'daymenu.bw', skip: 'daymenu.skip', end: 'daymenu.end' };
   // The hairline sets off the rows that move the block forward (LOOK 4.3): it hangs on the first of them.
   const rows = dayMenuRows(day, v.sets, v.block);
   const sep = rows.find(k => k === 'skip' || k === 'end');
@@ -370,7 +389,9 @@ function endSheet(ctx, v) {
     sh.close();
     openId = null;
     inset = null;
-    ctx.render();
+    // Block finished (17 C.3.9): the screen, with the backup nudge over it once (no Day done here).
+    ctx.finished = { id: v.block.id, nudge: true };
+    ctx.go('#/finished/' + v.block.id);
   });
 }
 
@@ -425,6 +446,7 @@ async function pickedFlow(ctx, screen, v, p) {
   const dayId = v.day.id;
   if (p.mode === 'swap') {
     const ok = await scopeSheet((sc) => ctx.store.liveEdit({ type: 'swap', dayId, slot: p.slot, exercise_id: p.exercise_id }, sc));
+    if (ok) tipEvent = { kind: 'start', dayId, exercise_id: p.exercise_id };
     if (ok) redraw(ctx, screen);
     return;
   }
@@ -491,6 +513,8 @@ function drawn(name) {
     DRAWN[name].map(([tag, at]) => svg(tag, at)));
 }
 export const tildeGlyph = () => drawn('tilde');
+// The small target ring of the Current pill (LOOK 3.5, Slice 3 block list).
+export const ringGlyph = () => drawn('ring');
 
 // Skip day (LOOK 4.11 confirm, 15 Part 15): a title, one line, a secondary confirm and a quiet
 // Cancel. No typed word, no undo. The store skips every planned set, ends the day and plans the
@@ -503,8 +527,9 @@ function skipDaySheet(ctx, screen, v) {
   cancel.addEventListener('click', () => sh.close());
   go.addEventListener('click', async () => {
     go.disabled = true;
+    let next = null;
     try {
-      await ctx.store.skipDay(v.day.id);
+      next = await ctx.store.skipDay(v.day.id);
     } catch (e) {
       go.disabled = false;
       toast(t('today.notsaved'));
@@ -513,8 +538,42 @@ function skipDaySheet(ctx, screen, v) {
     sh.close();
     ctx.wake.release();
     openId = null;
+    // Skip day on the last day ends the block (R21): Block finished, the nudge over it once (17 C.3.9).
+    if (!next) { ctx.finished = { id: v.block.id, nudge: true }; ctx.go('#/finished/' + v.block.id); return; }
     ctx.render();
   });
+}
+
+// Body weight (17 C.3.15, LOOK 4.13): one decimal field with the block's unit word, Save, quiet
+// Clear (writes null) and Cancel. 20 to 1000; a refused value shows num.bw and the old value stays.
+function bodyWeightSheet(ctx, screen, v) {
+  const unit = t(v.block.unit === 'kg' ? 'unit.kg' : 'unit.lb');
+  const input = el('input', { type: 'text', inputmode: 'decimal', class: 'field num', id: 'bw-in', maxlength: String(LIMITS.KEY), autocomplete: 'off', 'aria-label': t('bw.field', { unit }) });
+  input.value = typeof v.day.body_weight === 'number' ? String(v.day.body_weight) : '';
+  const help = el('p', { class: 'small', id: 'bw-help' }, '');
+  const save = el('button', { class: 'btn btn-primary', type: 'button', id: 'bw-save' }, t('text.save'));
+  const clearBtn = el('button', { class: 'btn btn-quiet', type: 'button', id: 'bw-clear' }, t('text.clear'));
+  const cancel = el('button', { class: 'btn btn-quiet', type: 'button', id: 'bw-cancel' }, t('text.cancel'));
+  const sh = sheet({ id: 'bw-sheet', title: t('daymenu.bw'), canDismiss: () => true },
+    el('label', { class: 'bw-row' }, el('span', { class: 'small' }, t('bw.field', { unit })), el('span', { class: 'bw-field' }, input, el('span', { class: 'unit' }, unit))),
+    help, save, el('div', { class: 'quiet-row' }, clearBtn, cancel));
+  const done = async (val) => {
+    try { await ctx.store.setBodyWeight(v.day.id, val); } catch (e) {
+      const refused = !!e && e.name === REFUSED;
+      if (refused) { help.textContent = t('num.bw'); return; }
+      toast(t('today.notsaved'));
+      return;
+    }
+    sh.close();
+    redraw(ctx, screen);
+  };
+  save.addEventListener('click', () => {
+    const n = readNumber(input.value, 1000, false);
+    if (n === null || Number.isNaN(n) || n < 20) { help.textContent = t('num.bw'); return; }
+    done(n);
+  });
+  clearBtn.addEventListener('click', () => done(null));
+  cancel.addEventListener('click', () => sh.close());
 }
 
 // Reset day (LOOK 4.3, 15 Part 12): a typed RESET, then the store makes the safety copy and
@@ -580,21 +639,23 @@ function setupScreen(ctx) {
   return el('div', { class: 'empty', id: 'setup' }, ghostTally(4),
     el('h2', {}, t('setup.title')), el('p', { class: 'lead' }, t('setup.line')),
     el('div', { class: 'seg' }, lb, kg),
-    el('button', { class: 'btn btn-primary', type: 'button', id: 'setup-build', on: { click: async () => { await ctx.store.setSetting('unit', unit); openBuilder(ctx); } } }, t('setup.build')),
+    el('button', { class: 'btn btn-primary', type: 'button', id: 'setup-build', on: { click: async () => { await ctx.store.setSetting('unit', unit); ctx.go('#/new'); } } }, t('setup.build')),
     el('button', { class: 'btn btn-quiet', type: 'button', id: 'setup-load', on: { click: () => { ctx.store.setSetting('unit', unit); ctx.loadBlockFile(); } } }, t('setup.load')));
 }
 
-function blockDone(ctx) {
+// The Block finished row (17 C.3.9, LOOK 3.10 Slice 3): the title, Start a new block and Copy this
+// block, no line (empty.done.line is Slices 1 and 2 only).
+function blockDone(ctx, block) {
   return el('div', { class: 'empty', id: 'block-done' }, ghostTally(4),
-    el('h2', {}, t('empty.done.title')), el('p', { class: 'lead' }, t('empty.done.line')),
-    el('button', { class: 'btn btn-primary', type: 'button', id: 'build-block', on: { click: () => openBuilder(ctx) } }, t('setup.build')),
-    el('button', { class: 'btn btn-quiet', type: 'button', id: 'load-block', on: { click: () => ctx.loadBlockFile() } }, t('setup.load')));
+    el('h2', {}, t('empty.done.title')),
+    el('button', { class: 'btn btn-primary', type: 'button', id: 'fin-new', on: { click: () => ctx.go('#/new') } }, t('fin.new')),
+    el('button', { class: 'btn btn-secondary', type: 'button', id: 'fin-copy', on: { click: () => ctx.go('#/copy/' + block.id) } }, t('fin.copy')));
 }
 
 function noBlock(ctx) {
   return el('div', { class: 'empty', id: 'no-block' }, ghostTally(4),
     el('h2', {}, t('empty.today.title')), el('p', { class: 'lead' }, t('empty.today.line')),
-    el('button', { class: 'btn btn-primary', type: 'button', id: 'build-block', on: { click: () => openBuilder(ctx) } }, t('setup.build')),
+    el('button', { class: 'btn btn-primary', type: 'button', id: 'build-block', on: { click: () => ctx.go('#/new') } }, t('setup.build')),
     el('button', { class: 'btn btn-quiet', type: 'button', id: 'load-block', on: { click: () => ctx.loadBlockFile() } }, t('setup.load')));
 }
 
@@ -609,7 +670,7 @@ export function tallyGroups(doneFlags) {
   });
   return groups;
 }
-function fillTally(tally, doneFlags) {
+export function fillTally(tally, doneFlags) {
   tally.classList.add('tally-grouped');
   for (const g of tallyGroups(doneFlags)) {
     const box = el('span', { class: 'tally-group', 'aria-hidden': 'true' });
@@ -643,7 +704,10 @@ function card(ctx, screen, v, slot, sets, ex, last, open, since, why, retarget) 
     paint();
     setTimeout(() => { if (sinceLine.isConnected) { clearInterval(sinceTimer); sinceTimer = setInterval(paint, 1000); } }, 0);
   }
-  const lastLine = last.length ? el('p', { class: 'ex-last' }, last.map(s => t('today.last', { load: fmtNum(s.done.load), reps: s.done.reps })).join(', ')) : null;
+  // A body-load row reads its reps only (17 C.2.2 Today change: today.last.body).
+  const bodyRow = !!ex && ex.load_kind === 'body';
+  const lastLine = last.length ? el('p', { class: 'ex-last' }, last.map(s => bodyRow ? t('today.last.body', { reps: s.done.reps })
+    : t('today.last', { load: fmtNum(s.done.load), reps: s.done.reps })).join(', ')) : null;
   const lift = liftOf(v, slot, sets[0].exercise_id);
   // His lift note (15 Part 18, LOOK 3.2): its own quiet line under the header, his words, text only.
   const noteLine = lift && lift.short_note ? el('p', { class: 'ex-note' }, lift.short_note) : null;
@@ -746,10 +810,16 @@ function setRow(ctx, screen, v, s, ex, isOpen, lift, retarget) {
 
   let loadIn = null, repsIn = null;
   const helper = el('p', { class: 'helper' });
+  // The weight cell by the exercise's load kind (17 C.2.2 Today change, health-coach C11): a body
+  // row shows today.body and no weight steppers; a body plus row shows today.plus before the added
+  // load; an assist row shows today.assist before the number and keeps its steppers.
+  const loadKind = ex && ex.load_kind ? ex.load_kind : 'external';
   const valueCell = (kind) => {
+    if (kind === 'load' && loadKind === 'body') return el('div', { class: 'cell', 'data-val': 'body' }, el('span', { class: 'unit body-word' }, t('today.body')));
     const val = kind === 'load' ? cur.load : cur.reps;
     const btn = el('button', { class: 'val-btn', type: 'button', 'data-val': kind }, fmtNum(val));
-    const cell = el('div', { class: 'cell' }, btn, el('span', { class: 'unit' }, kind === 'load' ? unitWord(block, s.target) : countWord));
+    const lead = kind === 'load' && (loadKind === 'body_plus' || loadKind === 'assist') ? el('span', { class: 'unit load-word', 'data-loadword': loadKind }, t(loadKind === 'assist' ? 'today.assist' : 'today.plus')) : null;
+    const cell = el('div', { class: 'cell' }, lead, btn, el('span', { class: 'unit' }, kind === 'load' ? unitWord(block, s.target) : countWord));
     if (isOpen && !st) {
       btn.addEventListener('click', () => {
         const limitKey = kind === 'load' ? 'LOAD_CHARS' : 'REPS_CHARS';
@@ -846,6 +916,7 @@ function setRow(ctx, screen, v, s, ex, isOpen, lift, retarget) {
     try {
       await ctx.store.tick(s.id, { ...cur });
       rowState.delete(s.id);
+      tipEvent = { kind: 'rest', dayId: day.id };
       ctx.wake.ensure();
       // Every saved tick on a card with block checks shows the inset under that row, warm-ups
       // included; the next tick replaces it (15 Part 17, R4-03, review R37).
@@ -921,7 +992,7 @@ function strips(ctx, screen, v, s, ex, cur, helper) {
   const br = breaksShown(s, ex) ? [el('p', { class: 'label' }, t('breaks.title')),
     breakChips(cur, setLabel(s), (n) => { cur.breaks = n; save(); })] : [];
   const out = el('div', { class: 'strips' },
-    el('div', { class: 'steppers' }, el('div', {}, stepper('load', -1), stepper('load', 1)), el('div', {}, stepper('reps', -1), stepper('reps', 1))),
+    el('div', { class: 'steppers' }, ex && ex.load_kind === 'body' ? el('div', {}) : el('div', {}, stepper('load', -1), stepper('load', 1)), el('div', {}, stepper('reps', -1), stepper('reps', 1))),
     el('p', { class: 'label' }, t('today.repsleft')), chips, ...br, el('div', { class: 'strip3' }, fail, menu));
   // Failure notes inform; they never block the save (DESIGN 5.3).
   if (cur.failure) {
@@ -1355,8 +1426,9 @@ export async function finishFlow(ctx, dayId) {
   }
   // (3) One transaction. (4) Keep-awake off. (5) The backup file rebuilt. (6) The nudge.
   // A write that does not save says so; the day stays open and keep-awake stays on (C35).
+  let next = null;
   try {
-    await store.finishDay(dayId, scores || {});
+    next = await store.finishDay(dayId, scores || {});
   } catch (e) {
     const none = !!e && e.code === NO_DONE_SET;
     toast(t(none ? 'today.finish.none' : 'today.finish.notsaved'));
@@ -1368,7 +1440,8 @@ export async function finishFlow(ctx, dayId) {
   openId = null;
   inset = null;
   // (6) The Day done screen, then the nudge over it right after its first paint (15 Part 14).
-  ctx.dayDone = { id: dayId, nudge: true };
+  ctx.dayDone = { id: dayId, nudge: true, finished: next ? null : v.block.id };
+  ctx.changedNote = null;
   ctx.go('#/daydone/' + dayId);
 }
 
@@ -1390,7 +1463,13 @@ export function renderDayDone(ctx, dayId) {
     const tally = el('span', { class: 'tally tally-lg', role: 'img', id: 'done-tally',
       'aria-label': totals.workDone === 1 ? t('done.tally.one') : t('done.tally', { n: totals.workDone }) });
     fillTally(tally, Array.from({ length: totals.workDone }, () => true));
-    const go = el('button', { class: 'btn btn-primary', type: 'button', id: 'done-go', on: { click: () => { ctx.dayDone = null; ctx.go('#/today'); } } }, t('done.go'));
+    // The last day of the block (17 C.3.9): the Day done button goes to Block finished, no second nudge.
+    const blockOver = !!want.finished;
+    const go = el('button', { class: 'btn btn-primary', type: 'button', id: 'done-go', on: { click: () => {
+      ctx.dayDone = null;
+      if (blockOver) { ctx.finished = { id: want.finished, nudge: false }; ctx.go('#/finished/' + want.finished); return; }
+      ctx.go('#/today');
+    } } }, t('done.go'));
     clear(screen);
     screen.append(
       el('p', { class: 'label', id: 'done-position' }, t('today.position', { r: day.pass, label: day.label || String(day.day) })),
@@ -1408,7 +1487,7 @@ export function renderDayDone(ctx, dayId) {
   return screen;
 }
 
-function nudge(ctx) {
+export function nudge(ctx) {
   const now = el('button', { class: 'btn btn-primary', type: 'button', id: 'nudge-now' }, t('nudge.now'));
   const later = el('button', { class: 'btn btn-quiet', type: 'button', id: 'nudge-later' }, t('nudge.later'));
   const sh = sheet({ id: 'nudge', onClose: () => ctx.offerPendingUpdate() }, now, el('div', { class: 'quiet-row' }, later));
@@ -1423,6 +1502,6 @@ export async function swapTo(ctx, exerciseId) {
   const p = ctx.picker;
   ctx.picker = null;
   if (!p) return;
-  if (p.mode === 'swap' && !p.scoped) { await ctx.store.swapExercise(p.dayId, p.slot, exerciseId); return; }
+  if (p.mode === 'swap' && !p.scoped) { await ctx.store.swapExercise(p.dayId, p.slot, exerciseId); tipEvent = { kind: 'start', dayId: p.dayId, exercise_id: exerciseId }; return; }
   if (p.mode === 'swap' || p.mode === 'addex') ctx.todayEdit = { mode: p.mode, dayId: p.dayId, slot: p.slot, exercise_id: exerciseId };
 }

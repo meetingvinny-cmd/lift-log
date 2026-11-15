@@ -571,7 +571,7 @@ export const SEED_IDS = Object.freeze(SEED_EXERCISES.map(r => r.id));
 export const MUSCLE_NAMES = Object.freeze({ chest: 'Chest', back: 'Back', shoulders: 'Shoulders', arms: 'Arms', legs: 'Legs', core: 'Core' });
 export const EQUIPMENT_NAMES = Object.freeze({ machine: 'Machine', cable: 'Cable', barbell: 'Barbell', dumbbell: 'Dumbbell', bodyweight: 'Body weight', other: 'Other' });
 // Picker chips (5.11 picker.chips order: All, Machine, Cable, Free, Body).
-export const CHIP_EQUIPMENT = Object.freeze([null, ['machine'], ['cable'], ['barbell', 'dumbbell'], ['bodyweight']]);
+export const CHIP_EQUIPMENT = Object.freeze([null, ['machine', 'smith'], ['cable'], ['barbell', 'landmine', 'dumbbell', 'kettlebell'], ['body']]);
 // Schema 2 finer values (17 C.2.2): their words, the chip each one sits on, and the two tag codes.
 export const MUSCLE_DETAIL_NAMES = Object.freeze({ chest: 'Chest', back: 'Back', traps_neck: 'Traps and neck', shoulders: 'Shoulders', biceps: 'Biceps', triceps: 'Triceps', forearms_grip: 'Forearms and grip', abs_core: 'Abs and core', quads: 'Quads', hamstrings: 'Hamstrings', glutes: 'Glutes', calves: 'Calves' });
 export const MUSCLE_DETAIL_CHIP = Object.freeze({ chest: 'chest', back: 'back', traps_neck: 'back', shoulders: 'shoulders', biceps: 'arms', triceps: 'arms', forearms_grip: 'arms', abs_core: 'core', quads: 'legs', hamstrings: 'legs', glutes: 'legs', calves: 'legs' });

@@ -5,13 +5,15 @@
 // schema 2 words, a sleep answer, a set kind he picked, a hand Add set, a custom exercise. Made
 // again at B.1 step 5 rest with the switch through switchProfile (three ticks and ADJUST), a Rest
 // of block Add set through liveEdit and a Change answers save (B.6.3). Made again at B.1 step 11,
-// once the Slice 2 screens call these, with the soreness-alone sheet's saveSoreness on day B.
+// once the Slice 2 screens call these, with the soreness-alone sheet's saveSoreness on day B. Made
+// again at Slice 3 C.0.1 step 1 with the Slice 3 store calls (C.0.2: every Slice 3 field filled).
 import { writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from '../../store.js';
 import { createFakeDb, fakeClock } from './unit/fake_db.js';
 import { SCHEMA } from '../../version.js';
+import { TEMPLATES } from '../../data/templates.js';
 
 if (SCHEMA !== 2) {
   console.log('make_fixture_v2.mjs makes the schema 2 fixture only; SCHEMA is ' + SCHEMA + ', nothing written');
@@ -105,6 +107,34 @@ clock.add(24 * 60 * MIN);
 day = await store.currentDay();
 await store.answerSleep(day.id, true);
 await store.answerSleep(day.id, null);
+
+// Slice 3 (17 C.0.1 step 1, C.0.2, r4 review R33): every Slice 3 field filled by the store's own
+// calls. Saved equipment, two tips seen, the what-changed version written on a first boot, a body
+// weight on the planned round 2 day A, muscle levels changed mid block, a block started from one of
+// our templates (template_id), his own template saved from the block, a copy of round 1
+// (copied_from) ended with End block (finished_at), and a block made and deleted (before-delete).
+await store.setSavedEquipment(['machine', 'smith', 'cable', 'barbell', 'landmine', 'dumbbell', 'kettlebell', 'body', 'other']);
+await store.markTipSeen('tip_warmup');
+await store.markTipSeen('intro_picker');
+await store.changedDue();
+clock.add(MIN);
+await store.setBodyWeight(day.id, 181.5);
+await store.setPriorities(block.id, { quads: 'top', hamstrings: 'middle', abs_core: 'bottom' });
+clock.add(MIN);
+const tpl = TEMPLATES[0];
+const draft = await store.templateToDraft(tpl.id);
+await store.createBlock({ name: draft.name, passes: 2, levels: draft.levels, template_id: draft.template_id,
+  day_templates: draft.days.map((d, i) => ({ day: i + 1, label: d.label, lifts: d.lifts.map((l, j) => lift(j + 1, l.exercise_id, l.sets, null,
+    { rep_low: l.rep_low, rep_high: l.rep_high, reps_left_target: l.reps_left_target, sides: l.sides })) })) }, null, { activate: false });
+clock.add(MIN);
+await store.saveBlockAsTemplate(block.id, 'Made-up own template');
+clock.add(MIN);
+const copy = await store.copyBlock(block.id, 1, { activate: false });
+clock.add(MIN);
+await store.endBlock(copy.id);
+clock.add(MIN);
+const gone = await store.createBlock({ name: 'Made-up block to delete', passes: 1, day_templates: [{ day: 1, label: 'A', lifts: [lift(1, 'leg_press', 1, 100)] }] }, null, { activate: false });
+await store.deleteBlock(gone.id, 'DELETE');
 
 await store.setSetting('last_backup_at', clock.now() - 1000);
 clock.add(MIN);

@@ -13,8 +13,8 @@ export const LIMITS = {
   PASS_MAX: 1000, DAY_MAX: 100, SLOT_MAX: 1000, SET_N_MAX: 1000, BLOCK_VERSION_MAX: 1000000,
   DAYS_PER_BLOCK: 14, LIFTS_PER_DAY: 30, WARMUPS: 5, CHECKS: 10, SCORES: 10, STEPS: 40,
   // FLAGS: his block file screens every list row with one entry each (r4.1 C2, 533 rows today), so
-  // the cap is above the list with room for his own rows.
-  ID_MAP: 500, FLAGS: 1000, BLOCK_EXERCISES: 500,
+  // the cap is above the list with room for his own rows (17 C.0.2: 5000, equal to ROWS.exercises).
+  ID_MAP: 500, FLAGS: 5000, BLOCK_EXERCISES: 500,
   // r4 block file fields (R4-04, r4.1 Q18): ids a check is asked on, and a block's own step size.
   CHECK_LIFTS: 50, BLOCK_STEP_MIN: 0.5, BLOCK_STEP_MAX: 200,
   // Breaks on a laps set (15 Part 16, R4-14): 0, 1, 2 or 3, where 3 means three or more.
@@ -30,8 +30,8 @@ export const LIMITS = {
   ROWS: { settings: 50, exercises: 5000, templates: 200, blocks: 500, days: 10000, sets: 100000, feedback: 40000 },
   FLAT_LOG_ROWS: 100000,
   // Worked out from the row caps by scripts/tests/unit/backup.test.js (it fails if these are lower).
-  MAX_STORES_BYTES: 2765511664,
-  MAX_RAW_BYTES: 4205577202,
+  MAX_STORES_BYTES: 5107511664,
+  MAX_RAW_BYTES: 6547577202,
   // A block file is a few KB; this cap is a set number above the largest block the caps
   // allow (backup.test.js builds that block and fails if it is not below), so a wrong pick
   // (a video) is refused before it is read (A2-5).
@@ -77,7 +77,7 @@ export const WHY_KEY_OF = Object.freeze({
   'Day skipped': 'why.dayskipped'
 });
 // Every rule table name a block can be frozen on (0.3.0).
-export const RULE_VERSIONS = Object.freeze(['none', 'signed-1']);
+export const RULE_VERSIONS = Object.freeze(['none', 'signed-1', 'signed-2']);
 export const MUSCLE_DETAILS = Object.freeze(['chest', 'back', 'traps_neck', 'shoulders', 'biceps', 'triceps', 'forearms_grip', 'abs_core', 'quads', 'hamstrings', 'glutes', 'calves']);
 export const MUSCLE_DETAIL_CHIP = Object.freeze({ chest: 'chest', back: 'back', traps_neck: 'back', shoulders: 'shoulders', biceps: 'arms', triceps: 'arms', forearms_grip: 'arms', abs_core: 'core', quads: 'legs', hamstrings: 'legs', glutes: 'legs', calves: 'legs' });
 export const EQUIPMENT_DETAILS = Object.freeze(['machine', 'smith', 'cable', 'barbell', 'landmine', 'dumbbell', 'kettlebell', 'band', 'body', 'other']);
@@ -465,7 +465,7 @@ function rowRules2(store, r, w) {
   }
   if (store === 'blocks') {
     if (r.rules_frozen.profile !== r.profile) bad(w + ': frozen profile differs from the block profile');
-    if (r.profile === 'adaptive' && r.rules_frozen.rules_version !== 'signed-1') bad(w + ': an adaptive block needs the signed rules');
+    if (r.profile === 'adaptive' && r.rules_frozen.rules_version !== 'signed-1' && r.rules_frozen.rules_version !== 'signed-2') bad(w + ': an adaptive block needs the signed rules');
     const ps = r.profile_switch;
     if (ps !== null) {
       if (ps.switched_at < LIMITS.ADJUST_EARLIEST_MS) bad(w + ': switched before the earliest day');

@@ -455,8 +455,11 @@ test('block caps: 15 days, 31 lifts or 501 exercises refused; the largest block 
   body.rules_frozen = { profile: 'fixed', rules_version: 'signed-1' };
   body.levels = { [exRow.muscle_detail]: 'middle' };
   // Every flag key must name a known exercise: his 500 rows first (the longest ids), then list ids.
+  // 17 C.0.2: FLAGS is 5000, above every id a block file can name (the list plus his 500 rows),
+  // so the largest file flags every one of them.
   const flagKeys = [...exercises.map(e => e.id), ...SEED_IDS].slice(0, LIMITS.FLAGS);
-  assert.equal(flagKeys.length, LIMITS.FLAGS, 'the list and his rows hold enough ids to fill the flags cap');
+  assert.equal(flagKeys.length, Math.min(LIMITS.FLAGS, LIMITS.BLOCK_EXERCISES + SEED_IDS.length), 'every id a block file can name is flagged');
+  assert.ok(LIMITS.FLAGS >= LIMITS.BLOCK_EXERCISES + SEED_IDS.length, 'the flags cap holds the whole list plus his own rows (17 C.0.2)');
   const flag0 = Object.values(big.exercise_flags)[0];
   body.exercise_flags = Object.fromEntries(flagKeys.map(k => [k, flag0]));
   body.checks = body.checks.map(ck => ({ ...ck, lifts: exercises.slice(0, LIMITS.CHECK_LIFTS).map(e => e.id) }));
@@ -1035,9 +1038,10 @@ const ROWS2 = [
   ['exercises.tags', [f => { exC(f).tags = ['heavy']; }, f => { exC(f).tags = ['overhead', 'overhead']; }, f => { exC(f).tags = ['overhead', 'spotter', 'overhead']; }, f => { exC(f).tags = null; }],
     [f => { exC(f).tags = []; }, f => { exC(f).tags = ['overhead', 'spotter']; }]],
   ['blocks.profile', [f => { blk(f).profile = 'auto'; }], [f => { blk(f).profile = 'fixed'; blk(f).rules_frozen.profile = 'fixed'; blk(f).profile_switch.back_at = NOW2 - 1000; }]],
-  ['blocks.rules_frozen', [f => { blk(f).rules_frozen.profile = 'fixed'; }, f => { blk(f).rules_frozen.rules_version = 'signed-2'; }, f => { blk(f).rules_frozen.rules_version = 'none'; },
+  ['blocks.rules_frozen', [f => { blk(f).rules_frozen.profile = 'fixed'; }, f => { blk(f).rules_frozen.rules_version = 'signed-3'; }, f => { blk(f).rules_frozen.rules_version = 'none'; },
     f => { blk(f).rules_frozen = { profile: 'adaptive' }; }],
-    [f => { Object.assign(blk(f), { profile: 'fixed', profile_switch: null, rules_frozen: { profile: 'fixed', rules_version: 'none' } }); }]],
+    [f => { Object.assign(blk(f), { profile: 'fixed', profile_switch: null, rules_frozen: { profile: 'fixed', rules_version: 'none' } }); },
+     f => { blk(f).rules_frozen.rules_version = 'signed-2'; }]],
   ['blocks.profile_switch', [f => { blk(f).profile_switch.switched_at = LIMITS.ADJUST_EARLIEST_MS - 1; }, f => { blk(f).profile_switch.ticks = [true, true]; },
     f => { blk(f).profile_switch.ticks = [true, true, false]; }, f => { blk(f).profile_switch.back_at = blk(f).profile_switch.switched_at; },
     f => { blk(f).profile_switch.back_at = NOW2 - 1000; }, f => { blk(f).profile_switch = null; },

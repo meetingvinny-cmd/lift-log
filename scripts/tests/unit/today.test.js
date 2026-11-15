@@ -255,7 +255,8 @@ test('the tally draws groups of five: four strokes, then the slash; a new group 
 
 // ---------------- r4.3 light pass (DESIGN 14.9 H8): the picker list ----------------
 
-const pr = (id, name, muscle, equipment, more) => ({ id, name, muscle, equipment, left_out_of_builder: false, ...(more || {}) });
+const DETAIL = { machine: 'machine', cable: 'cable', barbell: 'barbell', dumbbell: 'dumbbell', bodyweight: 'body', other: 'other' };
+const pr = (id, name, muscle, equipment, more) => ({ id, name, muscle, equipment, equipment_detail: DETAIL[equipment], left_out_of_builder: false, ...(more || {}) });
 
 test('X01: the picker groups lifts by muscle in list order', () => {
   const rows = [pr('r1', 'Leg press', 'legs', 'machine'), pr('r2', 'Plank', 'core', 'bodyweight'), pr('r3', 'Chest press', 'chest', 'machine'),
@@ -268,6 +269,27 @@ test('X01: the picker groups lifts by muscle in list order', () => {
   assert.deepEqual(pickerGroups(rows, '  PRESS ', null).map(x => x.rows.map(r => r.id)), [['r3'], ['r1']], 'the search is trimmed and case blind');
   assert.deepEqual(pickerGroups(rows, '', ['machine']).flatMap(x => x.rows.map(r => r.id)), ['r3', 'r1'], 'a chip keeps its equipment only');
   assert.deepEqual(pickerGroups(rows, 'zzz', null), [], 'no match gives no group');
+});
+
+test('C.3.1 R24: a chip filters by the finer equipment; Free shows a kettlebell row and Body shows push up', async () => {
+  const { CHIP_EQUIPMENT, SEED_EXERCISES } = await import('../../../data/exercises.js');
+  const rows = [pr('k1', 'Kettlebell swing', 'legs', 'other', { equipment_detail: 'kettlebell' }), pr('b1', 'Band pull apart', 'back', 'other', { equipment_detail: 'band' }),
+    pr('s1', 'Smith squat', 'legs', 'machine', { equipment_detail: 'smith' }), pr('p1', 'Push up', 'chest', 'bodyweight')];
+  const ids = (chip) => pickerGroups(rows, '', CHIP_EQUIPMENT[chip]).flatMap(x => x.rows.map(r => r.id)).sort();
+  assert.deepEqual(ids(3), ['k1'], 'Free holds the kettlebell row, never the band');
+  assert.deepEqual(ids(4), ['p1'], 'Body holds push up');
+  assert.deepEqual(ids(1), ['s1'], 'Machine holds the Smith machine row');
+  assert.deepEqual(ids(0), ['b1', 'k1', 'p1', 's1'], 'All holds every row');
+  assert.ok(SEED_EXERCISES.some(e => e.id === 'push_up' && CHIP_EQUIPMENT[4].includes(e.equipment_detail)), 'the shipped push up row sits under Body');
+});
+
+test('C.3.1: saved equipment hides the kinds not saved in every chip; his own exercises always show; Show all equipment shows them (M67)', () => {
+  const rows = [pr('k1', 'Kettlebell swing', 'legs', 'other', { equipment_detail: 'kettlebell' }), pr('b1', 'Band row', 'back', 'other', { equipment_detail: 'band' }),
+    pr('c1', 'My band move', 'back', 'other', { equipment_detail: 'band', custom: true })];
+  const ids = (saved, all) => pickerGroups(rows, '', null, { saved, allGear: !!all }).flatMap(x => x.rows.map(r => r.id)).sort();
+  assert.deepEqual(ids(['kettlebell']), ['c1', 'k1'], 'a band row is hidden when Band is not saved, his own band row stays');
+  assert.deepEqual(ids(null), ['b1', 'c1', 'k1'], 'no saved list: every kind');
+  assert.deepEqual(ids(['kettlebell'], true), ['b1', 'c1', 'k1'], 'Show all equipment shows them for this visit');
 });
 
 test('Q06: inside a muscle the picker sorts by name, never by answers (R4-18)', () => {
@@ -327,9 +349,9 @@ test('Slice 2 day menu: Add an exercise first on a day with room, Close block la
   const { LIMITS } = await import('../../../backup.js');
   const block = { status: 'active' };
   const rows = (n, status) => Array.from({ length: n }, (_, i) => ({ slot: i + 1, status: status || 'planned' }));
-  assert.deepEqual(dayMenuRows({ status: 'planned' }, rows(2), block), ['addex', 'relabel', 'skip', 'end']);
-  assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }], block), ['addex', 'relabel', 'reset', 'end']);
-  assert.deepEqual(dayMenuRows({ status: 'open' }, rows(LIMITS.LIFTS_PER_DAY), block), ['relabel', 'reset', 'skip', 'end'], 'a full day leaves Add an exercise out');
+  assert.deepEqual(dayMenuRows({ status: 'planned' }, rows(2), block), ['addex', 'relabel', 'bw', 'skip', 'end']);
+  assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }], block), ['addex', 'relabel', 'reset', 'bw', 'end']);
+  assert.deepEqual(dayMenuRows({ status: 'open' }, rows(LIMITS.LIFTS_PER_DAY), block), ['relabel', 'reset', 'bw', 'skip', 'end'], 'a full day leaves Add an exercise out');
   assert.ok(dayMenuRows({ status: 'open' }, [...rows(LIMITS.LIFTS_PER_DAY - 1), { slot: 99, status: 'skipped' }], block).includes('addex'), 'a skipped card is not counted');
   assert.ok(!dayMenuRows({ status: 'planned' }, rows(1), { status: 'done' }).includes('end'), 'a finished block has no Close block');
   assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }]), ['relabel', 'reset'], 'with no block given, the Slice 1 rows only');
@@ -473,4 +495,51 @@ test('Slice 2 Adjust each round: three ticks and ADJUST exact after trim; no thr
   assert.deepEqual(conditionLines({ switch_conditions: ['a', '', 'b', 3, 'c'] }), ['a', 'b', 'c']);
   assert.deepEqual(conditionLines({ switch_conditions: null }), []);
   assert.deepEqual(conditionLines({}), []);
+});
+
+
+// ---------------- Slice 3, track S3 (17 C.3.9 to C.3.16) ----------------
+
+test('C.3.15: Body weight sits in the day menu after Reset day on a planned or open day of the block, never on a done day (LOOK 4.3)', async () => {
+  const { dayMenuRows } = await import('../../../ui/today.js');
+  const block = { status: 'active' };
+  assert.deepEqual(dayMenuRows({ status: 'open' }, [{ slot: 1, status: 'done' }], block).slice(0, 4), ['addex', 'relabel', 'reset', 'bw']);
+  assert.ok(!dayMenuRows({ status: 'done' }, [], block).includes('bw'));
+  assert.ok(!dayMenuRows({ status: 'open' }, []).includes('bw'), 'no block given: the Slice 1 rows only');
+});
+
+test('C.3.12: a History set reads load x reps, reps only on a body row, the side letter on an L and R pair', async () => {
+  const { setText } = await import('../../../ui/history.js');
+  assert.equal(setText({ set_n: 1, side: 'none', load: 130, reps: 10 }, 'external'), '130 x 10');
+  assert.equal(setText({ set_n: 1, side: 'none', load: 0, reps: 12 }, 'body'), 'x 12');
+  assert.equal(setText({ set_n: 2, side: 'L', load: 30, reps: 9 }, 'external'), '2L 30 x 9');
+});
+
+test('C.3.12: the trend line lays out one dot per round, oldest first, with headroom and no zero floor', async () => {
+  const { trendLayout } = await import('../../../ui/trend.js');
+  const pts = trendLayout([{ pass: 1, value: 100 }, { pass: 2, value: 105 }, { pass: 3, value: 110 }]);
+  assert.deepEqual(pts.map(p => p.pass), [1, 2, 3]);
+  assert.ok(pts[0].x < pts[1].x && pts[1].x < pts[2].x, 'left to right by round');
+  assert.ok(pts[0].y > pts[2].y, 'higher value draws higher');
+  assert.ok(pts.every(p => p.y > 0 && p.y < 120), 'inside the box, with headroom');
+  assert.equal(trendLayout([{ pass: 4, value: 50 }]).length, 1);
+});
+
+test('C.3.16: one tip at a time, the newest event wins (start, then rest, then warm-up); a seen tip never comes back', async () => {
+  const { pickTip, TIP_IDS, changedKey } = await import('../../../ui/tips.js');
+  const day = { id: 'd1', pass: 1, status: 'open' };
+  assert.deepEqual(pickTip(null, {}, day, true), { id: 'tip_warmup' });
+  assert.deepEqual(pickTip({ kind: 'rest', dayId: 'd1' }, {}, day, true), { id: 'tip_rest' });
+  assert.deepEqual(pickTip({ kind: 'start', dayId: 'd1', exercise_id: 'x' }, {}, day, true), { id: 'tip_start', exercise_id: 'x' });
+  assert.equal(pickTip(null, { tip_warmup: true }, day, true), null, 'closed for good');
+  assert.equal(pickTip(null, {}, { ...day, pass: 2 }, true), null, 'the warm-up tip is a round 1 tip');
+  assert.deepEqual(pickTip({ kind: 'rest', dayId: 'other' }, {}, day, true), { id: 'tip_warmup' }, 'an event of another day does not count');
+  const { TIP_IDS: B } = await import('../../../backup.js');
+  assert.deepEqual([...TIP_IDS], [...B], 'ui/tips.js TIP_IDS equals the backup.js list');
+  assert.equal(changedKey('0.4.0'), 'changed.v0_4_0');
+});
+
+test('C.3.11: a grid cell names its state with the grid.states word', async () => {
+  const { cellState } = await import('../../../ui/block.js');
+  assert.deepEqual(['done', 'skipped', 'now', 'planned', 'notplanned'].map(state => cellState({ state })), ['done', 'skipped', 'current', 'planned', 'not planned yet']);
 });
