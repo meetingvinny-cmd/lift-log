@@ -380,8 +380,8 @@ def suite_slice0(browser, base, vp, local):
         check(tag + "(1) tab: Phone check runs in a tab, row 1 says No", rows.get("1", {}).get("r") == "no", summary)
         check(tag + "(1) tab: Phone check has no bottom bar", page.locator(".tabbar").count() == 0)
         back = page.locator("#check-back")
-        check(tag + "(1) tab: top link reads < Back and goes to Install",
-              back.inner_text().strip() == "< Back" and back.get_attribute("href") == "#/install")
+        check(tag + "(1) tab: top link reads Back (the glyph is the arrow, 0.4.1 Q2) and goes to Install",
+              back.inner_text().strip() == "Back" and back.get_attribute("href") == "#/install")
         check(tag + "(1) tab: top link draws the back glyph, sized as on the icon (G16, LOOK 4.2 R17)",
               back.locator("svg").count() == 1 and back.evaluate("a => { const r = a.querySelector('svg').getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; }") == [18, 18],
               back.evaluate("a => { const s = a.querySelector('svg'); return s ? [s.getBoundingClientRect().width, s.getBoundingClientRect().height] : 'no svg'; }"))
@@ -3511,7 +3511,7 @@ def suite_slice2(browser, base, vp, parts):
         check(tag + "(e) not planned yet: the pill and its line, one row per set, empty cells, nothing that writes",
               page.inner_text("#state-pill").strip() == "Not planned yet" and page.inner_text("#day-line").strip() == "Its numbers are set when the day before it is finished."
               and page.locator("#dayview .set.is-notplanned").count() >= 3 and no_write_controls(page)
-              and page.inner_text("#day-back").strip() == "< Back" and page.locator(".tab.is-active[data-tab='#/block']").count() == 1)
+              and page.inner_text("#day-back").strip() == "Back" and page.locator(".tab.is-active[data-tab='#/block']").count() == 1)
         layout(page, tag, "not planned yet")
         # Bad ids: each goes to the Block tab.
         bid = rows(page, "blocks")[0]["id"]
@@ -4766,6 +4766,72 @@ def part_s3_history(h):
     check(tag + "C.3.12: the view switch resets to Days after a reload (kept in memory only)", page.get_attribute("#history", "data-view") == "days")
     page.click("[data-histday]"); page.wait_for_selector("#dayview")
     check(tag + "C.3.12: a History day opens the read-only day view", page.get_attribute("#dayview", "data-state") == "done")
+    ctx.close()
+
+
+@slice3_part("look041")
+def part_s3_look041(h):
+    """0.4.1 look fixes (ai-ops-architect 2026-11-15): Q1 day.sub.one, Q2 one back arrow, Q3 the lit tab and Back."""
+    tag = h["tag"]
+    ctx, page = h["new"]()
+    s3_unit_first(page)
+    load_block_file(page, os.path.join(FIXTURES, "block_v1.json"))
+    guard = 0
+    while open_set(page) and guard < 40:
+        tick(page, fb="later")
+        guard += 1
+    page.click("#finish-day")
+    sub = None
+    for _ in range(12):
+        settle(page, 300)
+        if page.locator("#feedback").count():
+            page.click("#fb-skip"); continue
+        if page.locator("#overall").count():
+            sub = page.inner_text("#overall > p.small").strip()
+            page.click("#day-skip"); continue
+        if page.locator("#nudge").count():
+            page.click("#nudge-later"); settle(page); break
+    check(tag + "0.4.1 Q1: with one score the overall sheet reads '1 quick question'", sub == "1 quick question", sub)
+    leave_day_done(page)
+
+    def look(where):
+        return page.evaluate("""() => { const b = document.getElementById('day-back'); const on = [...document.querySelectorAll('.tab.is-active')].map(e => e.getAttribute('data-tab'));
+          return b ? { text: b.innerText.trim(), svgs: b.querySelectorAll('svg').length, href: b.getAttribute('href'), on } : null; }""")
+
+    # From History: History is lit and Back lands on #/history.
+    go_route(page, "#/history", "#history-days")
+    page.click("[data-histday]"); page.wait_for_selector("#dayview[data-state='done']")
+    a = look("history")
+    screenshot(page, "e2e_look041_%s_dayview.png" % h["vp"])   # for the by-eye read (written to the log folder)
+    check(tag + "0.4.1 Q2: the day view's Back link is one glyph and the word Back, no typed arrow",
+          a is not None and a["text"] == "Back" and a["svgs"] == 1 and "<" not in a["text"], a)
+    check(tag + "0.4.1 Q3a: a day opened from History lights the History tab", a is not None and a["on"] == ["#/history"], a)
+    check(tag + "0.4.1 Q3b: a day opened from History has Back to History", a is not None and a["href"] == "#/history", a)
+    page.click("#day-back")
+    ok = True
+    try:
+        page.wait_for_selector("#history-days", timeout=8000)
+    except Exception:
+        ok = False
+    check(tag + "0.4.1 Q3b: Back from a History day lands on History", ok and page.locator("#dayview").count() == 0)
+    layout(page, tag, "history after day back")
+
+    # A reload on the address: Block is lit and Back goes to Block.
+    page.click("[data-histday]"); page.wait_for_selector("#dayview[data-state='done']")
+    page.reload(); page.wait_for_selector("#dayview[data-state='done']", timeout=15000); settle(page, 300)
+    c = look("reload")
+    check(tag + "0.4.1 Q3a: a reload on a day address lights Block and Back goes to Block",
+          c is not None and c["on"] == ["#/block"] and c["href"] == "#/block", c)
+
+    # From the Block tab: Block is lit and Back lands on #/block.
+    go_route(page, "#/block", "#block #round-grid")
+    page.click("#round-grid [data-blockday$=':p1:d1']"); page.wait_for_selector("#dayview")
+    b = look("block")
+    check(tag + "0.4.1 Q3a: a day opened from the Block tab lights Block, Back goes to Block",
+          b is not None and b["on"] == ["#/block"] and b["href"] == "#/block" and b["text"] == "Back" and b["svgs"] == 1, b)
+    layout(page, tag, "day view from block")
+    page.click("#day-back"); page.wait_for_selector("#block #round-grid")
+    check(tag + "0.4.1 Q3b: Back from a Block day lands on the Block tab", page.locator("#dayview").count() == 0)
     ctx.close()
 
 

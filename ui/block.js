@@ -259,13 +259,14 @@ async function endFlow(ctx, ov) {
 // One view, its states told apart by the pill and the line (LOOK 4.11). No tick button, stepper,
 // set menu, card menu, Finish day or sleep card. A bad id, or one that names no day of a block on
 // the phone, goes to the Block tab (B.10 item 9); the open or current day goes to Today.
-export function renderDayView(ctx, dayId) {
+// 0.4.1 (ai-ops-architect Q3b): Back returns to the tab the day was opened from (`from`, the lit tab).
+export function renderDayView(ctx, dayId, from = '#/block') {
   const screen = el('section', { class: 'screen', id: 'dayview' });
-  drawDay(ctx, screen, dayId).catch(() => ctx.go('#/block'));
+  drawDay(ctx, screen, dayId, from).catch(() => ctx.go('#/block'));
   return screen;
 }
 
-async function drawDay(ctx, screen, dayId) {
+async function drawDay(ctx, screen, dayId, from) {
   let p = null;
   try { p = await ctx.store.dayPreview(dayId); } catch (e) { p = null; }
   if (!p) { ctx.go('#/block'); return; }
@@ -290,7 +291,7 @@ async function drawDay(ctx, screen, dayId) {
   screen.setAttribute('data-day', day.id);
   screen.setAttribute('data-state', p.state);
   screen.append(
-    el('a', { class: 'btn btn-quiet', href: '#/block', id: 'day-back' }, glyph('back'), t('check.backtab')),
+    el('a', { class: 'btn btn-quiet', href: from === '#/history' ? '#/history' : '#/block', id: 'day-back' }, glyph('back'), t('check.backtab')),
     el('div', { class: 'day-head' },
       el('p', { class: 'label', id: 'day-position' }, t('today.position', { r: day.pass, label: day.label || String(day.day) })),
       el('h1', { id: 'day-label' }, dayTitle(day)),

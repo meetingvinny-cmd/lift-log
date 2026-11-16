@@ -45,7 +45,8 @@ export const CMD = {
   // Slice 3 (17 C.4)
   unit_stats: ['node', ['--test', 'scripts/tests/unit/stats.test.js']],
   unit_templates: ['node', ['--test', 'scripts/tests/unit/templates.test.js']],
-  e2e_slice3: ['python3', ['scripts/tests/e2e.py', '--suite', 'slice3', '--viewport', '440']]
+  e2e_slice3: ['python3', ['scripts/tests/e2e.py', '--suite', 'slice3', '--viewport', '440']],
+  e2e_slice3_look041: ['python3', ['scripts/tests/e2e.py', '--suite', 'slice3', '--viewport', '440', '--part', 'look041']]
 };
 
 function listTerm(file, test) {
@@ -886,6 +887,15 @@ export const ROWS = [
     edits: [{ file: 'ui/guided.js', find: "name && !l.hand ? el('button'", replace: "name ? el('button'" }] },
   { id: 'PD242', what: 'the template preview says 1 sets (r4.6 Q7)', cmd: 'e2e_slice3', expect: "r4.6 Q7: a 1-set slot in the preview reads '1 set'",
     edits: [{ file: 'ui/strings.js', find: '  \'tpl.slot.one\': "{name}, 1 set",\n', replace: '' }] },
+  // 0.4.1 look fixes (ai-ops-architect 2026-11-15, Q1 to Q3).
+  { id: 'PD243', what: 'the overall sheet says 1 quick questions on one score (0.4.1 Q1)', cmd: 'e2e_slice3_look041', expect: "0.4.1 Q1: with one score the overall sheet reads '1 quick question'",
+    edits: [{ file: 'ui/today.js', find: "sub: v.block.scores.length === 1 ? t('day.sub.one') : t('day.sub', { n: v.block.scores.length })", replace: "sub: t('day.sub', { n: v.block.scores.length })" }] },
+  { id: 'PD244', what: 'the Back word carries its own typed arrow beside the glyph (0.4.1 Q2)', cmd: 'e2e_slice3_look041', expect: "0.4.1 Q2: the day view's Back link is one glyph and the word Back, no typed arrow",
+    edits: [{ file: 'ui/strings.js', find: "  'check.backtab': 'Back',", replace: "  'check.backtab': '< Back'," }] },
+  { id: 'PD245', what: 'the day view always lights the Block tab (0.4.1 Q3a)', cmd: 'e2e_slice3_look041', expect: '0.4.1 Q3a: a day opened from History lights the History tab',
+    edits: [{ file: 'app.js', find: "root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length), from)); root.appendChild(tabbar(from));", replace: "root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length), from)); root.appendChild(tabbar('#/block'));" }] },
+  { id: 'PD246', what: 'Back on a History day goes to the Block tab (0.4.1 Q3b)', cmd: 'e2e_slice3_look041', expect: '0.4.1 Q3b: a day opened from History has Back to History',
+    edits: [{ file: 'ui/block.js', find: "href: from === '#/history' ? '#/history' : '#/block', id: 'day-back'", replace: "href: '#/block', id: 'day-back'" }] },
   // Must PASS: an ignored stray file inside app/ never breaks the shell check.
   { id: 'C1', what: 'an ignored stray file in test-output/', cmd: 'static', mustPass: true,
     create: { 'test-output/stray.js': 'export const stray = 1;\n', '.DS_Store': 'x' }, edits: [] }

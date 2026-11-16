@@ -280,7 +280,7 @@ test('styles.css: no raw hex, px or ms after the token block', () => {
 
 test('version.js, package.json and manifest are exact', () => {
   // Slice 3 (17 C.0, r4.4 R17): 0.4.0, schema 2 kept, the signed-2 rules (builder and copy parts).
-  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.4.0'; export const SCHEMA = 2; export const RULES_VERSION = 'signed-2';");
+  assert.equal(read('version.js').trim(), "export const APP_VERSION = '0.4.1'; export const SCHEMA = 2; export const RULES_VERSION = 'signed-2';");
   assert.equal(read('package.json').trim(), '{"private":true,"type":"module"}');
   const man = JSON.parse(read('manifest.webmanifest'));
   assert.deepEqual(Object.keys(man).sort(), ['background_color', 'display', 'icons', 'id', 'name', 'orientation', 'scope', 'short_name', 'start_url', 'theme_color']);
@@ -1621,10 +1621,11 @@ test('Slice 2: the Adjust each round row is in the DOM only when the store allow
 
 test('Slice 2: the #/day/ route goes through the store check and to the Block tab otherwise; the view has no tick button, stepper, menu or Finish day (16 B.5 row 2, B.10 item 9)', () => {
   const app = read('app.js');
-  assert.match(app, /if \(route\.startsWith\(DAYVIEW\)\) \{ root\.appendChild\(renderDayView\(ctx, route\.slice\(DAYVIEW\.length\)\)\); root\.appendChild\(tabbar\('#\/block'\)\); return; \}/);
+  // 0.4.1 Q3a: the view lights the tab it was opened from (History or Block; Block on a cold load); the e2e look041 part proves it live.
+  assert.match(app, /if \(route\.startsWith\(DAYVIEW\)\) \{ const from = lastTab === '#\/history' \? '#\/history' : '#\/block'; root\.appendChild\(renderDayView\(ctx, route\.slice\(DAYVIEW\.length\), from\)\); root\.appendChild\(tabbar\(from\)\); return; \}/);
   assert.match(app, /'#\/block': \(\) => renderBlock\(ctx\),/);
   const src = read('ui/block.js');
-  const fn = span(src, 'async function drawDay(ctx, screen, dayId) {', '\n}');
+  const fn = span(src, 'async function drawDay(ctx, screen, dayId, from) {', '\n}');
   assert.match(fn, /try \{ p = await ctx\.store\.dayPreview\(dayId\); \} catch \(e\) \{ p = null; \}\n  if \(!p\) \{ ctx\.go\('#\/block'\); return; \}/, 'a bad id goes to the Block tab');
   const view = src.slice(src.indexOf('export function renderDayView('));
   assert.ok(!/'data-tick'|'data-step'|'data-setmenu'|'data-menu'|'data-addset'|finish-day|day-menu|sleepCard|\.tick\(|saveDraft|liveEdit/.test(view), 'nothing on the view can write');

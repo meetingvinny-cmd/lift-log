@@ -1388,7 +1388,7 @@ function overallSheet(ctx, v) {
     let result = null;
     const save = el('button', { class: 'btn btn-primary', type: 'button', id: 'day-save' }, t('day.save'));
     const skipBtn = el('button', { class: 'btn btn-quiet', type: 'button', id: 'day-skip' }, t('day.skip'));
-    const sh = sheet({ id: 'overall', title: t('day.title'), sub: t('day.sub', { n: v.block.scores.length }), canDismiss: () => false, onClose: () => resolve(result) },
+    const sh = sheet({ id: 'overall', title: t('day.title'), sub: v.block.scores.length === 1 ? t('day.sub.one') : t('day.sub', { n: v.block.scores.length }), canDismiss: () => false, onClose: () => resolve(result) },
       ...parts, save, el('div', { class: 'quiet-row' }, skipBtn));
     save.addEventListener('click', () => { result = { ...scores }; sh.close(); });
     skipBtn.addEventListener('click', () => {

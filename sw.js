@@ -1,11 +1,11 @@
 // sw.js - offline shell. Classic worker, no imports.
 // VERSION must equal APP_VERSION in version.js (the static test checks it).
 // Once a version has been pushed, any change to a SHELL file ships under a new VERSION.
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const CACHE = 'liftlog-' + VERSION;
 // sha256 of every SHELL file (this one with this line removed). The static test
 // recomputes it and fails on a mismatch, so a changed file forces a version bump.
-const SHELL_HASH = '788ba80f650f290b48243955ae6fb188bb8c4dd557a624b15dfaab4899c8cdec';
+const SHELL_HASH = '5a34ef8f2ada905f1667c6281957e90a78a344b4247fa925e680d08c88b1fdd9';
 
 // Every file the app serves. Must equal the git file list minus the files that
 // are never shipped (static test). No other file holds this list.

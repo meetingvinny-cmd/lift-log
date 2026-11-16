@@ -310,7 +310,11 @@ const TABS = [
   { route: '#/settings', key: 'tab.settings', icon: 'settings' }
 ];
 
+// The last tab route drawn this app session, in memory only (0.4.1, ai-ops-architect Q3a): the
+// read-only day view lights the tab it was opened from; a cold load or reload lights Block.
+let lastTab = null;
 function tabbar(active) {
+  lastTab = active;
   const bar = el('nav', { class: 'tabbar' },
     TABS.map(x => el('a', {
       class: 'tab' + (x.route === active ? ' is-active' : ''),
@@ -426,7 +430,7 @@ function render() {
     if (!ID_RE.test(id)) { go('#/exercises'); return; }
     root.appendChild(renderExerciseDetail(ctx, id)); root.appendChild(tabbar('#/block')); return;
   }
-  if (route.startsWith(DAYVIEW)) { root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length))); root.appendChild(tabbar('#/block')); return; }
+  if (route.startsWith(DAYVIEW)) { const from = lastTab === '#/history' ? '#/history' : '#/block'; root.appendChild(renderDayView(ctx, route.slice(DAYVIEW.length), from)); root.appendChild(tabbar(from)); return; }
   const make = STANDALONE_ROUTES[route];
   if (!make) { go('#/today'); return; }
   root.appendChild(make());
